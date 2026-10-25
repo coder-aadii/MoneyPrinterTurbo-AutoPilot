@@ -145,17 +145,22 @@ def test_cli_stdout_contains_only_json(tmp_path):
 
 @pytest.mark.parametrize("media_type", ["image/png", "audio/mpeg", "video/mp4"])
 def test_streamlit_media_responses_keep_valid_asgi_headers(media_type):
+    import asyncio
+    import httpx
     from starlette.applications import Starlette
     from starlette.responses import Response
     from starlette.routing import Route
-    from starlette.testclient import TestClient
     from streamlit.web.server.starlette.starlette_gzip_middleware import MediaAwareGZipMiddleware
 
     async def media(request):
         return Response(b"media payload" * 200, media_type=media_type)
 
     app = MediaAwareGZipMiddleware(Starlette(routes=[Route("/media", media)]))
-    with TestClient(app) as client:
-        result = client.get("/media", headers={"Accept-Encoding": "gzip"})
+    async def request_media():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.get("/media", headers={"Accept-Encoding": "gzip"})
+
+    result = asyncio.run(request_media())
     assert result.status_code == 200
     assert result.content == b"media payload" * 200

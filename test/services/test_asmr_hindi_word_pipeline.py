@@ -113,11 +113,12 @@ def test_hindi_word_cues_retain_marks_and_match_script(tmp_path):
 
 
 def test_gemini_edge_word_mode_uses_audio_alignment(tmp_path):
-    params = SimpleNamespace(
-        subtitle_enabled=True, subtitle_display_mode="word_by_word",
-        voice_name="gemini:Puck-Upbeat", video_language="hi",
-    )
     script = "कृष्ण प्रकाश देखता है।"
+    params = TaskVideoRequest(
+        video_subject="Hindi alignment fixture", video_script=script,
+        subtitle_enabled=True, subtitle_display_mode="word_by_word",
+        voice_name="gemini:Puck-Upbeat", video_language="hi", visual_style="asmr_cutting",
+    )
     def aligned(*, subtitle_file, **_kwargs):
         Path(subtitle_file).write_text(
             "1\n00:00:00,100 --> 00:00:00,500\nकृष्ण\n\n"
@@ -127,10 +128,11 @@ def test_gemini_edge_word_mode_uses_audio_alignment(tmp_path):
         )
     with patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
             patch.dict(task.config.app, {"subtitle_provider": "edge"}), \
-            patch.object(task.subtitle, "align_hindi_words", side_effect=lambda _audio, _script, target:
+            patch.object(task.subtitle, "align_hindi_words", side_effect=lambda _audio, _script, target, **_kwargs:
                          (aligned(subtitle_file=target) or True)) as align, \
             patch.object(task.voice, "create_subtitle") as estimate:
         result = task.generate_subtitle("task", params, script, object(), "audio.mp3")
+    assert align.call_count == 1
     assert result == str(tmp_path / "subtitle.srt")
     assert subtitle.validate_word_cues(result, script)
     assert align.call_args.args[:2] == ("audio.mp3", script)
@@ -138,9 +140,10 @@ def test_gemini_edge_word_mode_uses_audio_alignment(tmp_path):
 
 
 def test_gemini_edge_rejects_sentence_timeline_in_word_mode(tmp_path):
-    params = SimpleNamespace(
+    params = TaskVideoRequest(
+        video_subject="Hindi alignment fixture", video_script="कृष्ण प्रकाश",
         subtitle_enabled=True, subtitle_display_mode="word_by_word",
-        voice_name="gemini:Puck-Upbeat", video_language="hi",
+        voice_name="gemini:Puck-Upbeat", video_language="hi", visual_style="asmr_cutting",
     )
     with patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
             patch.dict(task.config.app, {"subtitle_provider": "edge"}), \
@@ -162,6 +165,11 @@ def test_reviewed_local_clip_counts_nonoverlapping_source_duration(tmp_path):
     (library / "manifest.json").write_text(json.dumps({"clips": [{
         "file": clip.name, "sha256": digest, "category": "kinetic_sand",
         "license": "self-owned", "reviewed_cutting": True,
+        "quality_review": {
+            "status": "approved", "reviewer": "test reviewer",
+            "sampled_timestamps_seconds": [1, 6, 11],
+            "notes": "Fixture clip reviewed for cutting content.",
+        },
     }]}), encoding="utf-8")
     with patch.object(asmr_library.utils, "storage_dir", return_value=str(library)), \
             patch.object(material, "_persist_material_sources") as persist:
@@ -193,6 +201,11 @@ def test_library_rejects_overlapping_trims_of_one_source(tmp_path):
             "category": "kinetic_sand", "license": "self-owned", "source_id": "one-take",
             "source_start_seconds": start, "source_end_seconds": end,
             "reviewed_cutting": True,
+            "quality_review": {
+                "status": "approved", "reviewer": "test reviewer",
+                "sampled_timestamps_seconds": [0.5, 1.5, 2.5],
+                "notes": "Fixture clip reviewed for cutting content.",
+            },
         })
     (library / "manifest.json").write_text(json.dumps({"clips": entries}), encoding="utf-8")
     with patch.object(asmr_library.utils, "storage_dir", return_value=str(library)):
@@ -212,7 +225,7 @@ def test_hindi_alignment_writes_exact_devanagari_words_and_rejects_low_score(tmp
 
     def write_result(arguments, **_kwargs):
         Path(arguments[-1]).write_text(json.dumps({
-            "audio_duration": 1.2, "words": words,
+            "audio_duration": 1.1, "words": words,
         }, ensure_ascii=False), encoding="utf-8")
         return SimpleNamespace(returncode=0, stderr="")
 
@@ -221,6 +234,7 @@ def test_hindi_alignment_writes_exact_devanagari_words_and_rejects_low_score(tmp
         assert subtitle.align_hindi_words(str(audio), "कृष्ण है।", str(output))
         assert [text for _timing, text in moviepy_subtitles(str(output))] == ["कृष्ण", "है।"]
         words[1]["score"] = 0.1
+        audio.write_bytes(b"changed audio, invalidate cached alignment")
         assert not subtitle.align_hindi_words(str(audio), "कृष्ण है।", str(output))
 
 
