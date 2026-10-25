@@ -1044,6 +1044,7 @@ class AutopilotService:
                     if pending.job_id not in self._active_submissions:
                         self._active_submissions.add(pending.job_id)
                         self._executor.submit(self._run_scheduled_job, pending.job_id)
+                        self._executor.submit(self._run_scheduled_job, pending.job_id)
 
     def close(self, wait: bool = True) -> None:
         """Stop the background scheduler and drain worker threads on shutdown."""

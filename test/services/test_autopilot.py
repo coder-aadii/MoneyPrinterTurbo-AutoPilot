@@ -350,6 +350,15 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(recovered.profile_version, 1)
         self.assertEqual(recovered.params_snapshot["video_subject"], "Persistent job")
 
+    def test_service_restart_submits_durable_queued_job_to_worker(self):
+        job = self.ready_job(topic="Resume queued worker task")
+        self.service.store.queue(job.job_id)
+        started = threading.Event()
+        reopened = autopilot.AutopilotService(self.database, runner=lambda _job_id: started.set())
+        self.addCleanup(reopened.close, wait=True)
+        self.assertTrue(started.wait(timeout=2))
+        self.assertEqual(reopened.store.get_job(job.job_id).state, "queued")
+
     def test_restart_marks_dead_generation_worker_failed_without_auto_retry(self):
         job = self.ready_job(topic="Interrupted worker")
         self.service.store.queue(job.job_id)
