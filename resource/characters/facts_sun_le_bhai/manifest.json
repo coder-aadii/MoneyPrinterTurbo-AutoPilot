@@ -1,0 +1,563 @@
+{
+  "name": "Facts Sun Le Bhai — canonical animated narrator stickman",
+  "asset_version": "3.0.0",
+  "canvas_dimensions": [
+    306,
+    429
+  ],
+  "color_mode": "RGBA",
+  "format": "transparent PNG",
+  "anchor": {
+    "type": "ground_center",
+    "coordinate_system": "top-left-origin",
+    "x": 153,
+    "y": 429
+  },
+  "poses": [
+    {
+      "name": "explaining",
+      "file": "01_explaining.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        9,
+        306,
+        424
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "c151d93cbdb834295f6f6293a09416350f726a976364c8326452dc2abfb35003"
+    },
+    {
+      "name": "waving",
+      "file": "02_waving.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        10,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "206b08ccff9621500c82bfc336119ecdb3f0ea8b28720baa48f1d820d641d3d7"
+    },
+    {
+      "name": "pointing_up",
+      "file": "03_pointing_up.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        9,
+        305,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "2bf8296f9f889e4a8a0944cf002c8c0ddd8417e651c1a5edee471700043ecb3b"
+    },
+    {
+      "name": "pointing_right",
+      "file": "04_pointing_right.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        12,
+        305,
+        426
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "770cfcf432498591245a56db8164238979f40da172e1e53acea3677b0b13109c"
+    },
+    {
+      "name": "confused",
+      "file": "05_confused.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        33,
+        5,
+        306,
+        428
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "e20a118ffdb99e47afbce2758bcdfdca198c909a3daa7c8915f2e687a1c27ec0"
+    },
+    {
+      "name": "angry",
+      "file": "06_angry.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        2,
+        306,
+        428
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "16dd413a013e2b46c49109b9184fb41ceeed44fd391e327ed5dc63a0ebf94112"
+    },
+    {
+      "name": "shocked",
+      "file": "07_shocked.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        305,
+        428
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "0c70d7dc59af745bb5342d04f6e4252ee5c8907b4a50507696f18a7e837bb1f6"
+    },
+    {
+      "name": "laughing",
+      "file": "08_laughing.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        5,
+        282,
+        428
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "1ea2eaaba6110f7c45ad9f385cd0f69357672c8d75d816f6247bbea23ebf2c46"
+    },
+    {
+      "name": "thinking",
+      "file": "09_thinking.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "cf658882afa1b79fce1a60f4b603aa2b987a1411d280e6900d3a9e86a3a5acaf"
+    },
+    {
+      "name": "skeptical",
+      "file": "10_skeptical.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        409
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "384b80c65f1384a6ed62e7a49f3228dab050518ef2c6201c44ad23aa01c535b3"
+    },
+    {
+      "name": "celebrating",
+      "file": "11_celebrating.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        2,
+        0,
+        305,
+        411
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "dcc542532b29db46062bc05fcc7e1d2e6f25d5e5b80f00d40f1703347d2f2ac5"
+    },
+    {
+      "name": "presenting",
+      "file": "12_presenting.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        0,
+        290,
+        413
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "e92b9eccd5619e2771a5560a43e33186798355711878a2408af858501645ccb4"
+    },
+    {
+      "name": "deadpan",
+      "file": "13_deadpan.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        409
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "02c495fb49a12fcd18ae50aeb87e82bb998ea932913521c8e28334b21c3ac741",
+      "derived_from": "10_skeptical.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "dry",
+        "sarcasm",
+        "deadpan"
+      ],
+      "purpose": "Brief sarcastic pause, not the entire explanation"
+    },
+    {
+      "name": "smug",
+      "file": "14_smug.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        409
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "8e8a3564ad12512c19ac55ce0ee85797cb11921edeb0c60c95fc3393237032c2",
+      "derived_from": "10_skeptical.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "sarcastic",
+        "teasing",
+        "smug"
+      ],
+      "purpose": "Cheeky witty reveal"
+    },
+    {
+      "name": "facepalm",
+      "file": "15_facepalm.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "6382da86561965ed82c9da566a63826f786308a25a41617203756f9dafaf9fa9",
+      "derived_from": "09_thinking.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "facepalm",
+        "disbelief"
+      ],
+      "purpose": "Clearly wrong assumption being mocked"
+    },
+    {
+      "name": "exasperated_sigh",
+      "file": "16_exasperated_sigh.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "22414e89eaab080d41f71748e0b631bf98abcaa9380f02cc1f6f00efb88d47eb",
+      "derived_from": "09_thinking.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "exasperated",
+        "sigh"
+      ],
+      "purpose": "Short rhetorical exasperation"
+    },
+    {
+      "name": "whispering",
+      "file": "17_whispering.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        8,
+        306,
+        424
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "2a2ddfa722950dea9fd74cc53ec01fa8cd1632805ea967fbd7c55fad8ad105f5",
+      "derived_from": "01_explaining.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "whisper",
+        "secret",
+        "setup"
+      ],
+      "purpose": "Setup for dramatic surprise or reveal"
+    },
+    {
+      "name": "idea_reveal",
+      "file": "18_idea_reveal.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        3,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "554980c4058118ab5f7bc8a08d67fb11ba1623cc444b89a90407533e4ef74fd7",
+      "derived_from": "03_pointing_up.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "aha",
+        "explanation",
+        "idea"
+      ],
+      "purpose": "When explanation turns from confusion to clarity"
+    },
+    {
+      "name": "nervous_sweat",
+      "file": "19_nervous_sweat.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        305,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "0f3434fafd0fa8a8a931d17c764cfbb62a854345b44b58911f179435e34fabcc",
+      "derived_from": "07_shocked.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "nervous",
+        "sweat",
+        "surprised"
+      ],
+      "purpose": "Genuine surprise or funny risk; sparingly"
+    },
+    {
+      "name": "frustrated_burst",
+      "file": "20_frustrated_burst.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        1,
+        2,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "a52f01b7c56927456118f1499c65681227e7ece65733fbbba6c463856635b6ab",
+      "derived_from": "06_angry.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "mock_angry",
+        "frustrated"
+      ],
+      "purpose": "Short punchline at a misconception; sparingly"
+    },
+    {
+      "name": "dramatic_pause",
+      "file": "21_dramatic_pause.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        429
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "9ef06e272f98a839aff1d1825cf5c928a5f082b6ac459a66382a8367da1919b8",
+      "derived_from": "09_thinking.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "pause",
+        "thinking"
+      ],
+      "purpose": "Comic silence / rhetorical beat"
+    },
+    {
+      "name": "serious_fact",
+      "file": "22_serious_fact.png",
+      "dimensions": [
+        306,
+        429
+      ],
+      "alpha_bbox": [
+        0,
+        0,
+        306,
+        409
+      ],
+      "anchor": {
+        "type": "ground_center",
+        "x": 153,
+        "y": 429
+      },
+      "sha256": "f45662ef2c8fdcb8b7542052f698984fc9eda22a578197d66473591f5135e651",
+      "derived_from": "10_skeptical.png",
+      "variant_type": "expression_or_reaction_overlay",
+      "tags": [
+        "factual",
+        "serious"
+      ],
+      "purpose": "Important qualification or scientific explanation"
+    }
+  ],
+  "aliases": {
+    "neutral": "explaining",
+    "explain": "explaining",
+    "hello": "waving",
+    "point_up": "pointing_up",
+    "point_to_right": "pointing_right",
+    "uncertain": "confused",
+    "surprised": "shocked",
+    "amused": "laughing",
+    "curious": "thinking",
+    "skeptical_question": "skeptical",
+    "win": "celebrating",
+    "present": "presenting",
+    "dry_sarcasm": "deadpan",
+    "cheeky": "smug",
+    "disbelief": "facepalm",
+    "sigh": "exasperated_sigh",
+    "secret": "whispering",
+    "aha": "idea_reveal",
+    "nervous": "nervous_sweat",
+    "mock_angry": "frustrated_burst",
+    "pause": "dramatic_pause",
+    "fact": "serious_fact"
+  },
+  "notes": [
+    "Canonical art uses the v2 pack files. The twelve v1 base sprites decode to the same pixels as their v2 counterparts after transparent padding to this common 306×429 canvas; v2 is retained as the canonical encoding.",
+    "Ten additional expression/reaction poses are unique derivatives of the supplied character pack.",
+    "Aliases retain alternate storyboard/action names and resolve to canonical pose IDs without duplicating image files.",
+    "Runtime removes only tiny detached flecks in the bottom edge band and centers/ground-aligns the subject when fitting its render canvas."
+  ]
+}
