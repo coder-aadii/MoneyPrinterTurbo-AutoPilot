@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import re
 import threading
@@ -339,6 +340,15 @@ def test_terminal_task_renders_subject_named_video_download(
         def success(self, message):
             self.successes.append(message)
 
+        def caption(self, _message):
+            pass
+
+        def info(self, _message):
+            pass
+
+        def progress(self, *_args, **_kwargs):
+            pass
+
         def warning(self, message):
             self.warnings.append(message)
 
@@ -351,8 +361,10 @@ def test_terminal_task_renders_subject_named_video_download(
     open_task_folder = MagicMock()
     namespace = {
         "Mapping": Mapping,
+        "Path": Path,
         "config": SimpleNamespace(ui=ui_config),
         "const": const,
+        "json": json,
         "logger": MagicMock(),
         "mimetypes": __import__("mimetypes"),
         "open_task_folder": open_task_folder,
@@ -363,6 +375,7 @@ def test_terminal_task_renders_subject_named_video_download(
             "Video {index} reused {count} source clips."
             if key == "Batch Material Reuse Warning" else key
         ),
+        "utils": SimpleNamespace(task_dir=lambda _task_id: str(tmp_path)),
         "_render_generation_logs": lambda _task_id: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
@@ -373,6 +386,7 @@ def test_terminal_task_renders_subject_named_video_download(
         {
             "state": task_state,
             "progress": 100,
+                "fact_verification_policy": "off",
             "videos": [str(video_path)] if has_video else [],
             "error": "OSError: second encoder failed",
             "warnings": [
@@ -406,7 +420,7 @@ def test_terminal_task_renders_subject_named_video_download(
                 "key": "download_generated_video_download-test_0",
                 "icon": ":material/download:",
                 "on_click": "ignore",
-                "use_container_width": True,
+                "width": "stretch",
             },
         )
     ]

@@ -1336,7 +1336,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         play_label,
                         key=f"play_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/play_arrow:",
                         help=play_label,
                         disabled=not has_video,
@@ -1348,7 +1348,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         open_label,
                         key=f"open_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/folder_open:",
                         help=open_label,
                     ):
@@ -1359,7 +1359,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         restore_label,
                         key=f"restore_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/replay:",
                         help=restore_label,
                         disabled=is_processing or not has_restore_data,
@@ -1376,7 +1376,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         delete_label,
                         key=f"delete_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width="stretch",
                         icon=":material/delete:",
                         help=delete_help,
                         disabled=is_busy,
@@ -1441,7 +1441,7 @@ def _render_task_video_preview():
     closed = preview_cols[1].button(
         "✕",
         key="close_task_video_preview",
-        use_container_width=True,
+        width="stretch",
         help=tr("Close"),
     )
     if closed:
@@ -1760,7 +1760,7 @@ def _render_task_restore_dialog(task_id):
     if cancel_col.button(
         tr("Cancel"),
         key="cancel_task_restore",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state.pop("task_restore_candidate_id", None)
         st.rerun(scope="app")
@@ -1768,7 +1768,7 @@ def _render_task_restore_dialog(task_id):
         tr("Load Task Configuration"),
         key="confirm_task_restore",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state["task_restore_payload"] = payload
         st.session_state.pop("task_restore_candidate_id", None)
@@ -2280,7 +2280,7 @@ def _render_generation_task_snapshot(task_id, task):
                             key=f"download_generated_video_{task_id}_{video_index}",
                             icon=":material/download:",
                             on_click="ignore",
-                            use_container_width=True,
+                            width="stretch",
                         )
     except Exception as exc:
         logger.exception(
@@ -3052,7 +3052,7 @@ def _render_cache_management_settings(panel):
         if refresh_col.button(
             tr("Refresh Cache Stats"),
             key="refresh_video_cache_stats",
-            use_container_width=True,
+            width="stretch",
             icon=":material/refresh:",
         ):
             _get_video_cache_stats_data.clear()
@@ -3061,7 +3061,7 @@ def _render_cache_management_settings(panel):
         if open_col.button(
             tr("Open Cache Directory"),
             key="open_video_cache_directory",
-            use_container_width=True,
+            width="stretch",
             icon=":material/folder_open:",
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
@@ -3072,7 +3072,7 @@ def _render_cache_management_settings(panel):
             key="clean_video_cache_now",
             type="primary",
             disabled=cleanup_disabled,
-            use_container_width=True,
+            width="stretch",
             icon=":material/delete_sweep:",
         ):
             result = cache_manager.clean_video_cache(max_age_days=max_age_days)
@@ -3336,7 +3336,7 @@ def _render_settings_transfer(params):
             ),
             file_name=SETTINGS_PRESET_FILE_NAME,
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
             key="export_settings_preset_button",
             icon=":material/download:",
         )
@@ -3391,7 +3391,7 @@ def _render_key_backup_settings(panel):
             file_name=KEY_BACKUP_FILE_NAME,
             mime="application/json",
             disabled=backup_key_count == 0,
-            use_container_width=True,
+            width="stretch",
             key="export_key_backup_button",
             icon=":material/download:",
         )
@@ -3916,7 +3916,7 @@ def _render_settings_dialog():
             if llm_form_panel.button(
                 tr("Test LLM Connection"),
                 key="test_llm_connection_button",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/network_check:",
             ):
@@ -4770,7 +4770,7 @@ def _render_loomloom_video_settings(params):
     refresh_models = st.button(
         tr("Refresh AI Video Models"),
         key="loomloom_refresh_video_models",
-        use_container_width=True,
+        width="stretch",
         disabled=not token,
     )
     capability = _load_loomloom_video_capability(token, force=refresh_models)
@@ -4989,7 +4989,7 @@ def _render_local_script_generation(params):
     if not st.button(
         tr("Generate Video Script and Keywords"),
         key="auto_generate_script",
-        use_container_width=True,
+        width="stretch",
         type="secondary",
         icon=":material/auto_awesome:",
     ):
@@ -5098,7 +5098,7 @@ def _render_loomloom_candidates():
         tr("Use Selected Candidate"),
         key="loomloom_apply_candidate",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state["video_script"] = selected.script
         st.session_state["video_terms"] = ", ".join(selected.video_terms)
@@ -5230,7 +5230,7 @@ def _render_loomloom_script_generation(params):
     if st.button(
         tr("Get LoomLoom Quote"),
         key="loomloom_quote_scripts",
-        use_container_width=True,
+        width="stretch",
         type="secondary",
         icon=":material/request_quote:",
         disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
@@ -5304,7 +5304,7 @@ def _render_loomloom_script_generation(params):
         if st.button(
             tr("Run LoomLoom Batch"),
             key="loomloom_execute_scripts",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=(not quote_is_current or not confirm_charge or run_in_progress),
         ):
@@ -5343,7 +5343,7 @@ def _render_loomloom_script_generation(params):
         if retry_col.button(
             tr("Resume LoomLoom Status Check"),
             key="loomloom_resume_status_check",
-            use_container_width=True,
+            width="stretch",
             type="secondary",
         ):
             st.session_state["loomloom_run_error"] = ""
@@ -5354,7 +5354,7 @@ def _render_loomloom_script_generation(params):
         if stop_col.button(
             tr("Stop Tracking LoomLoom Run"),
             key="loomloom_stop_tracking_run",
-            use_container_width=True,
+            width="stretch",
             type="secondary",
             help=tr("Stop Tracking LoomLoom Run Help"),
         ):
@@ -5565,14 +5565,14 @@ def _render_script_settings(panel, params):
                         key="restore_default_system_prompt",
                         icon=":material/restart_alt:",
                         on_click=reset_script_system_prompt,
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         st.toast(tr("Default System Prompt Restored"))
                     if preview_prompt_col.button(
                         tr("Preview Final Prompt"),
                         key="preview_final_script_prompt",
                         icon=":material/preview:",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         render_script_prompt_preview(
                             llm.build_script_prompt(
@@ -5644,7 +5644,7 @@ def _render_script_settings(panel, params):
             elif st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
-                use_container_width=True,
+                width="stretch",
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -6799,7 +6799,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         tr("Play Voice"),
         key="play_voice_button",
         icon=":material/graphic_eq:",
-        use_container_width=True,
+        width="stretch",
         disabled=bool(preview_validation_error),
     )
     full_preview_requested = preview_columns[1].button(
@@ -6807,7 +6807,7 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         key="generate_full_voiceover_preview_button",
         icon=":material/article:",
         help=tr("Full Voiceover Preview Cost Hint"),
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(script_content) or bool(preview_validation_error),
     )
 
@@ -7123,7 +7123,7 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
         tr("Load MiniMax Voices"),
         key="load_minimax_voices_button",
         icon=":material/refresh:",
-        use_container_width=True,
+        width="stretch",
     ):
         try:
             available_voices = voice.get_minimax_voice_catalog(
@@ -7495,7 +7495,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test Sonilo Connection"),
             key="test_sonilo_connection_button",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 sonilo_service.test_connection()
@@ -7524,7 +7524,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test ElevenLabs Connection"),
             key="test_elevenlabs_music_connection_button",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 elevenlabs_music_service.test_connection()
@@ -8022,7 +8022,7 @@ def _render_audio_settings(panel, params):
                             key="transcribe_voxcpm_prompt_audio_button",
                             icon=":material/transcribe:",
                             help=tr("Transcribe VoxCPM Prompt Audio Help"),
-                            use_container_width=True,
+                            width="stretch",
                             disabled=not bool(effective_prompt_audio),
                         ):
                             try:
@@ -8575,7 +8575,7 @@ def _render_subtitle_settings(panel, params):
                 key="restore_default_subtitle_settings",
                 icon=":material/restart_alt:",
                 on_click=reset_subtitle_settings,
-                use_container_width=True,
+                width="stretch",
             ):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
@@ -8642,7 +8642,7 @@ def _render_generation_controls(
 
     start_button = st.button(
         tr("Generate Video"),
-        use_container_width=True,
+        width="stretch",
         type="primary",
         key="generate_video_button",
         on_click=_prepare_generation_task,
@@ -9145,7 +9145,8 @@ def _manual_video_topic(topic, script):
 def _autopilot_create_video(profile, topic, script, duration, aspect, style, language,
                             review_ai_draft=False, narrator_preset=None,
                             profanity_level=None, fact_verification_policy=None,
-                            savage_quality_policy=None):
+                            savage_quality_policy=None, background_music_enabled=None,
+                            source_settings=None, parent_job_id=None):
     from app.models.autopilot import ContentPlanCreate
 
     service = autopilot_service.get_service()
@@ -9157,6 +9158,20 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         "language": language,
         "font_name": "NotoSansDevanagari-VF.ttf" if language == "hi" else profile.font_name,
     }
+    inherited_keys = {
+        "voice_name", "tts_model", "subtitle_enabled", "subtitle_position",
+        "subtitle_display_mode", "subtitle_animation", "voice_rate", "voice_volume",
+        "allow_unverified_publication", "duration_enforcement", "hindi_alignment_policy",
+        "bgm_type", "bgm_file", "bgm_volume", "stock_video_style", "video_source",
+        "asmr_categories", "tts_provider",
+    }
+    manual_overrides.update({
+        key: value for key, value in (source_settings or {}).items()
+        if key in inherited_keys and value is not None
+    })
+    # An explicitly edited duration uses the form's target and its normal range.
+    if source_settings and int(source_settings.get("target_duration_seconds", target)) != target:
+        manual_overrides.pop("duration_enforcement", None)
     if narrator_preset is not None:
         manual_overrides["narrator_preset"] = narrator_preset
     if profanity_level is not None:
@@ -9165,12 +9180,29 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         manual_overrides["fact_verification_policy"] = fact_verification_policy
     if savage_quality_policy is not None:
         manual_overrides["savage_quality_policy"] = savage_quality_policy
-    plan = service.plan(profile.channel_id, ContentPlanCreate(
-        topic=topic.strip(), script=script.strip(),
-        min_duration_seconds=max(1, target - 5),
-        max_duration_seconds=target,
-        visual_style_override=style,
-    ), manual_overrides=manual_overrides)
+    if background_music_enabled is False:
+        manual_overrides.update({"bgm_type": "", "bgm_file": "", "bgm_volume": 0.0})
+    try:
+        plan = service.plan(profile.channel_id, ContentPlanCreate(
+            topic=topic.strip(), script=script.strip(),
+            min_duration_seconds=(
+                source_settings.get("min_duration_seconds", max(1, target - 5))
+                if source_settings and int(source_settings.get("target_duration_seconds", target)) == target
+                else max(1, target - 5)
+            ),
+            max_duration_seconds=(
+                source_settings.get("max_duration_seconds", target)
+                if source_settings and int(source_settings.get("target_duration_seconds", target)) == target
+                else target
+            ),
+            visual_style_override=style,
+        ), manual_overrides=manual_overrides, source_job_id=parent_job_id)
+    except autopilot_service.DuplicateContent as exc:
+        if parent_job_id:
+            raise autopilot_service.AutopilotError(
+                "This new version matches another item in channel history. Edit the topic or narration and try again."
+            ) from exc
+        raise
     # Keep an already-created draft visible if a later step fails.
     st.session_state["autopilot_last_plan"] = plan.plan_id
     if (review_ai_draft or (plan.duration_enforcement == "strict" and not
@@ -9178,7 +9210,7 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         st.session_state["autopilot_pending_plan"] = plan.plan_id
         return None
     service.ready(profile.channel_id, plan.plan_id, False)
-    job = service.create_job(profile.channel_id, plan.plan_id)
+    job = service.create_job(profile.channel_id, plan.plan_id, parent_job_id=parent_job_id)
     st.session_state["autopilot_last_job"] = job.job_id
     service.start_job(job.job_id)
     st.session_state.pop("autopilot_pending_plan", None)
@@ -9188,7 +9220,7 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
 def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, language,
                             review_ai_draft=False, narrator_preset=None,
                             profanity_level=None, fact_verification_policy=None,
-                            savage_quality_policy=None):
+                            savage_quality_policy=None, background_music_enabled=None):
     """Continue an exact, unstarted channel draft without making a duplicate plan."""
     service = autopilot_service.get_service()
     normalized = autopilot_service.normalize_content(topic)
@@ -9209,6 +9241,8 @@ def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, lan
         overrides["fact_verification_policy"] = fact_verification_policy
     if savage_quality_policy is not None:
         overrides["savage_quality_policy"] = savage_quality_policy
+    if background_music_enabled is False:
+        overrides.update({"bgm_type": "", "bgm_file": "", "bgm_volume": 0.0})
     existing = service.prepare_manual_draft(
         profile.channel_id, existing.plan_id, overrides, script=script
     )
@@ -9250,13 +9284,20 @@ def _autopilot_upcoming_schedule(profile):
 @st.cache_data(show_spinner=False)
 def _autopilot_thumbnail(video_path, modified_at):
     try:
-        result = subprocess.run(
-            [utils.get_ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-ss", "1",
-             "-i", video_path, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
-            capture_output=True, timeout=10, check=False,
-        )
-        return result.stdout if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
+        command = [utils.get_ffmpeg_binary(), "-hide_banner", "-loglevel", "error"]
+        for seek in ("1", "0"):
+            try:
+                result = subprocess.run(
+                    [*command, "-ss", seek, "-i", video_path, "-frames:v", "1",
+                     "-vf", "scale=480:-2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+                    capture_output=True, timeout=10, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            if result.returncode == 0 and result.stdout:
+                return result.stdout
+        return None
+    except (OSError, ValueError, TypeError):
         return None
 
 
@@ -9312,23 +9353,74 @@ def _render_autopilot_active_job(job_id, channel_id):
 
 
 @st.fragment(run_every="3s")
-def _render_autopilot_videos(channel_id):
+def _render_autopilot_videos_fragment(channel_id):
     from webui.autopilot_view import group_video_attempts
 
     service = autopilot_service.get_service()
-    jobs = service.store.list_jobs(channel_id, 100)
+    jobs = service.store.list_jobs(channel_id, 500)
     drafts = service.list_manual_drafts(channel_id)
     if not jobs and not drafts:
         st.info("No videos yet. Create your first video in Create Video.")
         return
-    receipts = {item["job_id"]: item for item in service.store.list_publications(channel_id)}
-    for attempts in group_video_attempts(jobs):
-        latest = attempts[0]
-        _render_autopilot_video_attempt(latest, channel_id, receipts.get(latest.job_id))
-        if len(attempts) > 1:
-            with st.expander(f"Earlier attempts · {len(attempts) - 1}", expanded=False):
-                for attempt in attempts[1:]:
-                    _render_autopilot_video_attempt(attempt, channel_id, receipts.get(attempt.job_id))
+    receipts = {item["job_id"]: item
+                for item in service.store.list_publications(channel_id, 1000)}
+    st.subheader("My Videos")
+    filter_col, sort_col = st.columns([3, 1], vertical_alignment="bottom")
+    with filter_col:
+        query = st.text_input(
+            "Search videos", key=f"gallery_search_{channel_id}",
+            placeholder="Search titles", label_visibility="collapsed",
+        ).strip().casefold()
+    with sort_col:
+        sort_order = st.selectbox(
+            "Sort videos", ["Newest first", "Oldest first"],
+            key=f"gallery_sort_{channel_id}", label_visibility="collapsed",
+        )
+    if query:
+        jobs = [job for job in jobs if query in (job.topic or "").casefold()]
+    groups = group_video_attempts(jobs)
+    groups.sort(
+        key=lambda attempts: attempts[0].created_at,
+        reverse=sort_order == "Newest first",
+    )
+    if not groups and not drafts:
+        st.info("No matching videos. Try another title or create your first video.")
+    page_size = 24
+    page_count = max(1, math.ceil(len(groups) / page_size))
+    page_key = f"gallery_page_{channel_id}"
+    page = min(max(int(st.session_state.get(page_key, 1)), 1), page_count)
+    if page_count > 1:
+        prev_col, page_col, next_col = st.columns([1, 3, 1])
+        if prev_col.button("Previous", key=f"{page_key}_prev", disabled=page <= 1):
+            st.session_state[page_key] = page - 1
+            st.rerun(scope="app")
+        page_col.caption(f"Page {page} of {page_count} · {len(groups)} videos")
+        if next_col.button("Next", key=f"{page_key}_next", disabled=page >= page_count):
+            st.session_state[page_key] = page + 1
+            st.rerun(scope="app")
+    visible_groups = groups[(page - 1) * page_size:page * page_size]
+    playable = [
+        (attempts[0], output)
+        for attempts in visible_groups
+        if (output := _autopilot_video_output(attempts[0]))
+    ]
+    with st.container(key="my_video_gallery"):
+        for start in range(0, len(visible_groups), 6):
+            with st.container(key=f"my_video_gallery_row_{start}"):
+                columns = st.columns(6, gap="small", vertical_alignment="top")
+                for column, attempts in zip(columns, visible_groups[start:start + 6]):
+                    latest = attempts[0]
+                    with column:
+                        _render_autopilot_video_attempt(
+                            latest, channel_id, receipts.get(latest.job_id), gallery=True,
+                            playable_jobs=playable,
+                        )
+                        if len(attempts) > 1:
+                            with st.expander(f"Earlier attempts · {len(attempts) - 1}", expanded=False):
+                                for attempt in attempts[1:]:
+                                    _render_autopilot_video_attempt(
+                                        attempt, channel_id, receipts.get(attempt.job_id)
+                                    )
     if drafts:
         with st.expander(f"Saved drafts · {len(drafts)}", expanded=not jobs):
             for draft in drafts:
@@ -9341,7 +9433,69 @@ def _render_autopilot_videos(channel_id):
                     st.caption("Loads the topic and script into Create Video for review.")
 
 
-def _render_autopilot_video_attempt(job, channel_id, receipt):
+def _render_autopilot_videos(channel_id):
+    """Keep the live-updating grid isolated so playback dialogs stay mounted."""
+    from webui.autopilot_view import group_video_attempts
+
+    _render_autopilot_videos_fragment(channel_id)
+    service = autopilot_service.get_service()
+    jobs = service.store.list_jobs(channel_id, 500)
+    query = str(st.session_state.get(f"gallery_search_{channel_id}", "")).strip().casefold()
+    if query:
+        jobs = [job for job in jobs if query in (job.topic or "").casefold()]
+    groups = group_video_attempts(jobs)
+    groups.sort(
+        key=lambda attempts: attempts[0].created_at,
+        reverse=st.session_state.get(f"gallery_sort_{channel_id}", "Newest first") == "Newest first",
+    )
+    playable = [
+        (attempts[0], output)
+        for attempts in groups
+        if (output := _autopilot_video_output(attempts[0]))
+    ]
+    player_id = st.session_state.get("gallery_play_job_id")
+    if player_id:
+        selected_player = next(
+            ((job, path) for job, path in playable if job.job_id == player_id), None
+        )
+        if selected_player:
+            _render_autopilot_gallery_video_modal(playable)
+        else:
+            st.session_state.pop("gallery_play_job_id", None)
+    details_id = st.session_state.get("gallery_details_job_id")
+    if details_id:
+        selected_details = next((job for job in jobs if job.job_id == details_id), None)
+        if selected_details:
+            _render_autopilot_gallery_details_dialog(selected_details)
+        else:
+            st.session_state.pop("gallery_details_job_id", None)
+    delete_id = st.session_state.get("gallery_delete_job_id")
+    if delete_id:
+        selected_delete = next(
+            (job for job in service.store.list_jobs(channel_id, 500)
+             if job.job_id == delete_id), None
+        )
+        if selected_delete:
+            _render_autopilot_gallery_delete_dialog(selected_delete, channel_id)
+        else:
+            st.session_state.pop("gallery_delete_job_id", None)
+    download_id = st.session_state.get("gallery_download_job_id")
+    if download_id:
+        selected_download = next(
+            ((job, path) for job, path in playable if job.job_id == download_id), None
+        )
+        if selected_download:
+            _render_autopilot_gallery_download_dialog(*selected_download)
+        else:
+            st.session_state.pop("gallery_download_job_id", None)
+
+
+def _render_autopilot_video_attempt(job, channel_id, receipt, gallery=False,
+                                    playable_jobs=None):
+    if gallery:
+        _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs or [])
+        return
+
     service = autopilot_service.get_service()
     task_state = sm.state.get_task(job.mpt_task_id) if job.mpt_task_id else None
     progress = int((task_state or {}).get("progress") or 0)
@@ -9534,6 +9688,381 @@ def _render_autopilot_video_attempt(job, channel_id, receipt):
             st.link_button("Open on YouTube", receipt["provider_url"])
 
 
+def _autopilot_video_output(job):
+    storage_root = os.path.realpath(utils.storage_dir())
+    artifacts = list(job.output_artifacts or [])
+    artifacts.sort(key=lambda path: not str(path).rsplit("/", 1)[-1].startswith("final-"))
+    for item in artifacts:
+        try:
+            candidate = os.path.realpath(os.fspath(item))
+            if os.path.commonpath((storage_root, candidate)) != storage_root:
+                continue
+            if os.path.isfile(candidate):
+                return candidate
+        except (OSError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _dismiss_autopilot_gallery_player():
+    st.session_state.pop("gallery_play_job_id", None)
+
+
+def _select_autopilot_gallery_player(job_id):
+    st.session_state["gallery_play_job_id"] = job_id
+
+
+def _queue_autopilot_video_edit(job_id, channel_id):
+    """Persist the edit source before Streamlit reruns and select Create Video."""
+    st.session_state["autopilot_main_tabs"] = "Create Video"
+    st.session_state["simple_autopilot_channel"] = channel_id
+    st.session_state[f"gallery_actions_{job_id}"] = False
+    try:
+        job = autopilot_service.get_service().store.get_job(job_id)
+        if job.channel_id != channel_id:
+            raise LookupError("source video does not belong to the selected channel")
+        st.session_state["autopilot_edit_job"] = {
+            "job_id": job.job_id,
+            "channel_id": job.channel_id,
+            "topic": job.topic,
+            "script": job.script,
+            "params_snapshot": dict(job.params_snapshot or {}),
+        }
+        st.session_state.pop("autopilot_edit_error", None)
+    except LookupError as exc:
+        st.session_state.pop("autopilot_edit_job", None)
+        st.session_state["autopilot_edit_error"] = str(exc)
+    except Exception as exc:
+        logger.exception("failed to prepare video version from source task {}", job_id)
+        st.session_state.pop("autopilot_edit_job", None)
+        st.session_state["autopilot_edit_error"] = (
+            f"Video {job_id[:8]} could not be loaded for editing ({type(exc).__name__})."
+        )
+
+
+def _apply_autopilot_edit_form_state(state, edited, profile):
+    """Copy source values once; later Streamlit reruns keep the user's edits."""
+    if not isinstance(edited, dict) or edited.get("channel_id") != profile.channel_id:
+        return
+    source_id = edited.get("job_id")
+    if state.get("autopilot_edit_loaded_source_id") == source_id:
+        return
+    settings = edited.get("params_snapshot") or {}
+    channel_id = profile.channel_id
+    state[f"simple_topic_{channel_id}"] = edited.get("topic", "")
+    state[f"simple_draft_{channel_id}"] = edited.get("script", "")
+    state[f"simple_script_mode_{channel_id}"] = "Write or review my script"
+    state[f"simple_duration_{channel_id}"] = int(
+        settings.get("target_duration_seconds") or profile.target_duration_seconds
+    )
+    state[f"simple_format_{channel_id}"] = (
+        "Shorts (9:16)" if settings.get("video_aspect", "9:16") == "9:16"
+        else "Landscape (16:9)"
+    )
+    style = settings.get("visual_style")
+    style_labels = {value: label for label, value in VISUAL_STYLE_VALUES.items()}
+    if style in style_labels:
+        state[f"simple_style_{channel_id}"] = style_labels[style]
+        state[f"simple_style_user_selected_{channel_id}"] = True
+        state[f"simple_active_style_{channel_id}"] = style
+        state[f"simple_style_defaults_version_{channel_id}"] = 1
+    state[f"simple_language_{channel_id}"] = (
+        "Hindi" if str(settings.get("video_language") or settings.get("language") or "hi").lower().startswith("hi")
+        else "English"
+    )
+    state[f"simple_narrator_{channel_id}"] = {
+        "standard": "Standard", "desi_savage_aggressive": "Desi Savage Hindi",
+    }.get(settings.get("narrator_preset"), "Desi Savage Hindi")
+    state[f"simple_profanity_{channel_id}"] = {
+        "mild": "Mild", "savage_monetization_aware": "Savage — Monetization Aware",
+        "savage_unfiltered": "Savage Unfiltered",
+    }.get(settings.get("profanity_level"), "Savage — Monetization Aware")
+    state[f"simple_fact_policy_{channel_id}"] = settings.get(
+        "fact_verification_policy", "off"
+    )
+    state[f"simple_background_music_{channel_id}"] = bool(
+        settings.get("bgm_type") or settings.get("bgm_file")
+    )
+    state["autopilot_edit_loaded_source_id"] = source_id
+
+
+def _close_autopilot_gallery_action_menu(job_id):
+    st.session_state[f"gallery_actions_{job_id}"] = False
+
+
+@st.dialog(
+    "Watch video", width="small", dismissible=True,
+    on_dismiss=_dismiss_autopilot_gallery_player,
+)
+def _render_autopilot_gallery_video_modal(playable_jobs):
+    player_id = st.session_state.get("gallery_play_job_id")
+    current = next(
+        (i for i, (item, _) in enumerate(playable_jobs) if item.job_id == player_id), None
+    )
+    if current is None:
+        st.warning("This video is no longer available.")
+        return
+
+    job, video_path = playable_jobs[current]
+    aspect_value = str(job.params_snapshot.get("video_aspect", "9:16"))
+    aspect_class = (
+        "landscape" if aspect_value in {"16:9", "4:3"}
+        else "square" if aspect_value == "1:1" else "portrait"
+    )
+    st.caption(job.topic)
+    with st.container(key=f"gallery_video_modal_player_{aspect_class}"):
+        st.video(video_path, width="stretch")
+    previous_col, position_col, next_col = st.columns([1, 2, 1], vertical_alignment="center")
+    previous_col.button(
+        "Previous", key="gallery_player_previous", icon=":material/arrow_back:",
+        type="tertiary", disabled=current <= 0, help="Play previous video",
+        width="stretch", on_click=_select_autopilot_gallery_player,
+        args=(playable_jobs[current - 1][0].job_id,) if current > 0 else (),
+    )
+    position_col.caption(f"{current + 1} of {len(playable_jobs)}")
+    next_col.button(
+        "Next", key="gallery_player_next", icon=":material/arrow_forward:",
+        type="tertiary", disabled=current >= len(playable_jobs) - 1,
+        help="Play next video", width="stretch",
+        on_click=_select_autopilot_gallery_player,
+        args=(playable_jobs[current + 1][0].job_id,)
+        if current < len(playable_jobs) - 1 else (),
+    )
+
+
+@st.dialog("Remove video?", width="small", dismissible=False)
+def _render_autopilot_gallery_delete_dialog(job, channel_id):
+    st.write(f"Remove **{job.topic}** from My Videos? The rendered video files will be kept.")
+    cancel_col, confirm_col = st.columns(2)
+    if cancel_col.button("Cancel", key="gallery_delete_cancel"):
+        st.session_state.pop("gallery_delete_job_id", None)
+        st.rerun(scope="app")
+    if confirm_col.button("Remove video", key="gallery_delete_confirm", type="primary"):
+        try:
+            autopilot_service.get_service().store.delete_job(job.job_id, channel_id)
+            st.session_state.pop("gallery_delete_job_id", None)
+            st.toast("Video removed. Rendered files were kept.")
+            st.rerun(scope="app")
+        except Exception as exc:
+            st.error(f"Video could not be removed: {exc}")
+
+
+@st.dialog("Video details", width="medium", dismissible=False)
+def _render_autopilot_gallery_details_dialog(job):
+    task_state = sm.state.get_task(job.mpt_task_id) if job.mpt_task_id else None
+    fact_policy = job.params_snapshot.get(
+        "fact_verification_policy", job.profile_snapshot.get("fact_verification_policy", "off")
+    )
+    fact_state = (task_state or {}).get(
+        "fact_verification_state", getattr(job, "fact_verification_state", "unverified")
+    )
+    st.caption(
+        f"Created {job.created_at.strftime('%d %b %Y, %H:%M')} · "
+        f"Job {job.job_id[:8]}"
+        + (f" · Task {job.mpt_task_id[:8]}" if job.mpt_task_id else "")
+        + (f" · Version of {job.parent_job_id[:8]}" if getattr(job, "parent_job_id", None) else "")
+    )
+    st.caption(f"Fact check · {fact_policy} · {fact_state}")
+    if job.failure_details:
+        st.error(_autopilot_failure_help(job.failure_details))
+    st.text_area("Narration script", job.script, disabled=True,
+                 key=f"gallery_script_{job.job_id}", height=180)
+    if st.button("Close details", key="gallery_details_close"):
+        st.session_state.pop("gallery_details_job_id", None)
+        st.rerun(scope="app")
+
+
+@st.dialog("Download video", width="small", dismissible=False)
+def _render_autopilot_gallery_download_dialog(job, video_path):
+    st.caption(job.topic)
+    with open(video_path, "rb") as video_file:
+        st.download_button(
+            "Download video", video_file, file_name=Path(video_path).name,
+            mime="video/mp4", key="gallery_download_ready", on_click="ignore",
+            width="stretch", icon=":material/download:",
+        )
+    if st.button("Close", key="gallery_download_close"):
+        st.session_state.pop("gallery_download_job_id", None)
+        st.rerun(scope="app")
+
+
+def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
+    service = autopilot_service.get_service()
+    task_state = sm.state.get_task(job.mpt_task_id) if job.mpt_task_id else None
+    output = _autopilot_video_output(job)
+    status = ("Published" if receipt and receipt["state"] == "published" else
+              "Failed" if job.state == "failed" else
+              "Ready" if job.state == "generated" else
+              "Rendering" if job.state in {"queued", "generating"} else
+              "Draft")
+    if getattr(job, "parent_job_id", None):
+        status = f"Version · {status}"
+    duration = job.actual_duration_seconds or job.duration_estimate_seconds
+    duration_label = f"{int(duration // 60)}:{int(duration % 60):02d}" if duration else "Duration pending"
+
+    with st.container(key=f"gallery_card_{job.job_id}", border=True):
+        status_col, menu_col = st.columns([5, 1], vertical_alignment="center")
+        status_col.caption(status)
+        with menu_col:
+            with st.popover(
+                "", icon=":material/more_vert:", type="tertiary", help="Video actions",
+                key=f"gallery_actions_{job.job_id}", width=190, on_change="rerun",
+            ):
+                if output and st.button("Play", key=f"gallery_menu_play_{job.job_id}",
+                                         width="stretch", type="tertiary",
+                                         icon=":material/play_arrow:",
+                                         on_click=_close_autopilot_gallery_action_menu,
+                                         args=(job.job_id,)):
+                    st.session_state["gallery_play_job_id"] = job.job_id
+                    st.rerun(scope="app")
+                if output:
+                    if st.button("Download", key=f"gallery_download_{job.job_id}",
+                                 width="stretch", type="tertiary",
+                                 icon=":material/download:",
+                                 on_click=_close_autopilot_gallery_action_menu,
+                                 args=(job.job_id,)):
+                        st.session_state["gallery_download_job_id"] = job.job_id
+                        st.rerun(scope="app")
+                if st.button("View details", key=f"gallery_details_{job.job_id}",
+                             width="stretch", type="tertiary", icon=":material/info:",
+                             on_click=_close_autopilot_gallery_action_menu,
+                             args=(job.job_id,)):
+                    st.session_state["gallery_details_job_id"] = job.job_id
+                    st.rerun(scope="app")
+                if job.state == "failed":
+                    if ("Insufficient distinct ASMR footage" in (job.failure_details or "")
+                            and job.profile_snapshot.get("publishing_policy") == "manual"
+                            and not job.output_artifacts):
+                        if st.button("Use general stock footage", key=f"gallery_stock_fallback_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/refresh:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            try:
+                                replacement = service.retry_with_stock_footage(job.job_id)
+                                st.session_state["autopilot_active_job"] = replacement.job_id
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Stock footage attempt could not start: {exc}")
+                    else:
+                        if st.button("Retry video", key=f"gallery_retry_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/refresh:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            try:
+                                service.retry_job(job.job_id)
+                                st.session_state["autopilot_active_job"] = job.job_id
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Retry could not start: {exc}")
+                    if task_state and task_state.get("failed_stage") == "audio":
+                        if st.button("Retry with current channel settings",
+                                     key=f"gallery_retry_settings_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/settings_backup_restore:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            try:
+                                replacement = service.retry_with_current_channel_settings(job.job_id)
+                                st.session_state["autopilot_active_job"] = replacement.job_id
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"New attempt could not start: {exc}")
+                if job.state == "ready" and st.button(
+                    "Start generation", key=f"gallery_start_{job.job_id}", width="stretch",
+                    type="tertiary", icon=":material/play_arrow:",
+                    on_click=_close_autopilot_gallery_action_menu, args=(job.job_id,),
+                ):
+                    try:
+                        service.start_job(job.job_id)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Generation could not start: {exc}")
+                if st.button("Edit as a new version", key=f"gallery_edit_{job.job_id}",
+                             width="stretch", type="tertiary", icon=":material/edit:",
+                             on_click=_queue_autopilot_video_edit,
+                             args=(job.job_id, channel_id)):
+                    st.rerun(scope="app")
+                if job.state == "generated":
+                    with service.store._connection() as conn:
+                        qa = conn.execute("SELECT state FROM job_qa WHERE job_id=?", (job.job_id,)).fetchone()
+                    if qa and qa["state"] == "qa_passed":
+                        if st.button("Approve video", key=f"gallery_approve_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/check_circle:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            try:
+                                service.review_job(job.job_id, "approve")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Approval failed: {exc}")
+                    if qa and qa["state"] == "approved" and job.profile_snapshot.get("publishing_policy") == "manual":
+                        if st.button("Upload privately to YouTube", key=f"gallery_publish_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/upload:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            try:
+                                service.publish_job(job.job_id)
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Private upload failed: {exc}")
+                if receipt and receipt.get("provider_url"):
+                    st.link_button(
+                        "Open on YouTube", receipt["provider_url"], width="stretch",
+                        type="tertiary", icon=":material/open_in_new:",
+                    )
+                if job.state in {"failed", "generated", "cancelled"}:
+                    if receipt or job.intended_publication_slot:
+                        st.caption("This record is retained for publication history.")
+                    else:
+                        if st.button("Remove from My Videos", key=f"gallery_delete_{job.job_id}",
+                                     width="stretch", type="tertiary",
+                                     icon=":material/delete:",
+                                     on_click=_close_autopilot_gallery_action_menu,
+                                     args=(job.job_id,)):
+                            st.session_state["gallery_delete_job_id"] = job.job_id
+                            st.rerun(scope="app")
+
+        with st.container(key=f"gallery_thumbnail_slot_portrait_{job.job_id}"):
+            if output:
+                thumbnail = _autopilot_thumbnail(output, os.path.getmtime(output))
+                if thumbnail:
+                    st.image(thumbnail, width="stretch")
+                else:
+                    st.markdown('<div class="mpt-gallery-placeholder">▣</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="mpt-gallery-placeholder">▣</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="mpt-gallery-duration">{html.escape(duration_label)}</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Play video", key=f"gallery_play_{job.job_id}",
+            ):
+                if output:
+                    st.session_state["gallery_play_job_id"] = job.job_id
+                    st.rerun(scope="app")
+                elif job.state == "failed":
+                    st.toast(
+                        "This failed attempt has no playable video. Use the menu to retry or view details.",
+                        icon=":material/info:",
+                    )
+                else:
+                    st.toast("This video is not ready to play yet.", icon=":material/info:")
+
+        with st.container(key=f"gallery_title_{job.job_id}"):
+            st.text(job.topic)
+        with st.container(key=f"gallery_progress_{job.job_id}"):
+            if job.state in {"queued", "generating"}:
+                progress = int((task_state or {}).get("progress") or 0)
+                st.progress(progress, text=f"{progress}%")
+            else:
+                st.caption(" ")
+
+
 def _render_channel_autopilot():
     st.title("Channel Autopilot")
     profiles = channel_profiles.store.list()
@@ -9559,13 +10088,16 @@ def _render_channel_autopilot():
     new_selection = st.session_state.pop("autopilot_select_after_create", None)
     if new_selection in profiles_by_id:
         st.session_state["simple_autopilot_channel"] = new_selection
-    edited = st.session_state.pop("autopilot_edit_job", None)
-    if edited and edited[0] in profiles_by_id:
-        st.session_state["simple_autopilot_channel"] = edited[0]
-        st.session_state[f"simple_topic_{edited[0]}"] = edited[1]
-        st.session_state[f"simple_draft_{edited[0]}"] = edited[2]
-        st.session_state[f"simple_script_mode_{edited[0]}"] = "Write or review my script"
-        st.session_state["autopilot_edit_notice"] = True
+    edited = st.session_state.get("autopilot_edit_job")
+    if isinstance(edited, dict) and edited.get("channel_id") in profiles_by_id:
+        edit_channel = edited["channel_id"]
+        st.session_state["simple_autopilot_channel"] = edit_channel
+        _apply_autopilot_edit_form_state(
+            st.session_state, edited, profiles_by_id[edit_channel]
+        )
+    edit_error = st.session_state.pop("autopilot_edit_error", None)
+    if edit_error:
+        st.error(edit_error)
     channel_id = st.selectbox("YouTube channel", list(profiles_by_id),
                               format_func=lambda key: f"{profiles_by_id[key].display_name} · {_autopilot_connection_label(profiles_by_id[key], service)}",
                               key="simple_autopilot_channel")
@@ -9576,12 +10108,18 @@ def _render_channel_autopilot():
     else:
         st.success(f"YouTube destination: {destination}")
     create_tab, videos_tab, schedule_tab, channels_tab, advanced_tab = st.tabs(
-        ["Create Video", "My Videos", "Schedule", "Channels", "Advanced / Diagnostics"])
+        ["Create Video", "My Videos", "Schedule", "Channels", "Advanced / Diagnostics"],
+        key="autopilot_main_tabs", on_change="rerun",
+    )
 
-    with create_tab:
+    if create_tab.open:
         st.subheader("Create one video")
-        if st.session_state.pop("autopilot_edit_notice", False):
-            st.info("Your saved topic and script are loaded. Review them, then choose Generate Video to continue.")
+        if isinstance(edited, dict) and edited.get("channel_id") == channel_id:
+            st.info(
+                f"Preparing a new version of “{edited.get('topic') or 'Untitled video'}” "
+                f"(source {edited.get('job_id', '')[:8]}). Review the copied settings and narration; "
+                "the original video will remain unchanged."
+            )
         st.caption("Your saved channel settings are loaded. Generate an idea to fill both fields, or paste a topic and click Generate narration script.")
         topic_key = f"simple_topic_{channel_id}"
         draft_key = f"simple_draft_{channel_id}"
@@ -9604,7 +10142,7 @@ def _render_channel_autopilot():
             "Savage Unfiltered": "savage_unfiltered",
         }
         st.session_state.setdefault(duration_key, profile.target_duration_seconds)
-        st.session_state.setdefault(fact_policy_key, profile.fact_verification_policy)
+        st.session_state.setdefault(fact_policy_key, "off")
         st.session_state.setdefault(
             quality_policy_key, getattr(profile, "savage_quality_policy", "advisory")
         )
@@ -9637,6 +10175,19 @@ def _render_channel_autopilot():
             style_label = st.session_state.get(style_key, "")
             selected_style = styles.get(style_label, profile.visual_style)
             style_defaults = visual_style_service.preset_for(selected_style).defaults
+            source_settings = edited.get("params_snapshot", {}) if isinstance(edited, dict) else {}
+            inherited_fields = {
+                key: source_settings[key] for key in (
+                    "voice_name", "tts_model", "voice_rate", "voice_volume",
+                    "subtitle_enabled", "subtitle_position", "subtitle_display_mode",
+                    "subtitle_animation", "duration_enforcement", "hindi_alignment_policy",
+                    "bgm_type", "bgm_file", "bgm_volume", "stock_video_style",
+                    "video_source", "asmr_categories", "allow_unverified_publication",
+                ) if key in source_settings
+            }
+            generation_settings = dict(profile.generation_settings)
+            if source_settings.get("tts_provider"):
+                generation_settings["tts_provider"] = source_settings["tts_provider"]
             tts_defaults = {}
             if (selected_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
                     and config.app.get("gemini_api_key")):
@@ -9644,7 +10195,12 @@ def _render_channel_autopilot():
                     "voice_name": style_defaults["voice_name"],
                     "tts_model": style_defaults["tts_model"],
                 }
+            for key in ("voice_name", "tts_model"):
+                if key in source_settings:
+                    tts_defaults[key] = source_settings[key]
             return profile.model_copy(update={
+                **inherited_fields,
+                "generation_settings": generation_settings,
                 "language": "hi" if language_label == "Hindi" else "en",
                 "target_duration_seconds": int(st.session_state.get(duration_key, profile.target_duration_seconds)),
                 "visual_style": selected_style,
@@ -9818,8 +10374,15 @@ def _render_channel_autopilot():
             "Fact checking", ["off", "advisory", "strict"],
             format_func={"off": "Off", "advisory": "Advisory", "strict": "Strict"}.get,
             key=fact_policy_key,
-            help=("Off skips research. Advisory checks briefly and continues if evidence is "
+            help=("Optional. Off skips research. Advisory checks briefly and continues if evidence is "
                   "unavailable. Strict blocks TTS unless the exact narration is source-verified."),
+        )
+        background_music_key = f"simple_background_music_{channel_id}"
+        st.session_state.setdefault(background_music_key, False)
+        include_background_music = st.checkbox(
+            "Include background music",
+            key=background_music_key,
+            help="Optional. Off creates voice-only audio. On uses the background music saved for this channel.",
         )
         quality_policy = st.selectbox(
             "Savage creative-quality enforcement", ["advisory", "strict"],
@@ -9885,10 +10448,16 @@ def _render_channel_autopilot():
                         profanity_level=profanity_choices[profanity_label],
                         fact_verification_policy=fact_policy,
                         savage_quality_policy=quality_policy,
-                        review_ai_draft=False)
+                        background_music_enabled=include_background_music,
+                        review_ai_draft=False,
+                        source_settings=(edited.get("params_snapshot", {}) if isinstance(edited, dict) else None),
+                        parent_job_id=(edited.get("job_id") if isinstance(edited, dict) else None))
                     if job:
                         st.session_state["autopilot_active_job"] = job.job_id
                         st.success("Video job created and queued.")
+                        if isinstance(edited, dict):
+                            st.session_state.pop("autopilot_edit_job", None)
+                            st.session_state.pop("autopilot_edit_loaded_source_id", None)
                     else:
                         st.info("Review the AI draft and its estimated duration below, then choose whether to render it.")
                 except autopilot_service.DuplicateContent:
@@ -9909,6 +10478,7 @@ def _render_channel_autopilot():
                                 profanity_level=profanity_choices[profanity_label],
                                 fact_verification_policy=fact_policy,
                                 savage_quality_policy=quality_policy,
+                                background_music_enabled=include_background_music,
                                 review_ai_draft=False)
                             if resumed is False:
                                 st.info("An existing draft was found. Review its script and duration below before rendering.")
@@ -9946,10 +10516,10 @@ def _render_channel_autopilot():
             except LookupError:
                 st.session_state.pop("autopilot_pending_plan", None)
 
-    with videos_tab:
+    if videos_tab.open:
         _render_autopilot_videos(channel_id)
 
-    with schedule_tab:
+    if schedule_tab.open:
         st.subheader("Schedule")
         state = service.schedule_state(channel_id)
         with st.form(f"simple_schedule_{channel_id}"):
@@ -9994,7 +10564,7 @@ def _render_channel_autopilot():
                     if slot.get("details"):
                         st.caption(slot["details"])
 
-    with channels_tab:
+    if channels_tab.open:
         st.subheader("Channels")
         with st.expander("Add a YouTube channel"):
             with st.form("simple_add_channel"):
@@ -10081,7 +10651,7 @@ def _render_channel_autopilot():
                             _autopilot_save_profile(item, youtube_connection_id=None, youtube_channel_id=None)
                             st.rerun()
 
-    with advanced_tab:
+    if advanced_tab.open:
         st.session_state["autopilot_profile_channel_select"] = channel_id
         _render_channel_autopilot_advanced()
 

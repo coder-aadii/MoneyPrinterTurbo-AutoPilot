@@ -97,7 +97,8 @@ def group_video_attempts(jobs):
     groups = {}
     for job in sorted(jobs, key=lambda item: item.created_at, reverse=True):
         profile = job.profile_snapshot
-        if profile.get("publishing_policy") != "manual" or job.intended_publication_slot:
+        if (getattr(job, "parent_job_id", None)
+                or profile.get("publishing_policy") != "manual" or job.intended_publication_slot):
             key = (job.job_id,)
         else:
             key = (job.channel_id, normalize_content(job.topic), normalize_content(job.script),

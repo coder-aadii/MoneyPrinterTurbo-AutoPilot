@@ -88,6 +88,46 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(job.effective_visual_style, "relevant_stock")
         self.assertEqual(job.params_snapshot["visual_style"], "relevant_stock")
 
+    def test_manual_video_version_keeps_source_immutable_and_links_parent(self):
+        original = self.ready_job(topic="Version this video", script="Original narration remains saved.")
+        original_snapshot = original.model_copy(deep=True)
+        profile = self.profiles[0]
+        plan = self.service.plan(
+            profile.channel_id,
+            ContentPlanCreate(
+                topic=original.topic,
+                script="Edited narration for a separate version.",
+                min_duration_seconds=25,
+                max_duration_seconds=30,
+            ),
+            manual_overrides={
+                "target_duration_seconds": 30,
+                "voice_name": "azure-tts-v1:en-US-JennyNeural-Female",
+                "subtitle_enabled": False,
+                "fact_verification_policy": "advisory",
+            },
+            source_job_id=original.job_id,
+        )
+        ready = self.service.ready(profile.channel_id, plan.plan_id, True)
+        version = self.service.create_job(
+            profile.channel_id, ready.plan_id, parent_job_id=original.job_id
+        )
+
+        saved_original = self.service.store.get_job(original.job_id)
+        self.assertNotEqual(version.job_id, original.job_id)
+        self.assertEqual(version.parent_job_id, original.job_id)
+        self.assertEqual(version.script, "Edited narration for a separate version.")
+        self.assertEqual(version.params_snapshot["subtitle_enabled"], False)
+        self.assertEqual(version.params_snapshot["fact_verification_policy"], "advisory")
+        self.assertEqual(saved_original.script, original_snapshot.script)
+        self.assertEqual(saved_original.params_snapshot, original_snapshot.params_snapshot)
+
+    def test_new_version_rejects_missing_or_other_channel_parent(self):
+        plan = self.plan(topic="Invalid version parent")
+        ready = self.service.ready(plan.channel_id, plan.plan_id, True)
+        with self.assertRaises(LookupError):
+            self.service.create_job(plan.channel_id, ready.plan_id, parent_job_id="deleted-source")
+
     def test_fact_policy_and_publication_opt_in_are_pinned_in_job_snapshot(self):
         profile = self.profiles[0].model_copy(update={
             "visual_style": "savage_animated_explainer",
@@ -112,6 +152,17 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(saved.fact_verification_state, "unavailable")
         self.assertEqual(saved.params_snapshot["fact_verification_state"], "unavailable")
         self.assertTrue(saved.params_snapshot["allow_unverified_publication"])
+
+    def test_fact_verification_saves_the_policy_used_by_a_failed_attempt(self):
+        job = self.ready_job(topic="Persist runtime fact policy")
+        self.service.store.save_fact_verification(job.job_id, {
+            "fact_verification_state": "unavailable",
+            "fact_verification_policy": "strict",
+            "fact_verification_script_hash": "script-hash",
+            "fact_verification_report": {"state": "unavailable"},
+        })
+        saved = self.service.store.get_job(job.job_id)
+        self.assertEqual(saved.params_snapshot["fact_verification_policy"], "strict")
 
     def test_cross_channel_duplicate_check_is_opt_in_and_job_snapshots_stay_isolated(self):
         first = self.plan(topic="A fact about water")
@@ -587,6 +638,7 @@ class TestAutopilot(unittest.TestCase):
             "target_duration_seconds": 30, "video_aspect": "9:16",
             "stock_video_style": "satisfying_asmr_cutting", "language": "hi",
             "font_name": "Lohit-Devanagari.ttf",
+            "bgm_type": "", "bgm_file": "", "bgm_volume": 0.0,
         })
         self.assertEqual(reused.script, plan.script)
         self.assertEqual(reused.profile_version, updated.version)
@@ -594,6 +646,8 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(job.profile_snapshot["publishing_policy"], "manual")
         self.assertEqual(job.params_snapshot["video_script"], plan.script)
         self.assertEqual(job.params_snapshot["font_name"], "Lohit-Devanagari.ttf")
+        self.assertEqual(job.params_snapshot["bgm_type"], "")
+        self.assertEqual(job.params_snapshot["bgm_volume"], 0.0)
         with self.assertRaises(autopilot.InvalidTransition):
             self.service.prepare_manual_draft(profile.channel_id, plan.plan_id, {})
 
@@ -621,14 +675,21 @@ class TestAutopilot(unittest.TestCase):
         job = self.ready_job(topic="QA gates")
         self.service.store.queue(job.job_id)
         self.service.store.claim(job.job_id, "qa-task", f"{autopilot.socket.gethostname()}:{os.getpid()}")
-        self.service.store.transition(job.job_id, "generated", output_artifacts_json='["/tmp/qa.mp4"]', actual_duration_seconds=28)
+        self.service.store.transition(job.job_id, "generated",
+            output_artifacts_json='["/tmp/final-1.mp4", "/tmp/combined-1.mp4"]',
+            actual_duration_seconds=28)
         state = MemoryState()
         state.update_task("qa-task", state=const.TASK_STATE_COMPLETE, audio_file="/tmp/audio.mp3",
-                          subtitle_path="/tmp/subtitle.srt", materials=["/tmp/material.mp4"])
-        clip = MagicMock(w=1080, h=1920, audio=object())
+                          subtitle_path="/tmp/subtitle.srt", materials=["/tmp/material.mp4"],
+                          videos=["/tmp/final-1.mp4"], combined_videos=["/tmp/combined-1.mp4"])
+        final_clip = MagicMock(w=1080, h=1920, audio=object())
+        combined_clip = MagicMock(w=1080, h=1920, audio=None)
         with patch.object(autopilot.sm, "state", state), \
              patch("app.services.autopilot.os.path.isfile", return_value=True), \
-             patch.object(autopilot.video, "_open_video_clip_quietly", return_value=clip):
+             patch.object(autopilot.video, "_open_video_clip_quietly",
+                          side_effect=lambda path, audio: (
+                              final_clip if path.endswith("final-1.mp4") else combined_clip
+                          )):
             report = self.service.qa_report(job.job_id)
         self.assertTrue(report["passed"])
         self.assertTrue(report["checks"]["orientation"])

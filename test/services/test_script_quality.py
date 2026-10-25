@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from app.models.schema import VideoParams
-from app.services import llm, script_quality, topic_quality
+from app.services import llm, script_quality, subtitle, topic_quality
 
 
 def test_savage_quality_gate_detects_generic_opening_abuse_and_flat_ending():
@@ -49,6 +49,18 @@ def test_valid_topic_does_not_require_sarcasm_hook_or_profanity():
     assert "topic lacks a concrete relationship, question, comparison, quantity, or mechanism" in topic_quality.topic_issues(
         "A fact about the Moon"
     )
+
+
+def test_hindi_topic_word_count_keeps_devanagari_marks_with_their_words():
+    topic = "कैसे चंद्रमा की गुरुत्वाकर्षण शक्ति पृथ्वी के महासागरों में ज्वार की ऊंचाई को प्रभावित करती है?"
+    assert topic_quality.topic_issues(topic) == []
+
+
+def test_hindi_word_caption_preflight_rejects_unpronounceable_latin_abbreviation():
+    errors = subtitle.preflight_hindi_alignment_script(
+        "रेगिस्तान में यह छोटा जीव bc से भी शर्मिंदा नहीं होता।"
+    )
+    assert any(error["code"] == "unresolved_latin_token" for error in errors)
 
 
 def test_topic_generator_uses_topic_stage_validator_and_final_payload():

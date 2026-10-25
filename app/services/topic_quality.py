@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 
 _GENERIC = (
     "interesting facts", "amazing facts", "विज्ञान के तथ्य", "रोचक तथ्य",
     "कुछ रोचक बातें", "दुनिया के रहस्य",
 )
-_WORD = re.compile(r"[^\W_]+", re.UNICODE)
 _SPECIFICITY = re.compile(
     r"(?i)\b(?:why|how|when|what|does|do|can|weighs?|weight|difference|temperature|"
     r"cause|causes|changes?|affect|floats?|contains?|forms?|works?)\b|"
@@ -18,13 +18,29 @@ _SPECIFICITY = re.compile(
 )
 
 
+def _words(text: str) -> list[str]:
+    """Split on Unicode word boundaries while keeping combining marks attached."""
+    words = []
+    current = []
+    for char in text:
+        category = unicodedata.category(char)[0]
+        if category in {"L", "N"} or (category == "M" and current):
+            current.append(char)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return words
+
+
 def topic_issues(topic: str) -> list[str]:
     """Check topic specificity and basic coherence without grading its style."""
     text = re.sub(r"\s+", " ", str(topic or "")).strip()
     folded = text.casefold()
     if not text:
         return ["empty topic"]
-    words = _WORD.findall(text)
+    words = _words(text)
     issues = []
     if len(words) < 4:
         issues.append("topic is too broad or underspecified")

@@ -77,6 +77,7 @@ class ContentQualityReview(BaseModel):
 class ProductionJob(BaseModel):
     job_id: str
     plan_id: str
+    parent_job_id: str | None = None
     channel_id: str
     profile_version: int
     profile_snapshot: dict

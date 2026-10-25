@@ -219,6 +219,371 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
 
 }
 
+/* Channel Autopilot's My Videos gallery. */
+div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"] {
+    align-items: stretch !important;
+    gap: 0.55rem !important;
+}
+
+div[class~="st-key-my_video_gallery"] {
+    width: min(100%, 1140px) !important;
+    margin-inline: auto !important;
+}
+
+div[class*="st-key-my_video_gallery"] div[data-testid="stColumn"] {
+    min-width: 0 !important;
+}
+
+div[class*="st-key-my_video_gallery"] div[data-testid="stVerticalBlockBorderWrapper"] {
+    height: 100% !important;
+    padding: 0.45rem !important;
+    border-radius: 0.75rem !important;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+div[class*="st-key-gallery_card_"]:hover div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-color: color-mix(in srgb, currentColor 28%, transparent) !important;
+    box-shadow: 0 5px 18px rgba(0, 0, 0, 0.10);
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] {
+    position: relative !important;
+    width: 100% !important;
+    margin: 0 0 0.4rem !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    border-radius: 0.65rem;
+    background: rgba(128, 128, 128, 0.14);
+}
+
+div[class*="st-key-gallery_thumbnail_slot_portrait"] { aspect-ratio: 9 / 16; }
+div[class*="st-key-gallery_thumbnail_slot_landscape"] { aspect-ratio: 16 / 9; }
+div[class*="st-key-gallery_thumbnail_slot_square"] { aspect-ratio: 1 / 1; }
+
+div[class*="st-key-gallery_thumbnail_slot_"] > div[data-testid="stVerticalBlock"] {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block !important;
+    height: 100% !important;
+    min-height: 100% !important;
+    padding: 0 !important;
+    gap: 0 !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"]:has([data-testid="stImage"]),
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"]:has(.mpt-gallery-placeholder) {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stImage"],
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stImage"] img {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    object-fit: cover !important;
+    border-radius: inherit;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"] {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] {
+    position: absolute !important;
+    z-index: 2 !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] [data-testid="stButton"] {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] [data-testid="stTooltipHoverTarget"] {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] button {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: inherit !important;
+    color: transparent !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    font-size: 0 !important;
+    cursor: pointer !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] button::after {
+    content: "▶";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    display: grid;
+    place-items: center;
+    width: 3rem;
+    height: 3rem;
+    padding-left: 0.16rem;
+    border: 1px solid rgba(255, 255, 255, 0.68);
+    border-radius: 50%;
+    color: #fff;
+    background: rgba(12, 15, 20, 0.68);
+    font-size: 1.05rem;
+    transform: translate(-50%, -50%);
+    transition: transform 140ms ease, background 140ms ease;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]:hover [class*="st-key-gallery_play_"] button::after {
+    transform: translate(-50%, -50%) scale(1.06);
+    background: rgba(12, 15, 20, 0.82);
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] button:focus-visible {
+    outline: 3px solid #80b7ff !important;
+    outline-offset: -4px !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] .mpt-gallery-placeholder {
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+    color: rgba(180, 180, 190, 0.7);
+    font-size: 3rem;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] .mpt-gallery-duration {
+    position: absolute !important;
+    z-index: 5 !important;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    max-width: calc(100% - 1rem);
+    padding: 0.18rem 0.42rem;
+    overflow: hidden;
+    border-radius: 0.35rem;
+    color: #fff;
+    background: rgba(12, 15, 20, 0.78);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"]:has(.mpt-gallery-duration) {
+    position: absolute !important;
+    inset: 0 !important;
+    z-index: 4 !important;
+    width: 100% !important;
+    height: 100% !important;
+    pointer-events: none !important;
+}
+
+div[class*="st-key-my_video_gallery"] [class*="st-key-gallery_title_"] [data-testid="stText"] span {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    height: 2.6em;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    line-height: 1.3;
+}
+
+div[class*="st-key-my_video_gallery"] [class*="st-key-gallery_progress_"] {
+    min-height: 2.75rem;
+}
+
+div[class*="st-key-gallery_actions_"] button {
+    min-width: 2.5rem !important;
+    min-height: 2.5rem !important;
+}
+
+div[class*="st-key-gallery_actions_"] [data-testid="stPopoverButton"] {
+    min-width: 2.5rem !important;
+    min-height: 2.5rem !important;
+    border-radius: 50% !important;
+    justify-content: center !important;
+    padding: 0 !important;
+}
+
+div[class*="st-key-gallery_actions_"] [data-testid="stPopoverButton"] [aria-hidden="true"] {
+    display: none !important;
+}
+
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) {
+    box-sizing: border-box !important;
+    width: min(190px, calc(100vw - 1rem)) !important;
+    max-width: min(190px, calc(100vw - 1rem)) !important;
+    max-height: min(62vh, calc(100dvh - 1rem)) !important;
+    overflow: auto !important;
+    padding: 0.3rem !important;
+    border: 1px solid color-mix(in srgb, currentColor 12%, transparent) !important;
+    border-radius: 0.8rem !important;
+    background: #17191f !important;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24) !important;
+}
+
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) [data-testid="stVerticalBlock"] {
+    gap: 0.16rem !important;
+}
+
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) [data-testid="stBaseButton-tertiary"],
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) [data-testid="stBaseButton-secondary"] {
+    box-sizing: border-box !important;
+    width: 100% !important;
+    min-height: 2.15rem !important;
+    justify-content: flex-start !important;
+    padding: 0.38rem 0.52rem !important;
+    border: 0 !important;
+    border-radius: 0.5rem !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    font-size: 0.78rem !important;
+    text-align: left !important;
+    white-space: nowrap !important;
+}
+
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) button:hover,
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) a:hover {
+    background: color-mix(in srgb, currentColor 8%, transparent) !important;
+}
+
+div[data-testid="stPopoverBody"]:has([class*="st-key-gallery_menu_play_"]) [class*="st-key-gallery_delete_"] button {
+    color: #e25555 !important;
+}
+
+/* The gallery player uses Streamlit's accessible dialog and native video controls,
+   with its width scoped by the stable keyed player container. */
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) {
+    box-sizing: border-box !important;
+    width: min(430px, calc(100vw - 1rem)) !important;
+    max-width: min(430px, calc(100vw - 1rem)) !important;
+    max-height: calc(100dvh - 1rem) !important;
+    overflow-y: auto !important;
+    padding: 0.65rem !important;
+    border-radius: 1rem !important;
+}
+
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [data-testid="stDialogHeader"] {
+    min-height: 2.5rem !important;
+    padding: 0.2rem 0.25rem 0.4rem !important;
+}
+
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [data-testid="stDialogBody"] {
+    padding: 0.2rem 0.25rem 0.35rem !important;
+}
+
+div[class*="st-key-gallery_video_modal_player_"] {
+    box-sizing: border-box !important;
+    width: min(100%, 360px) !important;
+    margin: 0 auto !important;
+    padding: 0.35rem !important;
+    overflow: hidden !important;
+    border-radius: 0.8rem !important;
+    background: #08090c !important;
+}
+
+div[class*="st-key-gallery_video_modal_player_landscape"] {
+    width: 100% !important;
+}
+
+div[class*="st-key-gallery_video_modal_player_"] [data-testid="stVideo"] {
+    display: flex !important;
+    width: 100% !important;
+    max-height: calc(100dvh - 12rem) !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+div[class*="st-key-gallery_video_modal_player_"] video {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    max-height: calc(100dvh - 12rem) !important;
+    height: auto !important;
+    object-fit: contain !important;
+    background: #050507 !important;
+}
+
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [class*="st-key-gallery_player_previous"] button,
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [class*="st-key-gallery_player_next"] button {
+    min-height: 2.25rem !important;
+    padding-inline: 0.35rem !important;
+    opacity: 0.78;
+}
+
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [class*="st-key-gallery_player_previous"] button:hover,
+[role="dialog"]:has([class*="st-key-gallery_video_modal_player_"]) [class*="st-key-gallery_player_next"] button:hover {
+    opacity: 1;
+}
+
+@media (min-width: 1200px) {
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        flex: 1 1 calc(16.666% - 0.46rem) !important;
+        min-width: calc(16.666% - 0.46rem) !important;
+    }
+}
+
+@media (min-width: 1000px) and (max-width: 1199px) {
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        flex: 1 1 calc(20% - 0.5rem) !important;
+        min-width: calc(20% - 0.5rem) !important;
+    }
+}
+
+@media (min-width: 701px) and (max-width: 999px) {
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        flex: 1 1 calc(25% - 0.5rem) !important;
+        min-width: calc(25% - 0.5rem) !important;
+    }
+}
+
+@media (max-width: 700px) {
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+        gap: 0.55rem !important;
+    }
+
+    div[class*="st-key-my_video_gallery_row_"] > div[data-testid="stLayoutWrapper"] > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        flex: 1 1 calc(50% - 0.4rem) !important;
+        min-width: calc(50% - 0.4rem) !important;
+    }
+}
+
 /* 高级设置属于内容展开入口，不是执行操作。保留 Streamlit 原生 expander 的
    语义和键盘交互，只在带 advanced_settings_ key 的局部容器内移除卡片边框，
    避免与紧邻的 AI 生成按钮形成两个连续大按钮的视觉干扰。 */

@@ -259,6 +259,7 @@ class AutopilotStore:
                 CREATE TABLE IF NOT EXISTS production_jobs (
                     job_id TEXT PRIMARY KEY,
                     plan_id TEXT NOT NULL UNIQUE REFERENCES content_plans(plan_id),
+                    parent_job_id TEXT,
                     channel_id TEXT NOT NULL,
                     profile_version INTEGER NOT NULL,
                     profile_snapshot_json TEXT NOT NULL,
@@ -342,6 +343,9 @@ class AutopilotStore:
             ):
                 if column not in publication_columns:
                     conn.execute(f"ALTER TABLE publications ADD COLUMN {column} {definition}")
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(production_jobs)")}
+            if "parent_job_id" not in job_columns:
+                conn.execute("ALTER TABLE production_jobs ADD COLUMN parent_job_id TEXT")
             slot_columns = {row["name"] for row in conn.execute("PRAGMA table_info(autopilot_slots)")}
             if "lease_owner" not in slot_columns:
                 conn.execute("ALTER TABLE autopilot_slots ADD COLUMN lease_owner TEXT")
@@ -401,6 +405,7 @@ class AutopilotStore:
         params_snapshot = json.loads(row["params_snapshot_json"])
         return ProductionJob(
             job_id=row["job_id"], plan_id=row["plan_id"], channel_id=row["channel_id"],
+            parent_job_id=row["parent_job_id"] if "parent_job_id" in row.keys() else None,
             profile_version=row["profile_version"], profile_snapshot=json.loads(row["profile_snapshot_json"]),
             params_snapshot=params_snapshot, topic=row["topic"], script=row["script"],
             fact_verification_state=row["fact_verification_state"],
@@ -450,27 +455,31 @@ class AutopilotStore:
             if old_script == script_norm or (script_norm and _script_similarity(script, row["script"]) >= _NEAR_DUPLICATE_SCRIPT):
                 raise DuplicateContent("script duplicates or closely matches existing channel history")
 
-    def assert_topic_available(self, channel_id: str, topic: str, cross_channel: bool):
+    def assert_topic_available(self, channel_id: str, topic: str, cross_channel: bool,
+                               ignore_plan_id: str | None = None):
         with self._connection() as conn:
             if cross_channel:
                 rows = conn.execute(
-                    "SELECT channel_id, topic FROM content_plans ORDER BY created_at DESC LIMIT ?",
+                    "SELECT plan_id, channel_id, topic FROM content_plans ORDER BY created_at DESC LIMIT ?",
                     (_HISTORY_SCAN_LIMIT * 2,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT channel_id, topic FROM content_plans WHERE channel_id=? "
+                    "SELECT plan_id, channel_id, topic FROM content_plans WHERE channel_id=? "
                     "ORDER BY created_at DESC LIMIT ?", (channel_id, _HISTORY_SCAN_LIMIT),
                 ).fetchall()
         normalized = normalize_content(topic)
         for row in rows:
+            if row["plan_id"] == ignore_plan_id:
+                continue
             if row["channel_id"] != channel_id and not cross_channel:
                 continue
             old = normalize_content(row["topic"])
             if old == normalized or (normalized and SequenceMatcher(None, normalized, old).ratio() >= _NEAR_DUPLICATE_TOPIC):
                 raise DuplicateContent("topic duplicates or closely matches existing channel history")
 
-    def create_plan(self, plan: ContentPlanCreate, profile: ChannelProfile, script: str) -> ContentPlan:
+    def create_plan(self, plan: ContentPlanCreate, profile: ChannelProfile, script: str,
+                    source_job_id: str | None = None) -> ContentPlan:
         now = _now()
         minimum, maximum = _duration_bounds(profile, plan)
         estimate = estimate_narration_duration(script, profile.language, profile.voice_rate)
@@ -489,8 +498,25 @@ class AutopilotStore:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                source = None
+                if source_job_id:
+                    source = conn.execute(
+                        "SELECT plan_id,channel_id FROM production_jobs WHERE job_id=?",
+                        (source_job_id,),
+                    ).fetchone()
+                    if source is None or source["channel_id"] != profile.channel_id:
+                        raise LookupError("source video not found for this channel")
                 self._assert_unique_content(conn, profile.channel_id, plan.topic, script,
-                                            plan.check_cross_channel_duplicates)
+                                            plan.check_cross_channel_duplicates,
+                                            ignore_plan_id=source["plan_id"] if source else None)
+                topic_fingerprint = fingerprint(plan.topic)
+                script_fingerprint = fingerprint(script)
+                if source:
+                    # The database's per-channel uniqueness indexes still protect normal plans;
+                    # an explicit version gets its own immutable fingerprints while preserving
+                    # the visible topic and narration text.
+                    topic_fingerprint = fingerprint(f"{plan.topic} version {plan_id}")
+                    script_fingerprint = fingerprint(f"{script} version {plan_id}")
                 conn.execute("""INSERT INTO content_plans (
                     plan_id,channel_id,profile_version,profile_json,topic,topic_fingerprint,script,script_fingerprint,
                     source_references_json,research_report_json,fact_verification_state,duration_estimate_seconds,min_duration_seconds,
@@ -498,7 +524,7 @@ class AutopilotStore:
                     effective_visual_style,visual_style_reason,created_at,updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?)""",
                     (plan_id, profile.channel_id, profile.version, plan_profile.model_dump_json(), plan.topic,
-                     fingerprint(plan.topic), script, fingerprint(script), "[]",
+                     topic_fingerprint, script, script_fingerprint, "[]",
                      "unverified", estimate, minimum, maximum,
                      plan.intended_publication_slot.isoformat() if plan.intended_publication_slot else None,
                      int(plan.check_cross_channel_duplicates), plan.visual_style_override or "",
@@ -689,6 +715,7 @@ class AutopilotStore:
             if row is None:
                 return
             params = json.loads(row["params_snapshot_json"] or "{}")
+            policy = task_state.get("fact_verification_policy")
             params.update({
                 "fact_verification_state": state,
                 "fact_verification_status": display_status,
@@ -697,6 +724,8 @@ class AutopilotStore:
                 "fact_research_timeout_seconds": params.get("fact_research_timeout_seconds")
                 or config.app.get("fact_research_timeout_seconds", 8),
             })
+            if policy in {"off", "advisory", "strict"}:
+                params["fact_verification_policy"] = policy
             conn.execute(
                 "UPDATE production_jobs SET fact_verification_state=?,research_snapshot_json=?,params_snapshot_json=?,updated_at=? WHERE job_id=?",
                 (state, json.dumps({"state": state, "status": display_status,
@@ -705,7 +734,8 @@ class AutopilotStore:
                  json.dumps(params, ensure_ascii=False), _now(), job_id),
             )
 
-    def create_job(self, plan_id: str, channel_id: str, profile_store: ChannelProfileStore) -> ProductionJob:
+    def create_job(self, plan_id: str, channel_id: str, profile_store: ChannelProfileStore,
+                   parent_job_id: str | None = None) -> ProductionJob:
         now = _now()
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -714,6 +744,12 @@ class AutopilotStore:
                                     (plan_id, channel_id)).fetchone()
                 if plan is None:
                     raise LookupError("content plan not found")
+                if parent_job_id:
+                    parent = conn.execute(
+                        "SELECT channel_id FROM production_jobs WHERE job_id=?", (parent_job_id,)
+                    ).fetchone()
+                    if parent is None or parent["channel_id"] != channel_id:
+                        raise LookupError("source video not found for this channel")
                 if plan["state"] != "ready":
                     raise InvalidTransition("content plan must be ready before a production job is created")
                 # A manual video's choices are captured with its plan. Scheduled plans
@@ -733,13 +769,13 @@ class AutopilotStore:
                 }).params
                 job_id = str(uuid4())
                 conn.execute("""INSERT INTO production_jobs (
-                    job_id, plan_id, channel_id, profile_version, profile_snapshot_json, params_snapshot_json,
+                    job_id, plan_id, parent_job_id, channel_id, profile_version, profile_snapshot_json, params_snapshot_json,
                     topic, script, source_references_json, research_snapshot_json, fact_verification_state, intended_publication_slot,
                     fact_review_notes, visual_style, effective_visual_style, visual_style_reason,
                     target_duration_seconds, min_duration_seconds, max_duration_seconds,
                     duration_estimate_seconds, state, attempt_count, output_artifacts_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', 0, '[]', ?, ?)""",
-                    (job_id, plan_id, channel_id, plan["profile_version"], profile.model_dump_json(),
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', 0, '[]', ?, ?)""",
+                    (job_id, plan_id, parent_job_id, channel_id, plan["profile_version"], profile.model_dump_json(),
                      json.dumps(resolved.model_dump(mode="json", warnings=False)),
                      plan["topic"], plan["script"], plan["source_references_json"], plan["research_report_json"],
                      plan["fact_verification_state"], plan["intended_publication_slot"], plan["fact_review_notes"],
@@ -1423,7 +1459,13 @@ class AutopilotService:
                   "subtitles": not job.params_snapshot.get("subtitle_enabled") or bool(task_state.get("subtitle_path") and os.path.isfile(task_state.get("subtitle_path"))),
                   "audio": bool(task_state.get("audio_file") and os.path.isfile(task_state.get("audio_file"))),
                   "material_references": bool(task_state.get("materials"))}
-        # MPT's clip probe proves files are readable; inspect every render variant.
+        audio_artifacts = [str(item) for item in (task_state.get("videos") or []) if item]
+        if not audio_artifacts:
+            audio_artifacts = [
+                item for item in job.output_artifacts
+                if Path(item).name.startswith("final-")
+            ] or list(job.output_artifacts)
+        # Check every render variant's orientation; only final videos carry audio.
         try:
             orientations, audio_tracks = [], []
             for artifact in job.output_artifacts:
@@ -1433,7 +1475,10 @@ class AutopilotService:
                     orientations.append((aspect == "9:16" and clip.h >= clip.w)
                         or (aspect == "16:9" and clip.w >= clip.h)
                         or (aspect == "1:1" and abs(clip.w - clip.h) / max(clip.w, clip.h) <= 0.03))
-                    audio_tracks.append(clip.audio is not None)
+                    # combined-*.mp4 is the intentionally silent visual intermediate;
+                    # final-*.mp4 is rendered with narration and is the deliverable.
+                    if artifact in audio_artifacts:
+                        audio_tracks.append(clip.audio is not None)
                 finally:
                     clip.close()
             checks["orientation"] = bool(orientations) and all(orientations)
@@ -1988,17 +2033,26 @@ class AutopilotService:
     def _manual_profile(self, channel_id: str, overrides: dict) -> ChannelProfile:
         allowed = {
             "target_duration_seconds", "video_aspect", "stock_video_style", "visual_style",
-            "language", "font_name", "narrator_preset", "profanity_level",
+            "language", "font_name", "narrator_preset", "profanity_level", "video_source",
+            "asmr_categories", "tts_provider",
             "savage_quality_policy",
             "fact_verification_policy", "duration_enforcement", "hindi_alignment_policy",
+            "bgm_type", "bgm_file", "bgm_volume", "voice_name", "tts_model",
+            "subtitle_enabled", "subtitle_position", "subtitle_display_mode",
+            "subtitle_animation", "voice_rate", "voice_volume", "allow_unverified_publication",
         }
         if set(overrides) - allowed:
             raise AutopilotError("unsupported manual video setting")
         profile = self.profile_store.get(channel_id)
         if not profile.enabled:
             raise AutopilotError("channel profile is disabled")
+        profile_values = {**profile.model_dump(mode="json"), **overrides}
+        if "tts_provider" in overrides:
+            settings = dict(profile_values.get("generation_settings") or {})
+            settings["tts_provider"] = overrides["tts_provider"]
+            profile_values["generation_settings"] = settings
         return ChannelProfile.model_validate({
-            **profile.model_dump(mode="json"), **overrides,
+            **profile_values,
             "publishing_policy": "manual", "auto_public_enabled": False,
         })
 
@@ -2055,7 +2109,8 @@ class AutopilotService:
         return self.store.get_plan(plan_id, channel_id)
 
     def plan(self, channel_id: str, payload: ContentPlanCreate,
-             manual_overrides: dict | None = None) -> ContentPlan:
+             manual_overrides: dict | None = None,
+             source_job_id: str | None = None) -> ContentPlan:
         channel_profile = self.profile_store.get(channel_id)
         profile = (self._manual_profile(channel_id, manual_overrides)
                    if manual_overrides is not None else channel_profile)
@@ -2070,7 +2125,15 @@ class AutopilotService:
             if payload.check_cross_channel_duplicates is None
             else payload.check_cross_channel_duplicates
         )
-        self.store.assert_topic_available(channel_id, topic, cross_channel_duplicates)
+        source_plan_id = None
+        if source_job_id:
+            source = self.store.get_job(source_job_id)
+            if source.channel_id != channel_id:
+                raise LookupError("source video not found for this channel")
+            source_plan_id = source.plan_id
+        self.store.assert_topic_available(
+            channel_id, topic, cross_channel_duplicates, ignore_plan_id=source_plan_id
+        )
         # Resolve before an empty-script draft so a plan style override is
         # already present in the prompt. Explicit manual task settings retain
         # priority over plan, profile, and process defaults.
@@ -2098,14 +2161,15 @@ class AutopilotService:
                 settings.visual_style if payload.visual_style_override is not None else None
             ),
             "check_cross_channel_duplicates": cross_channel_duplicates,
-        }), profile, script)
+        }), profile, script, source_job_id=source_job_id)
 
     def ready(self, channel_id: str, plan_id: str,
               accept_duration_estimate: bool = False) -> ContentPlan:
         return self.store.mark_plan_ready(plan_id, channel_id, accept_duration_estimate)
 
-    def create_job(self, channel_id: str, plan_id: str) -> ProductionJob:
-        return self.store.create_job(plan_id, channel_id, self.profile_store)
+    def create_job(self, channel_id: str, plan_id: str,
+                   parent_job_id: str | None = None) -> ProductionJob:
+        return self.store.create_job(plan_id, channel_id, self.profile_store, parent_job_id)
 
     def start_job(self, job_id: str) -> ProductionJob:
         job = self.store.get_job(job_id)

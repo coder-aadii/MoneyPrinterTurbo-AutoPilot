@@ -162,6 +162,7 @@ def build_preview(profile: ChannelProfile, job_values: dict[str, Any] | None = N
         "video_source": profile.video_source,
         "video_language": profile.language,
         "voice_name": resolve_profile_voice(profile),
+        "tts_provider": profile.generation_settings.get("tts_provider"),
         "tts_model": profile.tts_model,
         "narrator_preset": profile.narrator_preset,
         "profanity_level": profile.profanity_level,
