@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import os
 import shutil
 import subprocess
@@ -499,59 +500,26 @@ class TestVoiceService(unittest.TestCase):
             1.0,
             "/tmp/gemini-achernar.mp3",
             1.0,
+            model="gemini-3.8-flash-tts",
+            emotion_plan=None,
         )
 
-    def test_gemini_tts_uses_google_genai_and_compatible_submaker_fields(self):
+    def test_gemini_38_tts_uses_interactions_api_and_compatible_submaker_fields(self):
         """
-        验证 Gemini TTS 在 edge_tts 7.x 环境下仍会返回项目兼容的字幕结构，
+        验证 Gemini 3.8 TTS 返回项目兼容的字幕结构，
         并且可以被 `subtitle_provider=edge` 的字幕生成链路直接消费，
         避免再次回退 Whisper。同时使用不存在的嵌套输出目录，覆盖 API 或
         CLI 直接调用服务时没有提前创建任务目录的边界情况。
         """
 
-        class _InlineData:
-            def __init__(self, data):
-                self.data = data
-
-        class _Part:
-            def __init__(self, data):
-                self.inline_data = _InlineData(data)
-
-        class _Content:
-            def __init__(self, data):
-                self.parts = [_Part(data)]
-
-        class _Candidate:
-            def __init__(self, data):
-                self.content = _Content(data)
-
-        class _Response:
-            def __init__(self, data):
-                self.candidates = [_Candidate(data)]
-
-        captured = {}
-
-        class _FakeModels:
-            def generate_content(self, **kwargs):
-                captured.update(kwargs)
-                tone = (
-                    AudioSegment.silent(duration=1800)
-                    .set_frame_rate(24000)
-                    .set_channels(1)
-                    .set_sample_width(2)
-                )
-                return _Response(tone.raw_data)
-
-        class _FakeClient:
-            def __init__(self, **kwargs):
-                captured["client_kwargs"] = kwargs
-                self.models = _FakeModels()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                captured["closed"] = True
+        tone = AudioSegment.silent(duration=1800).set_frame_rate(24000).set_channels(1)
+        wav = io.BytesIO()
+        tone.export(wav, format="wav")
+        audio_data = base64.b64encode(wav.getvalue()).decode("ascii")
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"output_audio": {"data": audio_data}},
+        )
 
         temp_root = Path(tempfile.mkdtemp(prefix="gemini-tts-output-"))
         self.addCleanup(shutil.rmtree, temp_root, True)
@@ -562,7 +530,7 @@ class TestVoiceService(unittest.TestCase):
 
         self.assertFalse(output_dir.exists())
 
-        with patch("google.genai.Client", _FakeClient), patch.object(
+        with patch.object(vs.requests, "post", return_value=response) as post, patch.object(
             vs.config,
             "app",
             dict(vs.config.app, gemini_api_key="test-key"),
@@ -583,16 +551,16 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
         self.assertEqual(sub_maker.offset[0][0], 0)
         self.assertLess(sub_maker.offset[0][1], sub_maker.offset[1][1])
-        self.assertEqual(captured["client_kwargs"], {"api_key": "test-key"})
-        self.assertEqual(captured["model"], "gemini-2.5-flash-preview-tts")
-        self.assertEqual(captured["contents"], text)
-        self.assertEqual(captured["config"].response_modalities, ["AUDIO"])
-        voice_config = captured["config"].speech_config.voice_config
+        post.assert_called_once()
+        request = post.call_args.kwargs
         self.assertEqual(
-            voice_config.prebuilt_voice_config.voice_name,
-            "Zephyr",
+            post.call_args.args[0],
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
         )
-        self.assertTrue(captured["closed"])
+        self.assertEqual(request["headers"]["x-goog-api-key"], "test-key")
+        self.assertEqual(request["json"]["model"], "gemini-3.8-flash-tts")
+        self.assertEqual(request["json"]["response_format"], {"type": "audio"})
+        self.assertEqual(request["json"]["generation_config"]["speech_config"], [{"voice": "Zephyr"}])
 
         vs.create_subtitle(sub_maker=sub_maker, text=text, subtitle_file=subtitle_file)
         subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")

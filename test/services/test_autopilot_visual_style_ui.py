@@ -42,7 +42,10 @@ service = SimpleNamespace(
     store=SimpleNamespace(list_slots=lambda _: []),
     _topic_for_slot=lambda selected_profile, slot: record_generation("topic", selected_profile) or "ISS gravity",
     draft_script=lambda selected_profile, topic: record_generation("script", selected_profile) or "Generated narration",
-    schedule_state=lambda _: {"paused": False},
+    schedule_state=lambda _: {
+        "paused": False,
+        "buffer": {"validated": 0, "target": 6, "in_progress": 0},
+    },
     youtube_connections=SimpleNamespace(connection_for_channel=lambda _: None))
 autopilot_service = SimpleNamespace(get_service=lambda: service)
 config = SimpleNamespace(ui={"tts_server": "azure-tts-v1"}, app={})
