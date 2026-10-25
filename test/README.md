@@ -1,55 +1,34 @@
-# MoneyPrinterTurbo Test Directory
+# Test Guide
 
-This directory contains unit tests for the **MoneyPrinterTurbo** project.
+This directory contains automated tests for the MoneyPrinterTurbo AutoPilot fork.
 
-## Directory Structure
+## Test layout
 
-- `services/`: Domain-focused unit and controller tests
-  - `test_task.py`: Task pipeline tests
-  - `test_task_manager.py`: In-memory and Redis queue tests
-  - `test_controller_*.py`: API controller tests split by controller domain
-  - `test_video.py`, `test_voice.py`: Media service tests
-- `test_main.py`: Application entry-point test
+- `services/` contains service, workflow, UI, and controller tests.
+- `test_main.py` covers application entry points.
+- `conftest.py` blocks external socket connections during tests while allowing local loopback test servers. Provider-facing tests should mock their clients and HTTP requests.
 
-## Running Tests
+## Run tests
 
-The CI suite uses pytest, which also runs the existing `unittest.TestCase`
-tests:
+Install the locked project dependencies from the repository root, then run:
 
 ```bash
-# Run all tests
+# Entire test suite
 uv run python -X utf8 -m pytest -q test
 
-# Run a specific test file
-uv run python -X utf8 -m pytest -q test/services/test_video.py
+# One test module
+uv run python -X utf8 -m pytest -q test/services/test_voice.py
 
-# Run a specific test class
-uv run python -X utf8 -m pytest -q test/services/test_video.py::TestVideoService
-
-# Run a specific test method
-uv run python -X utf8 -m pytest -q test/services/test_video.py::TestVideoService::test_preprocess_video
+# One test class or test case
+uv run python -X utf8 -m pytest -q test/services/test_voice.py::TestVoiceService
+uv run python -X utf8 -m pytest -q test/services/test_voice.py::TestVoiceService::test_parse_gemini_voice_name_supports_new_and_legacy_labels
 ```
 
-To run the same branch coverage check used by CI:
+The repository test guard rejects external connections, including calls to paid LLM, TTS, image, and video providers. Do not enable live-provider tests in the normal automated suite. Use deterministic mocks and fixtures instead.
 
-```bash
-uv run python -X utf8 -m coverage run -m pytest -q test
-uv run python -m coverage report
-```
+## Add tests
 
-Live provider tests are skipped by default. To run tests that may call external
-TTS or LLM services, set `MPT_RUN_INTEGRATION_TESTS=1` and provide the required
-provider credentials.
-
-## Adding New Tests
-
-To add tests for other components, follow these guidelines:
-
-1. Name files `test_<domain>.py` and keep each file focused on one domain.
-2. Split broad controller suites into files such as `test_controller_video.py`.
-3. Use either pytest functions or `unittest.TestCase`; pytest collects both.
-4. Name test functions and methods with the `test_` prefix.
-
-## Test Resources
-
-Place any resource files required for testing in the `test/resources` directory.
+1. Keep each `test_<domain>.py` focused on one subsystem.
+2. Use pytest functions or `unittest.TestCase`; pytest collects both.
+3. Mock provider clients and network calls. Do not add credentials to fixtures.
+4. Put small, redistributable test assets under `test/resources` and document their origin when needed.
