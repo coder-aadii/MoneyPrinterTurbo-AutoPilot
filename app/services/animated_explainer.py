@@ -7,6 +7,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -24,6 +25,27 @@ from app.utils.subtitle_reader import file_to_subtitles
 WIDTH, HEIGHT, FPS = 1080, 1920, 30
 _BG = (250, 249, 244)
 _TOP_PANEL = (96, 350, 984, 820)
+MAX_STOCK_CLIP_SECONDS = 5.0
+
+
+def _stock_candidate_keys(candidate: dict) -> set[str]:
+    """Return stable identities so renditions of one source are never reused."""
+    provider = str(candidate.get("provider") or "").casefold()
+    keys = set()
+    asset_id = str(candidate.get("asset_id") or "").strip()
+    url = str(candidate.get("url") or "").strip()
+    digest = str(candidate.get("sha256") or "").strip().casefold()
+    if asset_id:
+        keys.update((asset_id, f"asset:{provider}:{asset_id}"))
+    if url:
+        keys.add(f"url:{url.split('#', 1)[0]}")
+    if digest:
+        keys.add(f"sha256:{digest}")
+    return keys
+
+
+def _stock_candidate_is_used(candidate: dict, used_keys: set[str]) -> bool:
+    return bool(_stock_candidate_keys(candidate) & used_keys)
 
 
 @lru_cache(maxsize=4)
@@ -126,6 +148,8 @@ def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
     video_dir = Path(utils.storage_dir("cache_videos"))
     query_terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold())
                    if term not in {"a", "the", "above", "and", "moving", "footage"}}
+    if not query_terms:
+        return []
     candidates: dict[str, dict] = {}
     for cache_file in cache_dir.glob("*.json"):
         try:
@@ -148,7 +172,8 @@ def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
                                       str(info.get("title", "")),
                                       " ".join(map(str, tags)))).casefold()
             matched = query_terms & set(re.findall(r"[a-z0-9]+", metadata_text))
-            if len(matched) < 2:
+            minimum_matches = min(2, len(query_terms))
+            if not minimum_matches or len(matched) < minimum_matches:
                 continue
             digest = hashlib.md5(url.encode("utf-8")).hexdigest()
             local = video_dir / f"vid-{digest}.mp4"
@@ -173,8 +198,65 @@ def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
     return sorted(candidates.values(), key=lambda value: (-value["relevance_score"], value["asset_id"]))
 
 
-def _search_and_cache_stock_candidate(query: str, provider: str, task_id: str) -> list[dict]:
-    """Use MPT's configured provider search/cache and existing downloader for a beat."""
+MAX_STOCK_REPLACEMENTS_PER_TERM = 3
+
+
+def _prepare_stock_candidate(candidate: dict, task_id: str, seconds: float) -> str:
+    """Transcode and decode the exact short panel clip before accepting its source."""
+    if seconds <= 0 or seconds > MAX_STOCK_CLIP_SECONDS:
+        return ""
+    panel_dir = Path(utils.task_dir(task_id)) / "top-panel-media"
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    prepared = panel_dir / f"{candidate['sha256'][:16]}-{round(seconds * 1000)}ms-panel.mp4"
+    if not prepared.is_file():
+        result = subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", candidate["path"], "-t", f"{seconds:.3f}", "-an", "-sn", "-dn",
+            "-vf", "scale=888:470:force_original_aspect_ratio=increase,crop=888:470,fps=30",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-pix_fmt", "yuv420p", str(prepared),
+        ], check=False, capture_output=True, text=True)
+        if result.returncode or not prepared.is_file():
+            try:
+                prepared.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return ""
+    clip = None
+    try:
+        clip = VideoFileClip(str(prepared), audio=False)
+        clip.get_frame(0)
+        if not math.isfinite(float(clip.duration)) or clip.duration + 1 / FPS < seconds:
+            clip.close()
+            clip = None
+            prepared.unlink(missing_ok=True)
+            return ""
+        return str(prepared)
+    except (OSError, ValueError, IndexError):
+        try:
+            prepared.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return ""
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception:
+                pass
+
+
+def _search_and_cache_stock_candidate(
+    query: str,
+    provider: str,
+    task_id: str,
+    *,
+    required_count: int = 1,
+    minimum_duration: int = 3,
+    clip_seconds: float | None = None,
+    exclude_asset_ids: set[str] | None = None,
+) -> list[dict]:
+    """Fetch only needed, valid candidates and try same-query replacements on failure."""
     searchers = {
         "pixabay": material.search_videos_pixabay,
         "coverr": material.search_videos_coverr,
@@ -187,32 +269,70 @@ def _search_and_cache_stock_candidate(query: str, provider: str, task_id: str) -
         material.get_api_key(f"{provider}_api_keys")
         items = material._search_videos_with_cache(
             provider=provider, search_videos=searcher, search_term=query,
-            minimum_duration=3, video_aspect="16:9",
+            minimum_duration=minimum_duration, video_aspect="16:9",
         )
     except Exception as exc:
         logger.warning(f"optional {provider} storyboard search failed: {type(exc).__name__}")
         return []
-    scored = []
+    ranked = []
     query_terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold())
                    if term not in {"a", "the", "above", "and", "moving", "footage"}}
+    if not query_terms:
+        return []
     for item in items:
         info = item.source_info if isinstance(item.source_info, dict) else {}
         if not info.get("license") and provider != "coverr":
             continue
         tags = info.get("tags") or []
-        words = set(re.findall(r"[a-z0-9]+", " ".join(map(str, tags)).casefold()))
+        searchable_text = " ".join((str(info.get("title") or ""),
+                                     str(info.get("description") or ""),
+                                     " ".join(map(str, tags))))
+        words = set(re.findall(r"[a-z0-9]+", searchable_text.casefold()))
         score = len(query_terms & words)
-        if score < 1:
+        if score < min(2, len(query_terms)):
             continue
+        ranked.append((score, float(item.duration or 0), item, info, tags))
+    ranked.sort(key=lambda candidate: (-candidate[0], -candidate[1]))
+    scored = []
+    excluded = {str(asset_id) for asset_id in (exclude_asset_ids or set())}
+    unique_ranked = []
+    seen_candidate_keys: set[str] = set()
+    for candidate in ranked:
+        _score, _duration, item, info, _tags = candidate
+        candidate_info = {
+            "provider": provider,
+            "asset_id": info.get("asset_id"),
+            "url": item.url,
+        }
+        keys = _stock_candidate_keys(candidate_info)
+        if keys & excluded or keys & seen_candidate_keys:
+            continue
+        unique_ranked.append(candidate)
+        seen_candidate_keys.update(keys)
+    ranked = unique_ranked
+    target = max(1, int(required_count))
+    attempt_limit = target + MAX_STOCK_REPLACEMENTS_PER_TERM
+    attempts = 0
+    approved_count = 0
+    seen_content_hashes: set[str] = set()
+    for score, _duration, item, info, tags in ranked:
+        asset_id = str(info.get("asset_id") or item.url)
+        if attempts >= attempt_limit:
+            break
+        attempts += 1
         try:
-            path = material._save_material_item(item, str(Path(utils.task_dir(task_id)) / "top-panel-media"))
+            path = material._save_material_item(
+                item, str(Path(utils.task_dir(task_id)) / "top-panel-media")
+            )
         except Exception:
             continue
-        media = _probe_video(path)
-        if not media:
+        if not path:
             continue
-        scored.append({
-            "provider": provider, "asset_id": str(info.get("asset_id") or ""),
+        media = _probe_video(path)
+        if not media or media["duration"] < minimum_duration:
+            continue
+        candidate = {
+            "provider": provider, "asset_id": asset_id,
             "source_page": info.get("source_page"),
             "license": info.get("license") or "Coverr License",
             "license_url": info.get("license_url") or "https://coverr.co/license",
@@ -222,7 +342,34 @@ def _search_and_cache_stock_candidate(query: str, provider: str, task_id: str) -
             "height": media["height"], "codec": media["codec"],
             "tags": list(tags) if isinstance(tags, list) else [],
             "relevance_score": score,
-        })
+            "human_approval": visual_review.human_approval(
+                asset_id, task_artifacts.file_digest(path)
+            ),
+        }
+        content_hash_key = f"sha256:{str(candidate['sha256']).casefold()}"
+        if content_hash_key in excluded or content_hash_key in seen_content_hashes:
+            continue
+        seen_content_hashes.add(content_hash_key)
+        if candidate["human_approval"]:
+            if clip_seconds is not None:
+                candidate["prepared_path"] = _prepare_stock_candidate(
+                    candidate, task_id, clip_seconds
+                )
+                if not candidate["prepared_path"]:
+                    continue
+            approved_count += 1
+        else:
+            try:
+                candidate["visual_review"] = visual_review.sample_clip(
+                    path, task_id, asset_id,
+                    usable_seconds=min(float(media["duration"]), MAX_STOCK_CLIP_SECONDS),
+                    video_aspect="16:9",
+                )
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        scored.append(candidate)
+        if approved_count >= target:
+            break
     return sorted(scored, key=lambda value: (-value["relevance_score"], value["asset_id"]))
 
 
@@ -232,84 +379,242 @@ def resolve_storyboard_media(
     *,
     provider: str = "pixabay",
     allow_unapproved_preview: bool = False,
+    stock_terms: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Resolve beat media to approved local files; pending assets remain fallbacks."""
+    """Use one keyword per narration topic and one reviewed clip per <=5s window."""
+    if isinstance(stock_terms, str):
+        usable_terms = [term.strip() for term in re.split(r"[,，\n]", stock_terms) if term.strip()]
+    else:
+        usable_terms = [str(term).strip() for term in (stock_terms or []) if str(term).strip()]
+    if usable_terms and beats:
+        if len(usable_terms) != len(beats):
+            raise ValueError(
+                "Savage stock keywords must map one-to-one to narration beats: "
+                f"received {len(usable_terms)} keyword(s) for {len(beats)} beat(s). "
+                "Repeat a keyword for each beat that stays on the same topic."
+            )
+        for index, (beat, query) in enumerate(zip(beats, usable_terms)):
+            beats[index] = {
+                **beat,
+                "visual_mode": "stock_video",
+                "stock_query": query,
+                "effective_media_type": "illustration",
+                "visual_rationale": (
+                    "Use this editable narration-topic keyword for stock search; keep the "
+                    "original character and diagram visible as the approved fallback."
+                ),
+            }
+    elif usable_terms:
+        raise ValueError(
+            "Savage stock keywords cannot be mapped because narration timing produced no beats."
+        )
+
+    windows_by_query: dict[str, dict] = {}
+    report = []
+    for beat_index, beat in enumerate(beats):
+        query = str(beat.get("stock_query") or "").strip()
+        if beat.get("visual_mode") != "stock_video" or not query:
+            continue
+        try:
+            start, end = float(beat["start"]), float(beat["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end) and end > start):
+            continue
+        windows = []
+        cursor = start
+        while cursor < end:
+            clip_end = min(cursor + MAX_STOCK_CLIP_SECONDS, end)
+            windows.append({"beat_index": beat_index, "start": cursor, "end": clip_end})
+            cursor = clip_end
+        group_key = query.casefold()
+        group = windows_by_query.setdefault(
+            group_key, {"query": query, "windows": [], "candidates": []}
+        )
+        group["windows"].extend(windows)
+
     used_assets: set[str] = set()
     media_segments = []
-    report = []
-    for beat in beats:
-        entry = {
-            "beat_id": beat.get("beat_id"), "start": beat.get("start"), "end": beat.get("end"),
-            "short_visual_title": beat.get("short_visual_title"),
-            "query": beat.get("stock_query"), "planned_type": beat.get("visual_mode"),
-            "effective_type": beat.get("visual_mode"),
-            "selection_reason": beat.get("visual_rationale"), "fallback_reason": None,
-            "provider": None, "asset_id": None, "source_page": None, "license": None,
-            "license_url": None, "sha256": None, "local_path": None,
-            "approval_status": "not_required",
-            "source_url": None, "provider_download_url": None,
-        }
-        if beat.get("visual_mode") != "stock_video" or not beat.get("stock_query"):
-            report.append(entry)
-            continue
-        candidates = _cached_stock_candidates(beat["stock_query"], provider)
-        if not candidates:
-            candidates = _search_and_cache_stock_candidate(
-                beat["stock_query"], provider, task_id
+    for group in windows_by_query.values():
+        query = group["query"]
+        windows = group["windows"]
+        needed_count = len(windows)
+        minimum_duration = max(
+            3, math.ceil(max(window["end"] - window["start"] for window in windows))
+        )
+        clip_seconds = max(window["end"] - window["start"] for window in windows)
+        candidates = [
+            item for item in _cached_stock_candidates(query, provider)
+            if float(item.get("duration", 0)) >= minimum_duration
+            and not _stock_candidate_is_used(item, used_assets)
+        ]
+        unique_candidates = []
+        cached_ids: set[str] = set()
+        for candidate in candidates:
+            keys = _stock_candidate_keys(candidate)
+            if keys & cached_ids:
+                continue
+            unique_candidates.append(candidate)
+            cached_ids.update(keys)
+        candidates = unique_candidates
+        approved_cached = 0
+        for candidate in candidates:
+            candidate["human_approval"] = visual_review.human_approval(
+                candidate["asset_id"], candidate["sha256"]
             )
-        selected = next((item for item in candidates
-                         if item["asset_id"] not in used_assets), None)
-        if not selected:
-            entry["fallback_reason"] = "No licensed, relevant, locally decodable provider candidate was available."
-            beat["effective_media_type"] = "illustration"
-            beat["top_visual"] = "cloud_illustration" if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
-            report.append(entry)
-            continue
-        used_assets.add(selected["asset_id"])
-        approval = visual_review.human_approval(selected["asset_id"], selected["sha256"])
-        entry.update({key: selected.get(key) for key in (
-            "provider", "asset_id", "source_page", "license", "license_url", "sha256", "path"
-        )})
-        entry["source_url"] = selected.get("source_page")
-        if selected.get("provider") != "coverr":
-            entry["provider_download_url"] = selected.get("url")
-        entry["local_path"] = selected["path"]
-        entry["approval_status"] = "approved" if approval else "human_review_required"
-        if approval:
-            entry["human_approval"] = approval
-        if not approval:
-            try:
-                entry["visual_review"] = visual_review.sample_clip(
-                    selected["path"], task_id, selected["asset_id"],
-                    usable_seconds=min(float(selected["duration"]), max(.5, beat["end"]-beat["start"])),
-                    video_aspect="16:9",
+            if candidate["human_approval"]:
+                candidate["prepared_path"] = _prepare_stock_candidate(
+                    candidate, task_id, clip_seconds
                 )
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass
-        if approval:
-            beat["effective_media_type"] = "stock_video"
-            entry["effective_type"] = "stock_video"
-            beat["selected_source"] = {key: selected.get(key) for key in (
+                candidate["preparation_failed"] = not bool(candidate["prepared_path"])
+                if candidate["prepared_path"]:
+                    approved_cached += 1
+        if approved_cached < needed_count:
+            excluded_keys = set(cached_ids) | set(used_assets)
+            candidates.extend(_search_and_cache_stock_candidate(
+                query,
+                provider,
+                task_id,
+                required_count=needed_count - approved_cached,
+                minimum_duration=minimum_duration,
+                clip_seconds=clip_seconds,
+                exclude_asset_ids=excluded_keys,
+            ))
+
+        for window in windows:
+            beat = beats[window["beat_index"]]
+            required_seconds = window["end"] - window["start"]
+            selected = None
+            selected_approval = None
+            pending_candidate = None
+            for candidate in candidates:
+                if candidate.get("preparation_failed"):
+                    continue
+                if (_stock_candidate_is_used(candidate, used_assets)
+                        or float(candidate.get("duration", 0)) < required_seconds):
+                    continue
+                approval = candidate.get("human_approval")
+                if "human_approval" not in candidate:
+                    approval = visual_review.human_approval(
+                        candidate["asset_id"], candidate["sha256"]
+                    )
+                if approval:
+                    selected, selected_approval = candidate, approval
+                    break
+                if pending_candidate is None:
+                    pending_candidate = candidate
+            if selected is None:
+                selected = pending_candidate
+
+            entry = {
+                "beat_id": beat.get("beat_id"), "start": window["start"], "end": window["end"],
+                "short_visual_title": beat.get("short_visual_title"),
+                "query": query, "planned_type": "stock_video",
+                "effective_type": "illustration",
+                "selection_reason": beat.get("visual_rationale"), "fallback_reason": None,
+                "provider": None, "asset_id": None, "source_page": None, "license": None,
+                "license_url": None, "sha256": None, "local_path": None,
+                "approval_status": "not_found",
+                "source_url": None, "provider_download_url": None,
+            }
+            if not selected:
+                entry["fallback_reason"] = "No relevant, decodable candidate met the requested clip duration."
+                beat["effective_media_type"] = "illustration"
+                beat["top_visual"] = (
+                    "cloud_illustration"
+                    if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
+                )
+                report.append(entry)
+                continue
+
+            used_assets.update(_stock_candidate_keys(selected))
+            entry.update({key: selected.get(key) for key in (
                 "provider", "asset_id", "source_page", "license", "license_url", "sha256"
-            )}
-            media_segments.append({**selected, "start": beat["start"], "end": beat["end"], "approved": True})
-        elif allow_unapproved_preview:
-            beat["effective_media_type"] = "stock_video_review_only"
-            entry["effective_type"] = "stock_video_review_only"
-            media_segments.append({**selected, "start": beat["start"], "end": beat["end"], "approved": False})
-            entry["fallback_reason"] = "Shown only in the visibly watermarked local review preview; approval is pending."
-        else:
-            beat["effective_media_type"] = "illustration"
-            entry["effective_type"] = "illustration"
-            beat["top_visual"] = "cloud_illustration" if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
-            entry["fallback_reason"] = "Human visual approval is required before this source can appear in a final render."
-        report.append(entry)
+            )})
+            entry["source_url"] = selected.get("source_page")
+            if selected.get("provider") != "coverr":
+                entry["provider_download_url"] = selected.get("url")
+            entry["local_path"] = selected["path"]
+            entry["approval_status"] = "approved" if selected_approval else "human_review_required"
+            if selected_approval:
+                entry["human_approval"] = selected_approval
+                beat["effective_media_type"] = "stock_video"
+                beat["selected_source"] = {key: selected.get(key) for key in (
+                    "provider", "asset_id", "source_page", "license", "license_url", "sha256"
+                )}
+                media_segments.append({
+                    **selected, "start": window["start"], "end": window["end"],
+                    "search_term": query,
+                    "approved": True,
+                })
+                entry["effective_type"] = "stock_video"
+            else:
+                try:
+                    entry["visual_review"] = visual_review.sample_clip(
+                        selected["path"], task_id, selected["asset_id"],
+                        usable_seconds=min(float(selected["duration"]), required_seconds),
+                        video_aspect="16:9",
+                    )
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+                if allow_unapproved_preview:
+                    beat["effective_media_type"] = "stock_video_review_only"
+                    media_segments.append({
+                        **selected, "start": window["start"], "end": window["end"],
+                        "search_term": query,
+                        "approved": False,
+                    })
+                    entry["effective_type"] = "stock_video_review_only"
+                    entry["fallback_reason"] = (
+                        "Shown only in the visibly watermarked local review preview; approval is pending."
+                    )
+                else:
+                    beat["effective_media_type"] = "illustration"
+                    beat["top_visual"] = (
+                        "cloud_illustration"
+                        if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
+                    )
+                    entry["fallback_reason"] = (
+                        "Candidate failed the approval requirement; the illustrated scene is used."
+                    )
+            report.append(entry)
     report_path = Path(utils.task_dir(task_id)) / "top-panel-storyboard.json"
     try:
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         logger.warning(f"could not save optional top-panel storyboard report: {type(exc).__name__}")
     return beats, media_segments
+
+
+def cleanup_stock_media(task_id: str) -> list[str]:
+    """Remove task-local stock downloads after a successful final render, keeping source metadata."""
+    task_root = Path(utils.task_dir(task_id)).resolve()
+    media_dir = task_root / "top-panel-media"
+    if not media_dir.exists() or media_dir.is_symlink():
+        return []
+    try:
+        media_dir.resolve().relative_to(task_root)
+        files = [str(item) for item in media_dir.iterdir() if item.is_file()]
+        shutil.rmtree(media_dir)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"could not clean task-local stock media: {type(exc).__name__}")
+        return []
+
+    report_path = task_root / "top-panel-storyboard.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if isinstance(report, list):
+            for item in report:
+                if isinstance(item, dict) and item.get("local_path"):
+                    item["local_path"] = None
+                    item["local_media_removed"] = True
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning(f"could not update stock metadata after cleanup: {type(exc).__name__}")
+    return files
 
 
 def _draw_gravity_diagram(draw: ImageDraw.ImageDraw, font_path: str) -> None:
@@ -780,6 +1085,7 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
                       emotion_beats: list[dict] | None = None,
                       display_word_map: list[dict] | None = None,
                       stock_provider: str = "pixabay",
+                      stock_terms: list[str] | None = None,
                       preview_unapproved_stock: bool = False) -> str:
     """Render a 1080×1920, 30 FPS local explainer scene with the saved narrator."""
     if not math.isfinite(float(duration)) or duration <= 0:
@@ -792,28 +1098,19 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
     beats = emotion_storyboard.resolve(emotion_beats or [], cues)
     beats, stock_segments = resolve_storyboard_media(
         task_id, beats, provider=stock_provider,
+        stock_terms=stock_terms,
         allow_unapproved_preview=preview_unapproved_stock,
     )
     prepared_segments = []
-    panel_dir = Path(utils.task_dir(task_id)) / "top-panel-media"
-    panel_dir.mkdir(parents=True, exist_ok=True)
     for segment in stock_segments:
         seconds = float(segment["end"]) - float(segment["start"])
         if seconds <= 0 or seconds > float(segment["duration"]):
             continue
-        prepared_path = panel_dir / (
-            f"{segment['sha256'][:16]}-{round(seconds * 1000)}ms-panel.mp4"
+        prepared_path = segment.get("prepared_path") or _prepare_stock_candidate(
+            segment, task_id, seconds
         )
-        if not prepared_path.is_file():
-            result = subprocess.run([
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", segment["path"], "-t", f"{seconds:.3f}", "-an", "-sn", "-dn",
-                "-vf", "scale=888:470:force_original_aspect_ratio=increase,crop=888:470,fps=30",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-                "-pix_fmt", "yuv420p", str(prepared_path),
-            ], check=False, capture_output=True, text=True)
-            if result.returncode or not prepared_path.is_file():
-                continue
+        if not prepared_path or not Path(prepared_path).is_file():
+            continue
         try:
             panel_clip = VideoFileClip(str(prepared_path), audio=False)
             panel_clip.get_frame(0)

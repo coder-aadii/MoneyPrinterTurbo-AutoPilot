@@ -4,6 +4,17 @@
 
 Make the smallest correct, tested change while minimizing unnecessary context, tool calls, and output. Prefer verified repository behavior over assumptions.
 
+## Top-priority rule — prove the user-facing path
+
+For every user-visible feature or bug fix, identify each affected entry point
+(WebUI, API, CLI, scheduler, or other applicable interface) and trace the complete
+path from the control or request through submitted settings, persisted task/job
+state, and the code that consumes that state. Add a focused regression test that
+exercises each affected interface and verifies the resulting saved state. Service
+tests alone do not prove a UI feature works. Do not call the work complete until
+these paths are verified; clearly report any interface or persistence behavior
+that could not be tested.
+
 ## Repository map
 
 MoneyPrinterTurbo is a Python 3.11+ AI short-video generator.
@@ -20,7 +31,17 @@ MoneyPrinterTurbo is a Python 3.11+ AI short-video generator.
 | Generated artifacts | `storage/`                                         |
 | Dependencies        | `pyproject.toml`, `uv.lock`                        |
 
-Pipeline: topic → LLM script/keywords → stock media → voice/subtitles/music → FFmpeg video.
+Pipeline:
+topic → AI script → optional fact verification → Hindi/Hinglish
+normalization → TTS → word alignment → emotion storyboard →
+stock/original visuals → FFmpeg render → QA → YouTube publishing.
+
+Autopilot:
+persistent schedule → queued generation → validated video buffer →
+private upload → scheduled publication → reconciliation.
+
+Visual styles: AUTO, Savage Animated Explainer,
+Relevant Stock, ASMR Cutting.
 
 Optional Redis task queue. No StoryWeaver/Remotion/Next.js architecture here.
 
@@ -113,6 +134,110 @@ If detailed documentation or a report was explicitly requested, write the full c
 - No live paid-provider requests without explicit authorization.
 - No new dependencies unless justified by the task.
 - Never stage, commit, push or reset user changes without explicit permission.
+- Never solve a failing pipeline by repeatedly adding new validation, prompts or dependencies without proving the root cause. Prefer recovering existing artifacts and fixing the smallest demonstrated defect.
+
+## Production correctness — mandatory
+
+The primary project goal is reliable, unattended generation and scheduled YouTube publication of original Hindi Shorts.
+
+Prioritize correctness, recoverability, security and user-visible functionality over adding features.
+
+### Critical workflow invariants
+
+- A user-selected setting must reach every relevant downstream consumer. Verify UI → API/service → saved task → provider → renderer, not merely UI persistence.
+- Visual Style is a complete production preset. Preserve resolved settings and explicit overrides consistently across manual generation and Autopilot.
+- Fact verification is user-configurable: Off, Advisory or Strict. Never silently upgrade Advisory/Off to Strict or label unchecked claims verified.
+- Flexible duration accepts actual narration duration without truncating, stretching or unnecessary regeneration.
+- Preserve the canonical spoken script, display script and word mapping across Hindi/Hinglish TTS, alignment and captions.
+- Do not fabricate subtitle timestamps, silently drop spoken words, or represent uncertain alignment as verified.
+- For Savage narration, direct sarcasm/profanity at jargon, misconceptions or absurd situations, not the viewer.
+- For animated explainers, use narration-linked character reactions and meaningful stock/original visuals; avoid random pose changes or repeated generic diagrams.
+- Reuse intermediate artifacts only when their content fingerprints and relevant settings match.
+- Never allow production code to silently substitute mocks or dummy provider responses.
+- Never solve a failing pipeline by repeatedly adding new validation, prompts or dependencies without proving the root cause. Prefer recovering existing artifacts and fixing the smallest demonstrated defect.
+
+### Autopilot and YouTube reliability
+
+- Scheduled jobs must be persistent, restart-safe and idempotent.
+- Do not create duplicate jobs, videos or public uploads for the same scheduled slot.
+- Resume safe checkpoints and reconcile uncertain external-provider outcomes before retrying.
+- Apply bounded retries, backoff, rate limits and configured provider budgets.
+- Do not repeat potentially billable operations merely because a response was lost.
+- Prepare videos ahead of publication slots; don't assume generation completes instantly.
+- Use actual media duration and verify final MP4/audio integrity.
+- Validate the destination YouTube channel and selected publishing policy.
+- Never silently publish to a different channel or change Private to Public.
+- A failed or missed slot must be recorded accurately; never report success without remote confirmation.
+- Respect existing stock-media provenance, license and approval requirements.
+- Never bypass security, asset or publication safeguards simply to make a scheduled job complete.
+
+### Security boundaries
+
+Treat user input, generated scripts, provider responses, retrieved web pages, uploads, file paths and task metadata as untrusted.
+
+- Enforce authentication and authorization for every protected API and media route.
+- Validate file paths and prevent traversal outside intended storage roots.
+- Do not execute LLM/provider output as shell commands or executable code.
+- Protect against SSRF in remote URL/page/media fetching.
+- Keep OAuth credentials, API keys and encryption keys out of logs, commits and generated reports.
+- Use least-privilege permissions for credentials and external integrations.
+- Validate uploaded files and avoid trusting filenames, MIME types or provider metadata alone.
+- Avoid introducing unsafe deserialization or command injection through FFmpeg and subprocess arguments.
+- Use established project security patterns rather than inventing new authentication mechanisms.
+- Do not remove working authorization, validation or rate-limiting checks to resolve unrelated errors.
+
+### Verification standards
+
+For every nontrivial bug fix:
+
+1. Reproduce the bug or establish a failing test where practical.
+2. Identify the root cause and affected callers.
+3. Implement the smallest correct fix.
+4. Add a focused regression test.
+5. Run the relevant tests and static checks.
+6. Verify the affected user-visible workflow where feasible.
+
+For changes spanning multiple pipeline stages, include an integration test covering the actual data flow.
+
+Mocked tests prove local behavior only. Do not claim live TTS, YouTube publishing, browser interaction, rendered video quality or external-provider availability without testing them.
+
+Browser UI changes require checking the actual rendered UI, including relevant mobile layouts.
+
+Video changes require inspecting representative rendered frames and media metadata; audio/synchronization claims require corresponding playback or alignment evidence.
+
+Distinguish confirmed defects, plausible risks and environment limitations.
+
+### Safe releases
+
+- Develop changes on focused branches where practical; keep `main` suitable for tested releases.
+- Preserve user changes, local credentials, databases and generated task artifacts.
+- Inspect the diff before staging or committing.
+- Do not commit, merge, push, deploy or publish unless explicitly authorized.
+- Never force-push or rewrite shared history without explicit authorization.
+- Before a production release, confirm critical tests, configuration compatibility, secrets handling and rollback readiness.
+- Prefer reverting a faulty release over making uncontrolled production hotfixes.
+
+### Stop conditions
+
+Stop and report when:
+
+- A change could delete or corrupt user data.
+- An operation would require an unapproved billable provider call.
+- A proposed retry could duplicate a YouTube upload or another irreversible external action.
+- A security-sensitive operation cannot be validated safely.
+- The task requires a decision about public publishing, credentials or destructive migration.
+
+Do not stop routine local development merely because optional research, creative-quality checks or other advisory features report warnings.
+
+### Reporting
+
+For completed changes, report only:
+
+- What changed.
+- What actually passed verification.
+- What remains untested or blocked.
+
+Never equate passing unit tests with end-to-end production readiness.
 
 ## Verification
 

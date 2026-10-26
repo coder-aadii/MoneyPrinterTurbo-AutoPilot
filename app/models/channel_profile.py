@@ -47,6 +47,12 @@ class ChannelProfile(BaseModel):
     bgm_type: str = Field(default="random", max_length=64)
     bgm_file: str = Field(default="", max_length=1000)
     bgm_volume: float = Field(default=0.2, ge=0, le=1)
+    intro_enabled: bool = False
+    intro_text: str = Field(default="", max_length=1000)
+    intro_audio: dict[str, str | float | int | None] | None = None
+    outro_enabled: bool = False
+    outro_text: str = Field(default="", max_length=1000)
+    outro_audio: dict[str, str | float | int | None] | None = None
     generation_provider: str = Field(default="global", max_length=100)
     generation_settings: dict[str, str | int | float | bool] = Field(default_factory=dict)
     timezone: str = "UTC"

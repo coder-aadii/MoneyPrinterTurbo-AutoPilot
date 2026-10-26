@@ -5020,8 +5020,19 @@ def _render_local_script_generation(params):
             terms = llm.generate_terms(
                 params.video_subject,
                 script,
-                amount=8 if params.match_materials_to_script else 5,
-                match_script_order=params.match_materials_to_script,
+                amount=(
+                    max(1, len(tm.emotion_storyboard.build(
+                        tm._represent_script(params, script).spoken_script,
+                        narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+                        profanity_level=params.profanity_level or "savage_monetization_aware",
+                    )))
+                    if params.visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                    else 8 if params.match_materials_to_script else 5
+                ),
+                match_script_order=(
+                    params.match_materials_to_script
+                    or params.visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                ),
                 app_config=app_config_snapshot,
                 stock_video_style=params.stock_video_style,
                 asmr_categories=params.asmr_categories,
@@ -5659,15 +5670,42 @@ def _render_script_settings(panel, params):
                             lambda app_config_snapshot: llm.generate_terms(
                                 params.video_subject,
                                 params.video_script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
+                                amount=(
+                                    max(1, len(tm.emotion_storyboard.build(
+                                        tm._represent_script(params, params.video_script).spoken_script,
+                                        narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+                                        profanity_level=params.profanity_level or "savage_monetization_aware",
+                                    )))
+                                    if params.visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                                    else 8 if params.match_materials_to_script else 5
+                                ),
+                                match_script_order=(
+                                    params.match_materials_to_script
+                                    or params.visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                                ),
                                 app_config=app_config_snapshot,
                                 stock_video_style=params.stock_video_style,
                                 asmr_categories=params.asmr_categories,
                             ),
                         )
-                        if "Error: " in terms:
+                        if isinstance(terms, str):
                             st.error(tr(terms))
+                        elif (params.visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                              and len(terms) != len(tm.emotion_storyboard.build(
+                                  tm._represent_script(params, params.video_script).spoken_script,
+                                  narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+                                  profanity_level=params.profanity_level or "savage_monetization_aware",
+                              ))):
+                            expected = len(tm.emotion_storyboard.build(
+                                tm._represent_script(params, params.video_script).spoken_script,
+                                narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+                                profanity_level=params.profanity_level or "savage_monetization_aware",
+                            ))
+                            st.error(
+                                "Generated " + str(len(terms)) + " keyword(s) for "
+                                + str(expected) + " narration beats. Add or repeat keywords "
+                                "so each beat has an explicit keyword."
+                            )
                         else:
                             st.session_state["video_terms"] = ", ".join(terms)
 
@@ -5731,7 +5769,7 @@ def _render_video_settings(panel, params):
                 options=tuple(VISUAL_STYLE_VALUES),
                 key="visual_style_select",
                 on_change=_on_visual_style_changed,
-                help="Animated Explainer uses the saved character pack and original diagrams without stock media.",
+                help="Savage combines script-matched stock clips with the original character and diagrams. ASMR uses only quality-approved ASMR footage.",
             )
             params.visual_style = VISUAL_STYLE_VALUES[selected_visual_style]
             resolved_style_settings = generation_settings_service.resolve_generation_settings(
@@ -9146,7 +9184,8 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
                             review_ai_draft=False, narrator_preset=None,
                             profanity_level=None, fact_verification_policy=None,
                             savage_quality_policy=None, background_music_enabled=None,
-                            source_settings=None, parent_job_id=None):
+                            source_settings=None, parent_job_id=None, video_terms=None,
+                            intro_enabled=None, outro_enabled=None):
     from app.models.autopilot import ContentPlanCreate
 
     service = autopilot_service.get_service()
@@ -9158,6 +9197,12 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         "language": language,
         "font_name": "NotoSansDevanagari-VF.ttf" if language == "hi" else profile.font_name,
     }
+    if intro_enabled is not None:
+        manual_overrides["intro_enabled"] = bool(intro_enabled)
+    if outro_enabled is not None:
+        manual_overrides["outro_enabled"] = bool(outro_enabled)
+    if isinstance(source_settings, dict) and isinstance(source_settings.get("channel_branding"), dict):
+        manual_overrides["channel_branding"] = source_settings["channel_branding"]
     inherited_keys = {
         "voice_name", "tts_model", "subtitle_enabled", "subtitle_position",
         "subtitle_display_mode", "subtitle_animation", "voice_rate", "voice_volume",
@@ -9208,9 +9253,13 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
     if (review_ai_draft or (plan.duration_enforcement == "strict" and not
             plan.min_duration_seconds <= plan.duration_estimate_seconds <= plan.max_duration_seconds)):
         st.session_state["autopilot_pending_plan"] = plan.plan_id
+        st.session_state["autopilot_pending_video_terms"] = video_terms
         return None
     service.ready(profile.channel_id, plan.plan_id, False)
-    job = service.create_job(profile.channel_id, plan.plan_id, parent_job_id=parent_job_id)
+    job = service.create_job(
+        profile.channel_id, plan.plan_id, parent_job_id=parent_job_id,
+        video_terms=video_terms,
+    )
     st.session_state["autopilot_last_job"] = job.job_id
     service.start_job(job.job_id)
     st.session_state.pop("autopilot_pending_plan", None)
@@ -9220,7 +9269,8 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
 def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, language,
                             review_ai_draft=False, narrator_preset=None,
                             profanity_level=None, fact_verification_policy=None,
-                            savage_quality_policy=None, background_music_enabled=None):
+                            savage_quality_policy=None, background_music_enabled=None,
+                            video_terms=None, intro_enabled=None, outro_enabled=None):
     """Continue an exact, unstarted channel draft without making a duplicate plan."""
     service = autopilot_service.get_service()
     normalized = autopilot_service.normalize_content(topic)
@@ -9233,6 +9283,10 @@ def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, lan
         "visual_style": style, "language": language,
         "font_name": "NotoSansDevanagari-VF.ttf" if language == "hi" else profile.font_name,
     }
+    if intro_enabled is not None:
+        overrides["intro_enabled"] = bool(intro_enabled)
+    if outro_enabled is not None:
+        overrides["outro_enabled"] = bool(outro_enabled)
     if narrator_preset is not None:
         overrides["narrator_preset"] = narrator_preset
     if profanity_level is not None:
@@ -9252,7 +9306,9 @@ def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, lan
         return False
     if existing.state == "planned":
         service.ready(profile.channel_id, existing.plan_id, True)
-    job = service.create_job(profile.channel_id, existing.plan_id)
+    job = service.create_job(
+        profile.channel_id, existing.plan_id, video_terms=video_terms
+    )
     st.session_state["autopilot_last_job"] = job.job_id
     service.start_job(job.job_id)
     st.session_state.pop("autopilot_pending_plan", None)
@@ -10107,6 +10163,7 @@ def _render_channel_autopilot():
         st.warning(f"Destination: {destination}. Connect this channel in Channels before uploading.")
     else:
         st.success(f"YouTube destination: {destination}")
+    styles = VISUAL_STYLE_VALUES
     create_tab, videos_tab, schedule_tab, channels_tab, advanced_tab = st.tabs(
         ["Create Video", "My Videos", "Schedule", "Channels", "Advanced / Diagnostics"],
         key="autopilot_main_tabs", on_change="rerun",
@@ -10124,6 +10181,8 @@ def _render_channel_autopilot():
         topic_key = f"simple_topic_{channel_id}"
         draft_key = f"simple_draft_{channel_id}"
         generated_script_key = f"simple_ai_draft_{channel_id}"
+        stock_terms_key = f"simple_stock_terms_{channel_id}"
+        stock_terms_error_key = f"simple_stock_terms_error_{channel_id}"
         language_key = f"simple_language_{channel_id}"
         fact_policy_key = f"simple_fact_policy_{channel_id}"
         quality_policy_key = f"simple_savage_quality_{channel_id}"
@@ -10131,7 +10190,6 @@ def _render_channel_autopilot():
         style_key = f"simple_style_{channel_id}"
         narrator_key = f"simple_narrator_{channel_id}"
         profanity_key = f"simple_profanity_{channel_id}"
-        styles = VISUAL_STYLE_VALUES
         narrator_choices = {
             "Desi Savage Hindi": "desi_savage_aggressive",
             "Standard": "standard",
@@ -10168,6 +10226,11 @@ def _render_channel_autopilot():
         )
         st.session_state.setdefault(narrator_key, narrator_default)
         st.session_state.setdefault(profanity_key, profanity_default)
+        source_params = edited.get("params_snapshot", {}) if isinstance(edited, dict) else {}
+        saved_terms = source_params.get("video_terms", "")
+        if isinstance(saved_terms, list):
+            saved_terms = ", ".join(str(term) for term in saved_terms)
+        st.session_state.setdefault(stock_terms_key, str(saved_terms or ""))
 
         def current_draft_profile():
             language_label = st.session_state.get(
@@ -10242,6 +10305,12 @@ def _render_channel_autopilot():
             )
             cache_data = {
                 "topic": topic_text.strip(),
+                "channel_id": draft_profile.channel_id,
+                "niche": draft_profile.niche,
+                "script_style": draft_profile.script_style,
+                "topic_preferences": draft_profile.topic_preferences,
+                "target_duration_seconds": draft_profile.target_duration_seconds,
+                "duration_enforcement": draft_profile.duration_enforcement,
                 "language": draft_profile.language,
                 "visual_style": draft_profile.visual_style,
                 "narrator_preset": draft_profile.narrator_preset,
@@ -10261,6 +10330,57 @@ def _render_channel_autopilot():
             generated = service.draft_script(draft_profile, topic_text)
             st.session_state[cache_slot] = {"key": cache_key, "script": generated}
             return generated
+
+        def generate_savage_stock_terms(topic_text, narration):
+            draft_profile = current_draft_profile()
+            params = channel_profiles.build_preview(draft_profile, {
+                "video_subject": topic_text,
+                "video_script": narration,
+                "visual_style": draft_profile.visual_style,
+            }).params
+            represented = tm._represent_script(params, narration).spoken_script
+            beat_count = len(tm.emotion_storyboard.build(
+                represented,
+                narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+                profanity_level=params.profanity_level or "savage_monetization_aware",
+            ))
+            terms = _run_llm_read_operation(
+                "generate_terms",
+                lambda app_config_snapshot: llm.generate_terms(
+                    topic_text, narration, amount=max(1, beat_count),
+                    match_script_order=True, app_config=app_config_snapshot,
+                    stock_video_style=params.stock_video_style,
+                ),
+            )
+            if not isinstance(terms, (list, tuple)):
+                raise TypeError(str(terms or "The text provider returned stock keywords in an invalid format."))
+            terms = [str(term).strip() for term in terms if str(term).strip()]
+            if len(terms) != beat_count:
+                raise ValueError(
+                    f"Generated {len(terms)} keyword(s) for {beat_count} narration beats. "
+                    "Generate again or edit the list so every beat has one keyword."
+                )
+            return ", ".join(terms)
+
+        def refresh_savage_stock_terms(topic_text, narration):
+            try:
+                st.session_state[stock_terms_key] = generate_savage_stock_terms(
+                    topic_text, narration
+                )
+                st.session_state.pop(stock_terms_error_key, None)
+            except Exception as exc:
+                st.session_state[stock_terms_error_key] = str(exc)
+
+        def generate_terms_from_editor():
+            narration = str(st.session_state.get(draft_key, ""))
+            if not narration.strip():
+                st.session_state[stock_terms_error_key] = (
+                    "Enter narration before generating stock keywords."
+                )
+                return
+            refresh_savage_stock_terms(
+                str(st.session_state.get(topic_key, "")).strip(), narration
+            )
 
         def show_simple_script_quality_warnings(generated_script):
             if current_draft_profile().visual_style != visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
@@ -10304,6 +10424,8 @@ def _render_channel_autopilot():
                         st.session_state[draft_key] = generated_script
                         st.session_state[generated_script_key] = generated_script
                         show_simple_script_quality_warnings(generated_script)
+                        if current_draft_profile().visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+                            refresh_savage_stock_terms(idea, generated_script)
                     else:
                         generated_script = ""
             except Exception as exc:
@@ -10335,6 +10457,8 @@ def _render_channel_autopilot():
                         generated_script = draft_script_for_topic(topic.strip())
                     st.session_state[draft_key] = generated_script
                     st.session_state[generated_script_key] = generated_script
+                    if current_draft_profile().visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+                        refresh_savage_stock_terms(topic.strip(), generated_script)
                     st.success("Narration script generated. Review or edit it below.")
                 except Exception as exc:
                     show_simple_script_failure(exc)
@@ -10384,6 +10508,24 @@ def _render_channel_autopilot():
             key=background_music_key,
             help="Optional. Off creates voice-only audio. On uses the background music saved for this channel.",
         )
+        edit_branding = (
+            edited.get("params_snapshot", {}).get("channel_branding", {})
+            if isinstance(edited, dict) and isinstance(edited.get("params_snapshot"), dict)
+            else {}
+        )
+        branding_cols = st.columns(2)
+        include_intro = branding_cols[0].checkbox(
+            "Include channel intro",
+            value=bool(edit_branding.get("intro", {}).get("enabled", profile.intro_enabled)),
+            key=f"simple_intro_{channel_id}",
+            help="Uses the currently saved intro audio snapshot for this video.",
+        )
+        include_outro = branding_cols[1].checkbox(
+            "Include channel outro",
+            value=bool(edit_branding.get("outro", {}).get("enabled", profile.outro_enabled)),
+            key=f"simple_outro_{channel_id}",
+            help="Uses the currently saved outro audio snapshot for this video.",
+        )
         quality_policy = st.selectbox(
             "Savage creative-quality enforcement", ["advisory", "strict"],
             format_func={"advisory": "Advisory", "strict": "Strict"}.get,
@@ -10414,6 +10556,19 @@ def _render_channel_autopilot():
         script = st.text_area("Narration script", height=150,
                               key=draft_key,
                               help="Review or edit the generated narration. Your edits are preserved and used as entered.")
+        if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+            st.text_area(
+                "Stock video keywords", key=stock_terms_key,
+                help=("One English Pexels search keyword per narration beat, in order. "
+                      "Edit or repeat a keyword when consecutive beats cover the same topic."),
+            )
+            st.button(
+                "Generate stock keywords from narration",
+                key=f"simple_stock_terms_generate_{channel_id}",
+                on_click=generate_terms_from_editor,
+            )
+            if st.session_state.get(stock_terms_error_key):
+                st.warning(f"Stock keywords need attention: {st.session_state[stock_terms_error_key]}")
         quality_review = st.session_state.get(f"simple_script_warnings_{channel_id}")
         if (isinstance(quality_review, dict)
                 and quality_review.get("digest") == hashlib.sha256(
@@ -10450,8 +10605,14 @@ def _render_channel_autopilot():
                         savage_quality_policy=quality_policy,
                         background_music_enabled=include_background_music,
                         review_ai_draft=False,
+                        video_terms=(
+                            st.session_state.get(stock_terms_key, "")
+                            if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                            else None
+                        ),
                         source_settings=(edited.get("params_snapshot", {}) if isinstance(edited, dict) else None),
-                        parent_job_id=(edited.get("job_id") if isinstance(edited, dict) else None))
+                        parent_job_id=(edited.get("job_id") if isinstance(edited, dict) else None),
+                        intro_enabled=include_intro, outro_enabled=include_outro)
                     if job:
                         st.session_state["autopilot_active_job"] = job.job_id
                         st.success("Video job created and queued.")
@@ -10479,7 +10640,13 @@ def _render_channel_autopilot():
                                 fact_verification_policy=fact_policy,
                                 savage_quality_policy=quality_policy,
                                 background_music_enabled=include_background_music,
-                                review_ai_draft=False)
+                                intro_enabled=include_intro, outro_enabled=include_outro,
+                                review_ai_draft=False,
+                                video_terms=(
+                                    st.session_state.get(stock_terms_key, "")
+                                    if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                                    else None
+                                ))
                             if resumed is False:
                                 st.info("An existing draft was found. Review its script and duration below before rendering.")
                             elif resumed:
@@ -10505,11 +10672,15 @@ def _render_channel_autopilot():
                         try:
                             if pending.state == "planned":
                                 service.ready(channel_id, pending.plan_id, True)
-                            job = service.create_job(channel_id, pending.plan_id)
+                            job = service.create_job(
+                                channel_id, pending.plan_id,
+                                video_terms=st.session_state.get("autopilot_pending_video_terms"),
+                            )
                             st.session_state["autopilot_last_job"] = job.job_id
                             st.session_state["autopilot_active_job"] = job.job_id
                             service.start_job(job.job_id)
                             st.session_state.pop("autopilot_pending_plan", None)
+                            st.session_state.pop("autopilot_pending_video_terms", None)
                             st.success("Video job created and queued. Open My Videos to follow progress.")
                         except Exception as exc:
                             st.error(f"Draft could not be rendered: {exc}")
@@ -10520,7 +10691,7 @@ def _render_channel_autopilot():
         _render_autopilot_videos(channel_id)
 
     if schedule_tab.open:
-        st.subheader("Schedule")
+        st.subheader("Schedule & Automation")
         state = service.schedule_state(channel_id)
         with st.form(f"simple_schedule_{channel_id}"):
             enabled = st.toggle("Enable recurring videos", value=bool(profile.publications_per_week and not state["paused"]))
@@ -10586,6 +10757,21 @@ def _render_channel_autopilot():
             with st.container(border=True):
                 st.markdown(f"**{item.display_name}** · {_autopilot_connection_label(item, service)}")
                 if item.channel_id == channel_id:
+                    st.markdown("#### Channel Overview")
+                    connection_state = (
+                        service.youtube_connections.connection_for_channel(item.channel_id)
+                        if item.publishing_backend == "youtube_direct" else None
+                    )
+                    connected = (
+                        bool(connection_state and connection_state.get("state") == "connected")
+                        if item.publishing_backend == "youtube_direct"
+                        else bool(item.upload_post_username)
+                    )
+                    st.caption(
+                        f"{item.display_name} · "
+                        f"{'Connected' if connected else 'Connection needed'} · "
+                        f"Autopilot {'enabled' if item.enabled else 'disabled'}"
+                    )
                     saved_tts_server = config.ui.get("tts_server", "azure-tts-v1")
                     saved_voice_name = config.ui.get("voice_name", "")
                     gemini_voices = voice.get_gemini_voices() if saved_tts_server == "gemini-tts" else []
@@ -10597,6 +10783,7 @@ def _render_channel_autopilot():
                             "Choose that Gemini voice below and save channel defaults before retrying."
                         )
                     with st.form(f"simple_channel_settings_{channel_id}"):
+                        st.markdown("**Content & Narration**")
                         if gemini_voices:
                             preferred_voice = saved_voice_name if saved_voice_name in gemini_voices else gemini_voices[0]
                             initial_voice = item.voice_name if item.voice_name in gemini_voices else preferred_voice
@@ -10625,7 +10812,149 @@ def _render_channel_autopilot():
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Channel settings could not be saved: {exc}")
+                    st.markdown("#### Channel Branding — Intro & Outro")
+                    from app.services import channel_branding as branding_service
+                    branding_preview = channel_profiles.build_preview(item).params
+                    for segment in ("intro", "outro"):
+                        segment_audio = getattr(item, f"{segment}_audio") or {}
+                        with st.expander(segment.capitalize(), expanded=False):
+                            enabled = st.toggle(
+                                f"Enable {segment}",
+                                value=getattr(item, f"{segment}_enabled"),
+                                key=f"channel_branding_{segment}_enabled_{channel_id}",
+                            )
+                            spoken_text = st.text_area(
+                                "Spoken text", value=getattr(item, f"{segment}_text"),
+                                max_chars=1000,
+                                help="Hindi, Hinglish (Devanagari or Latin script), or English. The saved channel voice will speak this text as entered.",
+                                key=f"channel_branding_{segment}_text_{channel_id}",
+                            )
+                            save_branding = st.button(
+                                "Save branding settings",
+                                key=f"channel_branding_{segment}_save_{channel_id}",
+                            )
+                            uploaded_branding = st.file_uploader(
+                                "Upload custom MP3/WAV", type=["mp3", "wav"],
+                                key=f"channel_branding_{segment}_upload_{channel_id}",
+                            )
+                            force_regeneration = st.checkbox(
+                                "Regenerate matching audio",
+                                key=f"channel_branding_{segment}_force_{channel_id}",
+                                help="Normally matching saved audio is reused without another TTS request.",
+                            )
+                            if save_branding:
+                                try:
+                                    _autopilot_save_profile(
+                                        item, **{f"{segment}_enabled": enabled,
+                                                 f"{segment}_text": spoken_text.strip()}
+                                    )
+                                    st.success(f"{segment.capitalize()} settings saved.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Branding settings could not be saved: {exc}")
+                            if st.button(
+                                "Generate Audio", key=f"channel_branding_{segment}_generate_{channel_id}",
+                                disabled=not spoken_text.strip(),
+                            ):
+                                generated_path = None
+                                try:
+                                    from app.services.generation_settings import resolve_task_settings
+                                    settings = resolve_task_settings(
+                                        branding_preview, topic=item.display_name
+                                    )
+                                    request_hash = hashlib.sha256(json.dumps({
+                                        "text": spoken_text.strip(),
+                                        "voice": branding_preview.voice_name,
+                                        "rate": branding_preview.voice_rate,
+                                        "provider": settings.tts_provider,
+                                        "model": settings.tts_model,
+                                    }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+                                    if (segment_audio.get("request_hash") == request_hash
+                                            and not force_regeneration):
+                                        st.info("Matching saved audio already exists; reused it without another TTS request.")
+                                        _autopilot_save_profile(
+                                            item, **{f"{segment}_text": spoken_text.strip(),
+                                                     f"{segment}_enabled": enabled}
+                                        )
+                                    else:
+                                        with tempfile.TemporaryDirectory(prefix="mpt-branding-") as tmp:
+                                            generated_path = os.path.join(tmp, f"{segment}.mp3")
+                                            maker = voice.tts(
+                                                text=spoken_text.strip(),
+                                                voice_name=voice.parse_voice_name(branding_preview.voice_name),
+                                                voice_rate=branding_preview.voice_rate,
+                                                voice_file=generated_path,
+                                                tts_model=settings.tts_model,
+                                                tts_provider=settings.tts_provider,
+                                            )
+                                            if maker is None or not os.path.isfile(generated_path):
+                                                raise RuntimeError("TTS did not produce a usable audio file")
+                                            cue_path = os.path.join(tmp, f"{segment}.srt")
+                                            voice.create_subtitle(
+                                                text=spoken_text.strip(), sub_maker=maker,
+                                                subtitle_file=cue_path, word_level=False,
+                                            )
+                                            cues = Path(cue_path).read_bytes() if os.path.isfile(cue_path) else None
+                                            next_version = int(segment_audio.get("version", 0)) + 1
+                                            saved_asset = branding_service.save_asset(
+                                                channel_id, segment, Path(generated_path).read_bytes(),
+                                                extension="mp3", version=next_version,
+                                                provider=settings.tts_provider, model=settings.tts_model,
+                                                voice_name=branding_preview.voice_name,
+                                                request_hash=request_hash, cues=cues,
+                                            )
+                                        _autopilot_save_profile(
+                                            item, **{f"{segment}_audio": saved_asset,
+                                                     f"{segment}_text": spoken_text.strip(),
+                                                     f"{segment}_enabled": enabled}
+                                        )
+                                        st.success(f"{segment.capitalize()} audio saved and ready to reuse.")
+                                        st.rerun()
+                                except Exception as exc:
+                                    st.error(f"{segment.capitalize()} audio could not be generated: {exc}")
+                            if uploaded_branding:
+                                if st.button(
+                                    "Save uploaded audio",
+                                    key=f"channel_branding_{segment}_upload_save_{channel_id}",
+                                ):
+                                    try:
+                                        next_version = int(segment_audio.get("version", 0)) + 1
+                                        saved_asset = branding_service.save_asset(
+                                            channel_id, segment, uploaded_branding.getvalue(),
+                                            extension=Path(uploaded_branding.name).suffix.removeprefix(".").lower(),
+                                            version=next_version,
+                                        )
+                                        _autopilot_save_profile(
+                                            item, **{f"{segment}_audio": saved_asset,
+                                                     f"{segment}_text": spoken_text.strip(),
+                                                     f"{segment}_enabled": enabled}
+                                        )
+                                        st.success(f"Uploaded {segment} audio saved.")
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"Uploaded audio could not be saved: {exc}")
+                            if segment_audio:
+                                try:
+                                    saved_path = branding_service.resolve_asset(
+                                        channel_id, segment_audio.get("asset_key"),
+                                        expected_kind=segment,
+                                    )
+                                    if (hashlib.sha256(saved_path.read_bytes()).hexdigest()
+                                            != segment_audio.get("content_hash")
+                                            or voice.get_audio_duration(str(saved_path)) <= 0):
+                                        raise ValueError("saved audio failed validation")
+                                    mime = "audio/wav" if saved_path.suffix == ".wav" else "audio/mpeg"
+                                    st.audio(saved_path.read_bytes(), format=mime)
+                                    st.caption(
+                                        f"Ready · {segment_audio.get('duration_seconds', 0):.2f}s · "
+                                        f"v{segment_audio.get('version', '?')}"
+                                    )
+                                except (ValueError, OSError, TypeError):
+                                    st.warning("Enabled branding audio is missing or invalid. Upload or regenerate it to repair.")
+                            else:
+                                st.caption("No saved audio. Intro/outro is optional and disabled by default.")
                     if item.publishing_backend == "youtube_direct":
+                        st.markdown("#### Publishing Settings")
                         connection = service.youtube_connections.connection_for_channel(item.channel_id)
                         st.caption(f"Connection: {connection.get('state') if connection else 'not connected'}"
                                    + (f" · Last updated {connection['updated_at'][:10]}" if connection else ""))
@@ -10680,8 +11009,10 @@ def _render_channel_autopilot_advanced():
     with st.form("autopilot_profile_form"):
         display_name = st.text_input("Display name", value=current.display_name if current else "")
         niche = st.text_input("Content niche", value=current.niche if current else "")
-        topics = st.text_area("Topic preferences (one per line)", value="\n".join(current.topic_preferences) if current else "")
-        language = st.text_input("Narration language", value=current.language if current else "")
+        # These defaults are edited in the Channels section; don't show a second
+        # independent widget for the same profile fields here.
+        topics = "\n".join(current.topic_preferences) if current else ""
+        language = current.language if current else ""
         script_style = st.text_area("Storytelling style", value=current.script_style if current else "")
         duration = st.number_input("Target duration (seconds)", 5, 3600, current.target_duration_seconds if current else 30)
         duration_modes = ["flexible", "warn_only", "strict"]
@@ -10699,15 +11030,7 @@ def _render_channel_autopilot_advanced():
         )
         aspect_values = ["9:16", "16:9", "1:1"]
         aspect = st.selectbox("Aspect ratio", aspect_values, index=aspect_values.index(current.video_aspect.value) if current else 0)
-        visual_style_values = list(VISUAL_STYLE_LABELS)
-        visual_style_value = st.selectbox(
-            "Visual Style", visual_style_values,
-            format_func=VISUAL_STYLE_LABELS.get,
-            index=(
-                visual_style_values.index(current.visual_style)
-                if current else visual_style_values.index("savage_animated_explainer")
-            ),
-        )
+        visual_style_value = current.visual_style if current else "savage_animated_explainer"
         narrator_preset = st.selectbox(
             "Narration personality",
             ["desi_savage_aggressive", "standard"],
@@ -10741,24 +11064,7 @@ def _render_channel_autopilot_advanced():
         categories = st.multiselect("ASMR categories", category_values, default=current.asmr_categories if current else ["kinetic_sand", "soap"])
         source_values = ["pexels", "pixabay", "coverr", "local", "wavespeed", "volcengine_seedance", "ofox", "metaso_minimax", "muapi", "loomloom", "openai_image"]
         source = st.selectbox("Video source", source_values, index=source_values.index(current.video_source) if current else 0)
-        profile_voice_choices = (
-            voice.get_gemini_voices()
-            if config.ui.get("tts_server") == "gemini-tts"
-            else []
-        )
-        if profile_voice_choices:
-            configured_voice = config.ui.get("voice_name", "")
-            default_voice = current.voice_name if current and current.voice_name in profile_voice_choices else configured_voice
-            if default_voice not in profile_voice_choices:
-                default_voice = profile_voice_choices[0]
-            voice_name = st.selectbox(
-                "Narration voice",
-                profile_voice_choices,
-                index=profile_voice_choices.index(default_voice),
-                help="Uses the Gemini TTS provider and API key saved in Video Generator settings.",
-            )
-        else:
-            voice_name = st.text_input("Narration voice", value=current.voice_name if current else "")
+        voice_name = current.voice_name if current else str(config.ui.get("voice_name", "") or "")
         voice_rate = st.slider("Voice rate", 0.5, 2.0, float(current.voice_rate if current else 1.0))
         voice_volume = st.slider("Voice volume", 0.0, 2.0, float(current.voice_volume if current else 1.0))
         subtitle = st.checkbox("Subtitles enabled", value=current.subtitle_enabled if current else True)
@@ -10899,6 +11205,12 @@ def _render_channel_autopilot_advanced():
                 schedule_weekdays=[weekday_names.index(item) for item in schedule_days],
                 check_cross_channel_duplicates=profile_cross_dedupe,
                 upload_post_username=account or None, enabled=enabled,
+                intro_enabled=current.intro_enabled if current else False,
+                intro_text=current.intro_text if current else "",
+                intro_audio=current.intro_audio if current else None,
+                outro_enabled=current.outro_enabled if current else False,
+                outro_text=current.outro_text if current else "",
+                outro_audio=current.outro_audio if current else None,
             )
             # A form update must retain the channel's local ID: the direct YouTube
             # connection is cryptographically and logically pinned to that identity.

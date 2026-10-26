@@ -1,5 +1,6 @@
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
+import json
 
 import pytest
 
@@ -94,9 +95,44 @@ def test_pixabay_cover_crop_survives_cache_roundtrip_without_repeat_search(tmp_p
                          video_aspect=VideoAspect.portrait, require_asmr_metadata=True)
         first = material._search_videos_with_cache(**arguments)
         second = material._search_videos_with_cache(**arguments)
+    candidate.source_info["quality_review"] = {
+        "status": "approved", "reviewer": "test-reviewer",
+        "sampled_timestamps_seconds": [0.5, 2.0], "notes": "Clear cutting action.",
+    }
+    first[0].source_info["quality_review"] = candidate.source_info["quality_review"]
+    second[0].source_info["quality_review"] = candidate.source_info["quality_review"]
     assert remote.call_count == 1
     assert second[0].source_info["asset_id"] == "144459"
     ranked = asmr.rank_asmr_candidates([
         ("kinetic sand cutting", first), ("kinetic sand slicing", second)])
     assert len(ranked) == 1
     assert ranked[0][1].source_info["asmr_relevance_score"] > 0
+
+
+def test_cleanup_removes_only_task_owned_asmr_downloads_and_keeps_metadata(tmp_path, monkeypatch):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    clip = task_dir / "pexels-clip.mp4"
+    clip.write_bytes(b"stock clip")
+    shared = tmp_path / "shared-cache.mp4"
+    shared.write_bytes(b"shared clip")
+    (task_dir / "script.json").write_text(json.dumps({
+        "material_sources": [{
+            "provider": "pexels", "local_file": clip.name,
+            "license": "Pexels License", "search_term": "kinetic sand cutting",
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(material.utils, "task_dir", lambda _task: str(task_dir))
+
+    removed = material.cleanup_task_stock_materials(
+        "test-task", [str(clip), str(shared)]
+    )
+
+    assert removed == [clip.name]
+    assert not clip.exists()
+    assert shared.exists()
+    saved = json.loads((task_dir / "script.json").read_text(encoding="utf-8"))
+    record = saved["material_sources"][0]
+    assert record["license"] == "Pexels License"
+    assert record["search_term"] == "kinetic sand cutting"
+    assert record["local_file_removed"] is True

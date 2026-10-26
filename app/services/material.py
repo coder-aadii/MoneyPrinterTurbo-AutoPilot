@@ -1,6 +1,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 import math
 import os
 import re
@@ -243,6 +244,39 @@ def _persist_material_sources(
             "failed to persist material source records: "
             f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
         )
+
+
+def cleanup_task_stock_materials(task_id: str, video_paths: list[str]) -> list[str]:
+    """Delete task-owned stock downloads after rendering, preserving source metadata."""
+    task_root = Path(utils.task_dir(task_id)).resolve()
+    removed: set[str] = set()
+    for raw_path in video_paths:
+        try:
+            candidate = Path(raw_path)
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(task_root)
+            if resolved.is_file() and not candidate.is_symlink():
+                resolved.unlink()
+                removed.add(resolved.name)
+        except (OSError, ValueError, TypeError):
+            # Shared cache files and curated library assets are deliberately retained.
+            continue
+
+    if removed:
+        manifest = task_root / "script.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            records = data.get("material_sources", [])
+            if isinstance(records, list):
+                for record in records:
+                    if isinstance(record, dict) and record.get("local_file") in removed:
+                        record["local_file_removed"] = True
+                task_artifacts.patch_script_data(task_id, material_sources=records)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(
+                f"could not update stock metadata after cleanup: {type(exc).__name__}"
+            )
+    return sorted(removed)
 
 
 def _get_tls_verify() -> bool:
@@ -2368,7 +2402,11 @@ def download_videos(
         )
 
     material_directory = config.app.get("material_directory", "").strip()
-    if material_directory == "task":
+    if stock_video_style == asmr.SATISFYING_ASMR_CUTTING:
+        # ASMR stock is task-local so a successful render can clean its downloads
+        # without deleting shared cache files or reviewed library originals.
+        material_directory = utils.task_dir(task_id)
+    elif material_directory == "task":
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
@@ -2480,7 +2518,14 @@ def download_videos(
             metadata_candidate_duration = sum(
                 item.duration for _, items in all_asmr_results for item in items
             )
-            ranked_candidates = curated_candidates + asmr.rank_asmr_candidates(all_asmr_results)
+            ranked_remote = []
+            per_term_counts: dict[str, int] = {}
+            for search_term, item in asmr.rank_asmr_candidates(all_asmr_results):
+                if per_term_counts.get(search_term, 0) >= 3:
+                    continue
+                per_term_counts[search_term] = per_term_counts.get(search_term, 0) + 1
+                ranked_remote.append((search_term, item))
+            ranked_candidates = curated_candidates + ranked_remote
             available_duration = sum(usable(item) for _, item in ranked_candidates)
             if available_duration >= required_duration:
                 break

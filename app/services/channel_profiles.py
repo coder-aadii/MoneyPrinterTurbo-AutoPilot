@@ -155,6 +155,15 @@ def build_preview(profile: ChannelProfile, job_values: dict[str, Any] | None = N
     """Resolve profile defaults with explicit per-job topic/script taking precedence."""
     values = dict(job_values or {})
     profile_fields = {
+        "channel_id": profile.channel_id,
+        "channel_branding": {
+            name: {
+                "enabled": getattr(profile, f"{name}_enabled"),
+                "text": getattr(profile, f"{name}_text"),
+                "audio": getattr(profile, f"{name}_audio"),
+            }
+            for name in ("intro", "outro")
+        },
         "video_aspect": profile.video_aspect.value,
         "stock_video_style": profile.stock_video_style,
         "visual_style": profile.visual_style,

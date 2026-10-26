@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 import unittest
 import os
@@ -67,6 +68,29 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(second_plan.profile_version, 1)
         self.assertEqual(len(self.service.store.list_plans(first_plan.channel_id)), 1)
         self.assertEqual(len(self.service.store.list_plans(second_plan.channel_id)), 1)
+
+    def test_manual_stock_keywords_are_saved_in_restartable_job_snapshot(self):
+        profile = self.service.profile_store.create(ChannelProfile(
+            display_name="Savage Stock Channel", language="hi", niche="Hindi facts",
+            visual_style="savage_animated_explainer", publishing_backend="upload_post",
+            upload_post_username="account-c",
+        ))
+        plan = self.service.plan(profile.channel_id, ContentPlanCreate(
+            topic="How eggs become food", script="अंडे में प्रोटीन होता है।",
+            min_duration_seconds=5, max_duration_seconds=30,
+        ))
+        self.service.ready(profile.channel_id, plan.plan_id, accept_duration_estimate=True)
+
+        job = self.service.create_job(
+            profile.channel_id, plan.plan_id, video_terms="eggs, protein source"
+        )
+
+        self.assertEqual(job.params_snapshot["video_terms"], "eggs, protein source")
+        self.assertEqual(
+            autopilot.AutopilotStore(self.database)
+            .get_job(job.job_id).params_snapshot["video_terms"],
+            "eggs, protein source",
+        )
 
     def test_task_visual_style_override_is_persisted_through_job_snapshot(self):
         profile = self.profiles[0]
@@ -254,6 +278,8 @@ class TestAutopilot(unittest.TestCase):
 
     def test_topic_and_script_drafting_pass_visual_personality_and_profanity_choices(self):
         profile = self.profiles[0].model_copy(update={
+            "niche": "science for curious viewers",
+            "script_style": "Use natural spoken Hindi and simple examples.",
             "topic_preferences": ["space science"],
             "visual_style": "savage_animated_explainer",
             "narrator_preset": "desi_savage_aggressive",
@@ -275,6 +301,9 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(script_kwargs["visual_style"], "savage_animated_explainer")
         self.assertEqual(script_kwargs["narrator_preset"], "desi_savage_aggressive")
         self.assertEqual(script_kwargs["profanity_level"], "mild")
+        self.assertIn("science for curious viewers", script_kwargs["video_script_prompt"])
+        self.assertIn("Use natural spoken Hindi and simple examples.", script_kwargs["video_script_prompt"])
+        self.assertIn("Channel topic preferences: space science", script_kwargs["video_script_prompt"])
         full_prompt = autopilot.llm.build_script_prompt(**{
             key: value for key, value in script_kwargs.items()
             if key != "savage_quality_policy"
@@ -282,6 +311,42 @@ class TestAutopilot(unittest.TestCase):
         self.assertIn("specific, memorable situational hook", full_prompt)
         self.assertIn("Narration personality: Desi Savage Hindi", full_prompt)
         self.assertIn("Profanity intensity: mild", full_prompt)
+
+    def test_savage_profile_draft_does_not_duplicate_preset_past_prompt_limit(self):
+        profile = self.profiles[1].model_copy(update={
+            "language": "hi",
+            "visual_style": "savage_animated_explainer",
+            "niche": "science " * 40,
+            "script_style": "Use short spoken Hindi and avoid formal words. " * 20,
+            "topic_preferences": ["space science " * 8, "everyday examples " * 8],
+        })
+        captured = {}
+
+        def build_without_provider(**kwargs):
+            captured.update(kwargs)
+            prompt_args = {key: value for key, value in kwargs.items()
+                           if key != "savage_quality_policy"}
+            self.assertTrue(autopilot.llm.build_script_prompt(**prompt_args))
+            return "Drafted Hindi script"
+
+        with patch.object(autopilot.llm, "generate_script", side_effect=build_without_provider):
+            result = self.service.draft_script(profile, "Kya tumhe pata hai, bazar me money kese flow hota hai?")
+
+        self.assertEqual(result, "Drafted Hindi script")
+        self.assertLess(
+            len(captured["video_script_prompt"]),
+            autopilot.llm.MAX_SCRIPT_PROMPT_LENGTH,
+        )
+
+    def test_local_prompt_limit_error_is_not_reported_as_provider_failure(self):
+        with patch.object(
+            autopilot.llm, "generate_script",
+            return_value="Error: video_script_prompt exceeds 2000 characters; shorten it and retry.",
+        ):
+            with self.assertRaisesRegex(
+                autopilot.AutopilotError, "video_script_prompt exceeds 2000 characters"
+            ):
+                self.service.draft_script(self.profiles[0], "Short topic")
 
     def test_empty_script_draft_applies_plan_style_before_llm_prompt_and_keeps_task_personality(self):
         profile = self.profiles[1].model_copy(update={
@@ -316,6 +381,20 @@ class TestAutopilot(unittest.TestCase):
 
     def test_selected_generation_settings_are_pinned_in_manual_job_snapshot(self):
         profile = self.profiles[0]
+        profile = self.service.profile_store.update(
+            profile.channel_id,
+            profile.model_copy(update={
+                "intro_enabled": True,
+                "intro_text": "सुन भाई, aaj ka fact!",
+                "intro_audio": {
+                    "asset_key": "intro/v1-" + "a" * 64 + ".mp3",
+                    "content_hash": "a" * 64,
+                    "duration_seconds": 1.4,
+                    "version": 1,
+                },
+            }),
+            profile.version,
+        )
         plan = self.service.plan(
             profile.channel_id,
             ContentPlanCreate(
@@ -336,6 +415,10 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(job.params_snapshot["visual_style"], "savage_animated_explainer")
         self.assertEqual(job.params_snapshot["narrator_preset"], "desi_savage_aggressive")
         self.assertEqual(job.params_snapshot["profanity_level"], "mild")
+        self.assertEqual(job.params_snapshot["channel_id"], profile.channel_id)
+        self.assertEqual(job.params_snapshot["channel_branding"]["intro"]["text"],
+                         "सुन भाई, aaj ka fact!")
+        self.assertEqual(job.params_snapshot["channel_branding"]["intro"]["audio"]["version"], 1)
         resolved = job.params_snapshot["resolved_generation_settings"]
         self.assertEqual(resolved["visual_style"], "savage_animated_explainer")
         self.assertEqual(resolved["narrator_preset"], "desi_savage_aggressive")
@@ -405,9 +488,17 @@ class TestAutopilot(unittest.TestCase):
         job = self.ready_job(topic="Resume queued worker task")
         self.service.store.queue(job.job_id)
         started = threading.Event()
-        reopened = autopilot.AutopilotService(self.database, runner=lambda _job_id: started.set())
+        calls = []
+        lock = threading.Lock()
+        def run(_job_id):
+            with lock:
+                calls.append(_job_id)
+            started.set()
+        reopened = autopilot.AutopilotService(self.database, runner=run)
         self.addCleanup(reopened.close, wait=True)
         self.assertTrue(started.wait(timeout=2))
+        threading.Event().wait(0.05)
+        self.assertEqual(calls, [job.job_id])
         self.assertEqual(reopened.store.get_job(job.job_id).state, "queued")
 
     def test_restart_marks_dead_generation_worker_failed_without_auto_retry(self):
@@ -858,17 +949,200 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(sum(slot["state"] == "queued" for slot in slots), 1)
         self.assertFalse(any(slot["state"] == "failed" for slot in slots))
 
-    def test_scheduler_records_overdue_slot_as_skipped_and_pause_is_durable(self):
+    def test_scheduler_recovers_missed_slots_after_1_4_and_24_hour_outages(self):
         from datetime import datetime, timezone
-        profile = self.profiles[0].model_copy(update={"publications_per_week": 1, "schedule_weekdays": [0]})
-        profile = self.service.profile_store.update(profile.channel_id, profile, profile.version)
-        self.service.tick_scheduler(datetime(2026, 10, 19, 14, 0, tzinfo=timezone.utc))
-        slot = self.service.store.list_slots(profile.channel_id)[0]
-        self.assertEqual(slot["state"], "skipped")
+
+        cases = (
+            ("one hour", datetime(2035, 1, 1, 10, 0, tzinfo=timezone.utc),
+             datetime(2035, 1, 1, 8, 59, tzinfo=timezone.utc), "2035-01-01T09:00:00+00:00"),
+            ("four hours", datetime(2035, 1, 1, 13, 0, tzinfo=timezone.utc),
+             datetime(2035, 1, 1, 8, 59, tzinfo=timezone.utc), "2035-01-01T09:00:00+00:00"),
+            ("twenty four hours", datetime(2035, 1, 2, 10, 0, tzinfo=timezone.utc),
+             datetime(2035, 1, 1, 9, 59, tzinfo=timezone.utc), "2035-01-02T09:00:00+00:00"),
+        )
+        for label, now, previous_tick, missed_time in cases:
+            with self.subTest(outage=label), TemporaryDirectory() as temporary:
+                database = Path(temporary) / "autopilot.sqlite3"
+                service = autopilot.AutopilotService(database, runner=lambda _job_id: None)
+                profile = service.profile_store.create(ChannelProfile(
+                    display_name=f"Recovery {label}", language="hi", niche="Hindi facts",
+                    topic_preferences=["nature"], timezone="UTC", publications_per_week=7,
+                    schedule_times_local=["09:00"], schedule_weekdays=list(range(7)),
+                    generation_lead_hours=48, ready_buffer_target=1,
+                    publishing_policy="manual", auto_public_enabled=False,
+                ))
+                service.store.set_scheduler_tick(profile.channel_id, previous_tick)
+                topic_variants = iter(("Jupiter storms", "Octopus hearts", "Coral reefs"))
+                with patch.object(
+                    service, "_topic_for_slot",
+                    side_effect=lambda _profile, slot, _style=None: f"{next(topic_variants)} {slot.isoformat()}",
+                ), patch.object(
+                    autopilot.llm, "generate_script",
+                    side_effect=lambda **kwargs: self.hindi_script(topic=kwargs["video_subject"]),
+                ):
+                    service.tick_scheduler(now)
+
+                slots = service.store.list_slots(profile.channel_id, limit=100)
+                missed = next(slot for slot in slots if slot["slot_utc"] == missed_time)
+                self.assertEqual(missed["state"], "skipped")
+                self.assertIn("rescheduled to", missed["details"])
+                recovery = next(slot for slot in slots if slot["recovery_of_slot_id"] == missed["slot_id"])
+                recovered_at = datetime.fromisoformat(recovery["slot_utc"])
+                self.assertGreater(recovered_at, now)
+                self.assertIn(recovered_at.weekday(), range(7))
+                self.assertEqual((recovered_at.hour, recovered_at.minute), (9, 0))
+                recovered_job = service.store.get_job(recovery["job_id"])
+                self.assertEqual(recovered_job.channel_id, profile.channel_id)
+                self.assertEqual(recovered_job.intended_publication_slot, recovered_at)
+                self.assertEqual(recovered_job.profile_snapshot["publishing_policy"], "manual")
+                self.assertFalse(recovered_job.profile_snapshot["auto_public_enabled"])
+                service.close(wait=True)
+
+    def test_missed_recovery_link_and_work_survive_scheduler_restart(self):
+        from datetime import datetime, timezone
+
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "autopilot.sqlite3"
+            now = datetime(2035, 1, 1, 13, 0, tzinfo=timezone.utc)
+            service = autopilot.AutopilotService(database, runner=lambda _job_id: None)
+            profile = service.profile_store.create(ChannelProfile(
+                display_name="Restart recovery", language="hi", niche="Hindi facts",
+                topic_preferences=["nature"], timezone="UTC", publications_per_week=1,
+                schedule_times_local=["09:00"], schedule_weekdays=[0],
+                generation_lead_hours=48, ready_buffer_target=1,
+                publishing_policy="manual", auto_public_enabled=False,
+            ))
+            service.store.set_scheduler_tick(
+                profile.channel_id, datetime(2035, 1, 1, 8, 59, tzinfo=timezone.utc),
+            )
+            topic_variants = iter(("Moon tides", "Octopus hearts", "Coral reefs"))
+            with patch.object(
+                service, "_topic_for_slot",
+                side_effect=lambda _profile, slot, _style=None: f"{next(topic_variants)} {slot.isoformat()}",
+            ), patch.object(
+                autopilot.llm, "generate_script",
+                side_effect=lambda **kwargs: self.hindi_script(topic=kwargs["video_subject"]),
+            ):
+                service.tick_scheduler(now)
+            service.close(wait=True)
+
+            reopened = autopilot.AutopilotService(database, runner=lambda _job_id: None)
+            try:
+                before = reopened.store.list_slots(profile.channel_id, limit=100)
+                missed = next(slot for slot in before if slot["slot_utc"] == "2035-01-01T09:00:00+00:00")
+                recovery = next(slot for slot in before if slot["recovery_of_slot_id"] == missed["slot_id"])
+                reopened.tick_scheduler(now)
+                after = reopened.store.list_slots(profile.channel_id, limit=100)
+                self.assertEqual(
+                    sum(slot["recovery_of_slot_id"] == missed["slot_id"] for slot in after), 1,
+                )
+                self.assertEqual(reopened.store.get_job(recovery["job_id"]).intended_publication_slot,
+                                 datetime.fromisoformat(recovery["slot_utc"]))
+            finally:
+                reopened.close(wait=True)
+
+    def test_pause_state_survives_scheduler_cursor_migration(self):
+        profile = self.profiles[0]
         self.service.set_channel_paused(profile.channel_id, True, "operator pause")
-        reopened = autopilot.AutopilotService(self.database)
-        self.addCleanup(reopened._executor.shutdown, wait=True)
-        self.assertTrue(reopened.schedule_state(profile.channel_id)["paused"])
+        reopened = autopilot.AutopilotService(self.database, runner=lambda _job_id: None)
+        try:
+            self.assertTrue(reopened.schedule_state(profile.channel_id)["paused"])
+        finally:
+            reopened.close(wait=True)
+
+    def test_missed_recovery_reuses_completed_video_when_upload_never_started(self):
+        from datetime import datetime, timezone
+
+        with TemporaryDirectory() as temporary:
+            database = Path(temporary) / "autopilot.sqlite3"
+            now = datetime(2035, 1, 1, 13, 0, tzinfo=timezone.utc)
+            missed_at = datetime(2035, 1, 1, 9, 0, tzinfo=timezone.utc)
+            artifact = Path(temporary) / "completed.mp4"
+            artifact.write_bytes(b"offline test video")
+            service = autopilot.AutopilotService(database, runner=lambda _job_id: None)
+            profile = service.profile_store.create(ChannelProfile(
+                display_name="Reuse missed video", language="hi", niche="Hindi facts",
+                topic_preferences=["nature"], timezone="UTC", publications_per_week=7,
+                schedule_times_local=["09:00"], schedule_weekdays=list(range(7)),
+                generation_lead_hours=48, ready_buffer_target=1,
+                publishing_policy="manual", auto_public_enabled=False,
+            ))
+            service.store.set_scheduler_tick(
+                profile.channel_id, datetime(2035, 1, 1, 8, 59, tzinfo=timezone.utc),
+            )
+            plan = service.plan(profile.channel_id, ContentPlanCreate(
+                topic="Missed original topic", script=self.hindi_script(topic="missed"),
+                min_duration_seconds=25, max_duration_seconds=30,
+                intended_publication_slot=missed_at,
+            ))
+            ready = service.ready(profile.channel_id, plan.plan_id, True)
+            job = service.create_job(profile.channel_id, ready.plan_id)
+            service.store.queue(job.job_id)
+            service.store.claim(job.job_id, "completed-task", "test-worker")
+            service.store.transition(
+                job.job_id, "generated", output_artifacts_json=json.dumps([str(artifact)]),
+            )
+            with service.store._connection() as conn:
+                conn.execute(
+                    "INSERT INTO job_qa VALUES (?, 'qa_passed', '{}', NULL, NULL, ?)",
+                    (job.job_id, autopilot._now()),
+                )
+            missed_id = f"{profile.channel_id}:{missed_at.isoformat()}"
+            service.store.claim_slot(missed_id, profile.channel_id, missed_at.isoformat(), "test-owner")
+            service.store.finish_slot(missed_id, "queued", job.job_id)
+
+            with patch.object(service, "reconcile_publications"):
+                service.tick_scheduler(now)
+
+            recovery = next(slot for slot in service.store.list_slots(profile.channel_id, 100)
+                            if slot["recovery_of_slot_id"] == missed_id)
+            self.assertEqual(recovery["job_id"], job.job_id)
+            self.assertEqual(service.store.get_job(job.job_id).intended_publication_slot,
+                             datetime.fromisoformat(recovery["slot_utc"]))
+            self.assertEqual(service.store.get_job(job.job_id).output_artifacts, [str(artifact)])
+            service.close(wait=True)
+
+    def test_uncertain_missed_upload_does_not_create_replacement_work(self):
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        now = datetime(2035, 1, 1, 13, 0, tzinfo=timezone.utc)
+        missed_at = datetime(2035, 1, 1, 9, 0, tzinfo=timezone.utc)
+        profile = self.profiles[0].model_copy(update={
+            "timezone": "UTC", "publications_per_week": 1,
+            "schedule_times_local": ["09:00"], "schedule_weekdays": [0],
+            "publishing_policy": "manual", "auto_public_enabled": False,
+        })
+        profile = self.service.profile_store.update(profile.channel_id, profile, profile.version)
+        self.service.store.set_scheduler_tick(
+            profile.channel_id, datetime(2035, 1, 1, 8, 59, tzinfo=timezone.utc),
+        )
+        plan = self.service.plan(profile.channel_id, ContentPlanCreate(
+            topic="Uncertain missed upload", script=self.hindi_script(topic="uncertain"),
+            min_duration_seconds=25, max_duration_seconds=30,
+            intended_publication_slot=missed_at,
+        ))
+        ready = self.service.ready(profile.channel_id, plan.plan_id, True)
+        job = self.service.create_job(profile.channel_id, ready.plan_id)
+        missed_id = f"{profile.channel_id}:{missed_at.isoformat()}"
+        self.service.store.claim_slot(missed_id, profile.channel_id, missed_at.isoformat(), "test-owner")
+        self.service.store.finish_slot(missed_id, "skipped", details="missed during downtime; recovery pending")
+        now_text = autopilot._now()
+        with self.service.store._connection() as conn:
+            conn.execute(
+                "INSERT INTO publications (publication_id,job_id,channel_id,profile_version,idempotency_key,"
+                "provider_request_id,state,attempt_count,created_at,updated_at,publisher_backend,next_check_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'unknown', 1, ?, ?, 'youtube_direct', ?)",
+                (str(uuid4()), job.job_id, profile.channel_id, job.profile_version,
+                 f"retry-{job.job_id}", f"request-{job.job_id}", now_text, now_text,
+                 datetime(2035, 1, 1, 14, 0, tzinfo=timezone.utc).isoformat()),
+            )
+        with patch.object(self.service, "reconcile_publications"), patch.object(
+            self.service, "_topic_for_slot", side_effect=AssertionError("uncertain upload must block new work"),
+        ):
+            self.service.tick_scheduler(now)
+        self.assertFalse(any(slot["recovery_of_slot_id"] == missed_id
+                             for slot in self.service.store.list_slots(profile.channel_id, 100)))
 
     def test_schedule_slot_lease_prevents_concurrent_claim_and_recovers_after_expiry(self):
         slot_id = f"{self.profiles[0].channel_id}:2030-01-01T09:00:00+00:00"

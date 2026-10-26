@@ -83,6 +83,24 @@ class TestChannelProfiles(unittest.TestCase):
         self.assertEqual(preview.params.asmr_categories, ["soap", "jelly"])
         self.assertIn("28 seconds", preview.params.video_script_prompt)
 
+    def test_preview_pins_channel_branding_for_manual_and_scheduled_snapshots(self):
+        profile = self.profile().model_copy(update={
+            "intro_enabled": True,
+            "intro_text": "सुन भाई, aaj ka fact will blow your mind!",
+            "intro_audio": {"asset_key": "intro/v2-" + "a" * 64 + ".mp3",
+                            "content_hash": "a" * 64, "duration_seconds": 1.25,
+                            "version": 2},
+        })
+        params = service.build_preview(profile).params
+        self.assertEqual(params.channel_id, profile.channel_id)
+        self.assertEqual(
+            params.channel_branding["intro"]["text"],
+            "सुन भाई, aaj ka fact will blow your mind!",
+        )
+        self.assertTrue(params.channel_branding["intro"]["enabled"])
+        self.assertEqual(params.channel_branding["intro"]["audio"]["version"], 2)
+        self.assertFalse(params.channel_branding["outro"]["enabled"])
+
     def test_blank_channel_voice_uses_saved_video_generator_voice(self):
         profile = self.profile(language="hi")
         with patch.object(service.config, "ui", {"voice_name": "gemini:Puck-Upbeat"}):

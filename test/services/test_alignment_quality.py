@@ -35,17 +35,41 @@ def test_real_marginal_be_timing_is_accepted_unchanged_only_in_balanced():
     assert not evaluate(data, "strict")["accepted"]
 
 
-@pytest.mark.parametrize("word,start,end,score,index", [
-    ("सर्वर,", 13.187, 13.447, .257, 40),
-    ("हैं", 8.426, 8.487, .005, 25),
-])
-def test_lower_confidence_requires_review_in_both_policies(word, start, end, score, index):
+def test_balanced_accepts_isolated_low_confidence_word_with_reliable_timing():
     data = measurements()
-    data["words"][index] = dict(word=word, start=start, end=end, score=score)
+    data["words"][0] = {"word": "क्या", "start": .14, "end": .24, "score": .166}
+    report = evaluate(data)
+    assert report["accepted"]
+    assert report["warnings"] == [{
+        "word_index": 1, **data["words"][0],
+        "code": "marginal_confidence",
+        "message": "original CTC timing retained; pronunciation is uncertain",
+    }]
+    assert not evaluate(data, "strict")["accepted"]
+
+
+def test_balanced_accepts_isolated_interior_low_confidence_word():
+    data = measurements()
+    data["words"][40]["score"] = .257
+    report = evaluate(data)
+    assert report["accepted"]
+    assert report["warnings"][0]["word_index"] == 41
+
+
+def test_extremely_low_confidence_still_requires_review():
+    data = measurements()
+    data["words"][25]["word"] = "हैं"
+    data["words"][25]["score"] = .005
     for policy in ("balanced", "strict"):
         report = evaluate(data, policy)
         assert not report["accepted"]
-        assert any(issue.get("score") == score for issue in report["confidence_errors"])
+        assert any(issue.get("score") == .005 for issue in report["confidence_errors"])
+
+
+def test_balanced_rejects_low_confidence_word_at_audio_edge_with_unreliable_timing():
+    data = measurements()
+    data["words"][0] = {"word": "क्या", "start": .9, "end": 1.0, "score": .166}
+    assert not evaluate(data)["accepted"]
 
 
 @pytest.mark.parametrize("change", [
@@ -161,6 +185,56 @@ def test_worker_errors_are_reported_and_never_emit_captions(tmp_path):
     report = json.loads((tmp_path / "alignment-quality.json").read_text())
     assert "cannot represent" in report["structural_errors"][0]["message"]
     assert not (tmp_path / "subtitle.srt").exists()
+
+
+def test_task_pipeline_falls_back_to_phrase_captions_without_tts(tmp_path):
+    params = VideoParams(
+        video_subject="Test", video_script="क्या कभी सोचा है?", video_language="hi",
+        voice_name="gemini:Puck-Upbeat", subtitle_enabled=True,
+        subtitle_display_mode="word_by_word", hindi_alignment_policy="strict",
+    )
+    state = MemoryState()
+    script = params.video_script
+
+    def reject_with_measured_but_uncertain_words(_audio, _script, _destination, *, policy):
+        aligned = {
+            "audio_duration": 2.0,
+            "words": [
+                {"word": "क्या", "start": .1, "end": .35, "score": .166},
+                {"word": "कभी", "start": .4, "end": .65, "score": .8},
+                {"word": "सोचा", "start": .7, "end": 1.15, "score": .8},
+                {"word": "है?", "start": 1.2, "end": 1.8, "score": .8},
+            ],
+        }
+        report = alignment_quality.evaluate(aligned, script, policy)
+        (tmp_path / "alignment-quality.json").write_text(json.dumps(report), encoding="utf-8")
+        return False
+
+    with patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
+            patch.object(task.sm, "state", state), \
+            patch.object(task.utils, "check_ffmpeg_ready", return_value=True), \
+            patch.object(task.config, "app", dict(task.config.app, subtitle_provider="edge")), \
+            patch.object(task, "generate_script", return_value=script), \
+            patch.object(task, "_verify_script_for_policy", return_value=script), \
+            patch.object(task, "save_script_data"), \
+            patch.object(task, "generate_audio", return_value=("audio.mp3", 2, None)), \
+            patch.object(task, "_alignment_preflight_errors", return_value=[]), \
+            patch.object(subtitle, "align_hindi_words", side_effect=reject_with_measured_but_uncertain_words), \
+            patch.object(subtitle, "create") as whisper_create, \
+            patch.object(task.voice, "get_audio_duration", return_value=2.0), \
+            patch.object(task.voice, "tts") as tts:
+        result = task.start("phrase-fallback", params, stop_at="subtitle")
+
+    subtitle_path = result["subtitle_path"]
+    assert subtitle_path.endswith("subtitle.srt")
+    cues = subtitle.file_to_subtitles(subtitle_path)
+    assert len(cues) == 1
+    assert cues[0][2] == "क्या कभी सोचा है?"
+    assert params.subtitle_display_mode == "sentence"
+    assert state.get_task("phrase-fallback")["subtitle_alignment_fallback"]["effective_mode"] == "sentence"
+    assert state.get_task("phrase-fallback")["state"] == task.const.TASK_STATE_COMPLETE
+    whisper_create.assert_not_called()
+    tts.assert_not_called()
 
 
 def test_render_retry_reuses_gemini_audio_but_changed_synthesis_inputs_do_not(tmp_path):

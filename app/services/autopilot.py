@@ -180,11 +180,11 @@ def _duration_bounds(profile: ChannelProfile, request: ContentPlanCreate) -> tup
 
 
 def _script_prompt(profile: ChannelProfile, topic: str, style: str | None = None) -> str:
-    preset = visual_style.preset_for(style or profile.visual_style)
+    effective_style = style or profile.visual_style
     parts = [profile.niche, profile.script_style]
     if profile.topic_preferences:
         parts.append("Channel topic preferences: " + ", ".join(profile.topic_preferences))
-    if (profile.language or "").lower().startswith("hi") and profile.visual_style == "asmr_cutting":
+    if (profile.language or "").lower().startswith("hi") and effective_style == "asmr_cutting":
         parts.append("Structure the narration as Hook → Interesting Fact → Explanation → Payoff, in concise natural Hindi.")
     parts.append(
         f"Draft narration for the topic: {topic}. Aim for about {profile.target_duration_seconds} seconds. "
@@ -195,7 +195,9 @@ def _script_prompt(profile: ChannelProfile, topic: str, style: str | None = None
         "Open with a specific hook, explain one distinct subject in a useful or entertaining way, "
         "and end with a clear payoff."
     )
-    parts.extend((preset.script_guidance, preset.visual_guidance))
+    # build_script_prompt adds the selected preset's visual and narration guidance
+    # itself. Copying those same long blocks here can push a valid profile over
+    # MAX_SCRIPT_PROMPT_LENGTH before the provider request is made.
     return "\n".join(part for part in parts if part)
 
 
@@ -295,13 +297,14 @@ class AutopilotStore:
                     ON production_jobs(state, created_at);
                 CREATE TABLE IF NOT EXISTS channel_runtime (
                     channel_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
-                    reason TEXT, updated_at TEXT NOT NULL
+                    reason TEXT, updated_at TEXT NOT NULL,
+                    last_scheduler_tick_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS autopilot_slots (
                     slot_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, slot_utc TEXT NOT NULL,
                     state TEXT NOT NULL, job_id TEXT, details TEXT, created_at TEXT NOT NULL,
                     lease_owner TEXT, lease_expires_at TEXT, visual_style TEXT,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    attempt_count INTEGER NOT NULL DEFAULT 0, recovery_of_slot_id TEXT,
                     UNIQUE(channel_id, slot_utc)
                 );
                 CREATE TABLE IF NOT EXISTS job_qa (
@@ -355,6 +358,13 @@ class AutopilotStore:
                 conn.execute("ALTER TABLE autopilot_slots ADD COLUMN visual_style TEXT")
             if "attempt_count" not in slot_columns:
                 conn.execute("ALTER TABLE autopilot_slots ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+            if "recovery_of_slot_id" not in slot_columns:
+                conn.execute("ALTER TABLE autopilot_slots ADD COLUMN recovery_of_slot_id TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_autopilot_slot_recovery_origin "
+                         "ON autopilot_slots(recovery_of_slot_id) WHERE recovery_of_slot_id IS NOT NULL")
+            runtime_columns = {row["name"] for row in conn.execute("PRAGMA table_info(channel_runtime)")}
+            if "last_scheduler_tick_at" not in runtime_columns:
+                conn.execute("ALTER TABLE channel_runtime ADD COLUMN last_scheduler_tick_at TEXT")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(production_jobs)")}
             if "worker_owner" not in columns:
                 conn.execute("ALTER TABLE production_jobs ADD COLUMN worker_owner TEXT")
@@ -735,7 +745,8 @@ class AutopilotStore:
             )
 
     def create_job(self, plan_id: str, channel_id: str, profile_store: ChannelProfileStore,
-                   parent_job_id: str | None = None) -> ProductionJob:
+                   parent_job_id: str | None = None,
+                   video_terms: str | list[str] | None = None) -> ProductionJob:
         now = _now()
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -766,6 +777,7 @@ class AutopilotStore:
                     "max_duration_seconds": plan["max_duration_seconds"],
                     "effective_visual_style": plan["effective_visual_style"],
                     "visual_style_reason": plan["visual_style_reason"],
+                    **({"video_terms": video_terms} if video_terms else {}),
                 }).params
                 job_id = str(uuid4())
                 conn.execute("""INSERT INTO production_jobs (
@@ -844,6 +856,205 @@ class AutopilotStore:
             rows = conn.execute("SELECT * FROM autopilot_slots WHERE channel_id=? ORDER BY slot_utc DESC LIMIT ?",
                                  (channel_id, min(max(limit, 1), 1000))).fetchall()
         return [dict(row) for row in rows]
+
+    def last_scheduler_tick(self, channel_id: str) -> datetime | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT last_scheduler_tick_at FROM channel_runtime WHERE channel_id=?",
+                (channel_id,),
+            ).fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    def set_scheduler_tick(self, channel_id: str, now: datetime) -> None:
+        timestamp = now.astimezone(timezone.utc).isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO channel_runtime (channel_id,paused,reason,updated_at,last_scheduler_tick_at) "
+                "VALUES (?,0,NULL,?,?) ON CONFLICT(channel_id) DO UPDATE SET "
+                "last_scheduler_tick_at=CASE WHEN channel_runtime.last_scheduler_tick_at IS NULL "
+                "OR channel_runtime.last_scheduler_tick_at<excluded.last_scheduler_tick_at "
+                "THEN excluded.last_scheduler_tick_at ELSE channel_runtime.last_scheduler_tick_at END, "
+                "updated_at=excluded.updated_at",
+                (channel_id, timestamp, timestamp),
+            )
+
+    def pending_missed_slots(self, channel_id: str) -> list[dict]:
+        """Return missed publication slots that have not been durably rescheduled."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT missed.* FROM autopilot_slots AS missed "
+                "WHERE missed.channel_id=? AND missed.state='skipped' "
+                "AND missed.details LIKE 'missed during downtime%' "
+                "AND NOT EXISTS (SELECT 1 FROM autopilot_slots AS recovery "
+                "WHERE recovery.recovery_of_slot_id=missed.slot_id) "
+                "ORDER BY missed.slot_utc",
+                (channel_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recovery_origin(self, recovery_slot_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT recovery_of_slot_id FROM autopilot_slots WHERE slot_id=?",
+                (recovery_slot_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def missed_slot_has_publication_attempt(self, missed_slot_id: str, channel_id: str) -> bool:
+        """Do not create replacement content while the original upload may exist."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM content_plans p JOIN production_jobs j ON j.plan_id=p.plan_id "
+                "JOIN publications pub ON pub.job_id=j.job_id "
+                "WHERE p.channel_id=? AND p.intended_publication_slot=("
+                "SELECT slot_utc FROM autopilot_slots WHERE slot_id=? AND channel_id=?) LIMIT 1",
+                (channel_id, missed_slot_id, channel_id),
+            ).fetchone()
+        return row is not None
+
+    def claim_recovery_slot(self, missed_slot_id: str, channel_id: str,
+                            recovery_slot_id: str, recovery_slot_utc: str,
+                            owner: str, style_rotation: list[str] | None = None) -> bool:
+        """Atomically reserve a future schedule slot for one missed slot."""
+        now = datetime.now(timezone.utc)
+        expiry = (now + timedelta(hours=1)).isoformat()
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missed = conn.execute(
+                    "SELECT state,slot_utc FROM autopilot_slots WHERE slot_id=? AND channel_id=?",
+                    (missed_slot_id, channel_id),
+                ).fetchone()
+                linked = conn.execute(
+                    "SELECT 1 FROM autopilot_slots WHERE recovery_of_slot_id=?",
+                    (missed_slot_id,),
+                ).fetchone()
+                occupied = conn.execute(
+                    "SELECT 1 FROM autopilot_slots WHERE channel_id=? AND slot_utc=?",
+                    (channel_id, recovery_slot_utc),
+                ).fetchone()
+                planned = conn.execute(
+                    "SELECT 1 FROM content_plans WHERE channel_id=? AND intended_publication_slot=? "
+                    "UNION ALL SELECT 1 FROM production_jobs WHERE channel_id=? AND intended_publication_slot=? LIMIT 1",
+                    (channel_id, recovery_slot_utc, channel_id, recovery_slot_utc),
+                ).fetchone()
+                if not missed or missed["state"] != "skipped" or linked or occupied or planned:
+                    conn.rollback()
+                    return False
+                old_plan = conn.execute(
+                    "SELECT plan_id FROM content_plans WHERE channel_id=? AND intended_publication_slot=? LIMIT 1",
+                    (channel_id, missed["slot_utc"]),
+                ).fetchone()
+                if old_plan:
+                    old_job = conn.execute(
+                        "SELECT job_id,state,output_artifacts_json FROM production_jobs WHERE plan_id=?",
+                        (old_plan["plan_id"],),
+                    ).fetchone()
+                    if old_job:
+                        if old_job["state"] == "generated":
+                            qa = conn.execute(
+                                "SELECT state FROM job_qa WHERE job_id=?", (old_job["job_id"],),
+                            ).fetchone()
+                            try:
+                                artifacts = json.loads(old_job["output_artifacts_json"])
+                            except (TypeError, json.JSONDecodeError):
+                                artifacts = []
+                            if (not qa or qa["state"] != "qa_passed" or not artifacts
+                                    or not all(isinstance(path, str) and os.path.isfile(path) for path in artifacts)):
+                                conn.rollback()
+                                return False
+                        elif old_job["state"] != "ready":
+                            # Let queued/active or failed work finish its own safe
+                            # recovery before allocating replacement production.
+                            conn.rollback()
+                            return False
+                        if conn.execute(
+                            "SELECT 1 FROM publications WHERE job_id=?", (old_job["job_id"],),
+                        ).fetchone():
+                            conn.rollback()
+                            return False
+                        conn.execute(
+                            "UPDATE production_jobs SET intended_publication_slot=?,updated_at=? WHERE job_id=?",
+                            (recovery_slot_utc, now.isoformat(), old_job["job_id"]),
+                        )
+                    conn.execute(
+                        "UPDATE content_plans SET intended_publication_slot=?,updated_at=? WHERE plan_id=?",
+                        (recovery_slot_utc, now.isoformat(), old_plan["plan_id"]),
+                    )
+                rotation = list(dict.fromkeys(style_rotation or []))
+                assigned_style = None
+                if rotation:
+                    assigned = conn.execute(
+                        "SELECT COUNT(*) FROM autopilot_slots WHERE channel_id=? AND visual_style IS NOT NULL",
+                        (channel_id,),
+                    ).fetchone()[0]
+                    assigned_style = rotation[assigned % len(rotation)]
+                conn.execute(
+                    "INSERT INTO autopilot_slots (slot_id,channel_id,slot_utc,state,job_id,details,created_at,"
+                    "lease_owner,lease_expires_at,visual_style,attempt_count,recovery_of_slot_id) "
+                    "VALUES (?, ?, ?, 'planning', NULL, NULL, ?, ?, ?, ?, 1, ?)",
+                    (recovery_slot_id, channel_id, recovery_slot_utc, now.isoformat(), owner,
+                     expiry, assigned_style, missed_slot_id),
+                )
+                conn.execute(
+                    "UPDATE autopilot_slots SET details=? WHERE slot_id=? AND state='skipped'",
+                    (f"missed during downtime; rescheduled to {recovery_slot_utc}", missed_slot_id),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return False
+            except Exception:
+                conn.rollback()
+                raise
+
+    def reuse_completed_missed_job(self, missed_slot_id: str, channel_id: str,
+                                   recovery_slot_utc: str) -> str | None:
+        """Move a completed, QA-passed job only when no publication was attempted."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missed = conn.execute(
+                    "SELECT slot_utc FROM autopilot_slots WHERE slot_id=? AND channel_id=? AND state='skipped'",
+                    (missed_slot_id, channel_id),
+                ).fetchone()
+                if not missed:
+                    conn.rollback()
+                    return None
+                row = conn.execute(
+                    "SELECT j.job_id,j.state,j.output_artifacts_json,q.state AS qa_state "
+                    "FROM content_plans p JOIN production_jobs j ON j.plan_id=p.plan_id "
+                    "JOIN job_qa q ON q.job_id=j.job_id "
+                    "WHERE p.channel_id=? AND p.intended_publication_slot IN (?,?) LIMIT 1",
+                    (channel_id, missed["slot_utc"], recovery_slot_utc),
+                ).fetchone()
+                if (not row or row["state"] != "generated" or row["qa_state"] != "qa_passed"
+                        or conn.execute("SELECT 1 FROM publications WHERE job_id=?", (row["job_id"],)).fetchone()):
+                    conn.rollback()
+                    return None
+                try:
+                    artifacts = json.loads(row["output_artifacts_json"])
+                except (TypeError, json.JSONDecodeError):
+                    artifacts = []
+                if not artifacts or not all(isinstance(path, str) and os.path.isfile(path) for path in artifacts):
+                    conn.rollback()
+                    return None
+                conn.execute(
+                    "UPDATE content_plans SET intended_publication_slot=?,updated_at=? "
+                    "WHERE plan_id=(SELECT plan_id FROM production_jobs WHERE job_id=?)",
+                    (recovery_slot_utc, _now(), row["job_id"]),
+                )
+                conn.execute(
+                    "UPDATE production_jobs SET intended_publication_slot=?,updated_at=? "
+                    "WHERE job_id=? AND state='generated'",
+                    (recovery_slot_utc, _now(), row["job_id"]),
+                )
+                conn.commit()
+                return row["job_id"]
+            except Exception:
+                conn.rollback()
+                raise
 
     def list_publications(self, channel_id: str, limit: int = 200) -> list[dict]:
         with self._connection() as conn:
@@ -1080,7 +1291,6 @@ class AutopilotService:
                     if pending.job_id not in self._active_submissions:
                         self._active_submissions.add(pending.job_id)
                         self._executor.submit(self._run_scheduled_job, pending.job_id)
-                        self._executor.submit(self._run_scheduled_job, pending.job_id)
 
     def close(self, wait: bool = True) -> None:
         """Stop the background scheduler and drain worker threads on shutdown."""
@@ -1236,7 +1446,8 @@ class AutopilotService:
     def set_channel_paused(self, channel_id: str, paused: bool, reason: str = "") -> dict:
         self.profile_store.get(channel_id)
         with self.store._connection() as conn:
-            conn.execute("INSERT INTO channel_runtime VALUES (?, ?, ?, ?) ON CONFLICT(channel_id) DO UPDATE SET paused=excluded.paused, reason=excluded.reason, updated_at=excluded.updated_at",
+            conn.execute("INSERT INTO channel_runtime (channel_id,paused,reason,updated_at) VALUES (?, ?, ?, ?) "
+                         "ON CONFLICT(channel_id) DO UPDATE SET paused=excluded.paused, reason=excluded.reason, updated_at=excluded.updated_at",
                          (channel_id, int(paused), reason[:500] or None, _now()))
         return {"channel_id": channel_id, "paused": paused, "reason": reason}
 
@@ -1275,12 +1486,36 @@ class AutopilotService:
             raise AutopilotError(f"topic planning failed: {reason}")
         return topic
 
+    def _record_overdue_completed_slots(self, now: datetime) -> None:
+        """Keep completed buffer jobs attached to missed slots for safe reuse."""
+        now_utc = now.astimezone(timezone.utc)
+        for profile in self.profile_store.list(include_disabled=False):
+            previous_tick = self.store.last_scheduler_tick(profile.channel_id)
+            missed_since = (previous_tick or (now_utc - timedelta(hours=3))).astimezone(timezone.utc)
+            with self.store._connection() as conn:
+                rows = conn.execute(
+                    "SELECT s.slot_id,s.job_id FROM autopilot_slots s "
+                    "JOIN production_jobs j ON j.job_id=s.job_id "
+                    "JOIN job_qa q ON q.job_id=j.job_id "
+                    "LEFT JOIN publications p ON p.job_id=j.job_id "
+                    "WHERE s.channel_id=? AND s.state='queued' AND s.slot_utc>? AND s.slot_utc<=? "
+                    "AND j.state='generated' AND q.state='qa_passed' "
+                    "AND (p.job_id IS NULL OR p.state NOT IN ('published','scheduled'))",
+                    (profile.channel_id, missed_since.isoformat(), now_utc.isoformat()),
+                ).fetchall()
+            for row in rows:
+                self.store.finish_slot(
+                    row["slot_id"], "skipped", row["job_id"],
+                    details="missed during downtime; recovery pending",
+                )
+
     def tick_scheduler(self, now: datetime | None = None) -> list[dict]:
-        """Fill the configured future-ready buffer and catch up recent scheduled slots."""
+        """Fill the ready buffer and reschedule missed publications without exceeding cadence."""
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("scheduler time must include timezone")
         self.reconcile_publications()
+        self._record_overdue_completed_slots(now)
         created = []
         # Retry only scheduled jobs whose saved failure is clearly transient.
         # The task id is retained so validated scripts/audio/render artifacts can
@@ -1329,7 +1564,9 @@ class AutopilotService:
             pending_releases = conn.execute("""SELECT j.job_id,j.channel_id,j.profile_snapshot_json
                 FROM production_jobs j JOIN job_qa q ON q.job_id=j.job_id
                 LEFT JOIN publications p ON p.job_id=j.job_id
-                WHERE j.state='generated' AND q.state='qa_passed' AND p.job_id IS NULL""").fetchall()
+                WHERE j.state='generated' AND q.state='qa_passed' AND p.job_id IS NULL
+                AND (j.intended_publication_slot IS NULL OR j.intended_publication_slot>?)""",
+                (now.astimezone(timezone.utc).isoformat(),)).fetchall()
         for row in pending_releases:
             policy = json.loads(row["profile_snapshot_json"]).get("publishing_policy")
             public_ok = policy in {"automatic_public", "scheduled_public"}
@@ -1343,9 +1580,16 @@ class AutopilotService:
                     self.publish_job(row["job_id"])
                 except AutopilotError:
                     logger.warning(f"autopilot publication remains pending, job_id={row['job_id']}")
-        for profile in self.profile_store.list(include_disabled=False):
-            if profile.publications_per_week <= 0 or self._is_paused(profile.channel_id):
+        for profile in self.profile_store.list(include_disabled=True):
+            if (not profile.enabled or profile.publications_per_week <= 0
+                    or self._is_paused(profile.channel_id)):
+                self.store.set_scheduler_tick(profile.channel_id, now)
                 continue
+            previous_tick = self.store.last_scheduler_tick(profile.channel_id)
+            # Before the first persistent tick exists, retain the former short
+            # startup catch-up window; later restarts use the exact durable cursor.
+            missed_since = previous_tick or (now - timedelta(hours=3))
+            missed_since = missed_since.astimezone(timezone.utc)
             local_now = now.astimezone(ZoneInfo(profile.timezone))
             channel_tz = ZoneInfo(profile.timezone)
             # Frequency is distributed over the configured weekdays and local times.
@@ -1357,8 +1601,11 @@ class AutopilotService:
             selected = [choices[min(len(choices)-1, int(i * len(choices) / profile.publications_per_week))]
                         for i in range(profile.publications_per_week)]
             due_slots = []
+            recovery_due_slots = []
             lead_hours = profile.generation_lead_hours
-            days_ahead = max(7, (lead_hours + 23) // 24)
+            # Keep a second week available for recovery placement when the normal
+            # buffer already occupies every slot in the generation lead window.
+            days_ahead = max(14, (lead_hours + 23) // 24)
             for days_ago in range(7, -days_ahead - 1, -1):
                 local_date = local_now.date() - timedelta(days=days_ago)
                 for day, hour, minute in sorted(set(selected)):
@@ -1371,10 +1618,11 @@ class AutopilotService:
                     if local_slot.astimezone(timezone.utc).astimezone(channel_tz).replace(tzinfo=None) != naive_slot:
                         continue
                     age = (local_now - local_slot).total_seconds()
-                    if age < -(lead_hours * 3600):
-                        continue
                     slot_utc = local_slot.astimezone(timezone.utc)
                     slot_id = f"{profile.channel_id}:{slot_utc.isoformat()}"
+                    if age < -(lead_hours * 3600):
+                        recovery_due_slots.append((slot_id, slot_utc, age))
+                        continue
                     due_slots.append((slot_id, slot_utc, age))
             with self.store._connection() as conn:
                 existing = {row["slot_id"]: dict(row) for row in conn.execute(
@@ -1383,13 +1631,16 @@ class AutopilotService:
                 )}
             retry_cutoff = now.astimezone(timezone.utc).isoformat()
             candidates = [item for item in due_slots
-                          if item[0] not in existing
-                          or existing[item[0]]["state"] == "planning"
-                          or (existing[item[0]]["state"] == "failed"
-                              and existing[item[0]]["attempt_count"] <= profile.provider_retry_limit
-                              and _transient_generation_failure(existing[item[0]]["details"])
-                              and (not existing[item[0]]["lease_expires_at"]
-                                   or existing[item[0]]["lease_expires_at"] <= retry_cutoff))]
+                          if ((item[0] not in existing
+                               and not (item[2] > 0 and item[1] <= missed_since))
+                              or (item[0] in existing
+                                  and existing[item[0]]["state"] == "planning")
+                              or (item[0] in existing
+                                  and existing[item[0]]["state"] == "failed"
+                                  and existing[item[0]]["attempt_count"] <= profile.provider_retry_limit
+                                  and _transient_generation_failure(existing[item[0]]["details"])
+                                  and (not existing[item[0]]["lease_expires_at"]
+                                       or existing[item[0]]["lease_expires_at"] <= retry_cutoff)))]
             candidates.sort(key=lambda item: item[1])
             buffer = self.store.buffer_counts(profile.channel_id, now, profile.ready_buffer_target)
             stale = [item for item in candidates if item[2] > 3 * 3600]
@@ -1403,10 +1654,22 @@ class AutopilotService:
                     retry_limit=profile.provider_retry_limit,
                 ):
                     continue
-                if age > 3 * 3600:
-                    self.store.finish_slot(slot_id, "skipped", details="missed during downtime; older than 3-hour catch-up window")
+                if age > 0:
+                    # Keep the original slot as the audit record. Recovery assigns
+                    # its work to a later configured slot with a durable link.
+                    self.store.finish_slot(slot_id, "skipped", details="missed during downtime; recovery pending")
                     continue
                 try:
+                    recovery_origin = self.store.recovery_origin(slot_id)
+                    if recovery_origin:
+                        reused_job_id = self.store.reuse_completed_missed_job(
+                            recovery_origin, profile.channel_id, slot_utc.isoformat(),
+                        )
+                        if reused_job_id:
+                            self.store.finish_slot(slot_id, "queued", reused_job_id)
+                            created.append({"slot_id": slot_id, "job_id": reused_job_id,
+                                            "recovery_of": recovery_origin, "reused": True})
+                            continue
                     with self.store._connection() as conn:
                         existing_plan = conn.execute("SELECT plan_id,state FROM content_plans WHERE channel_id=? AND intended_publication_slot=?",
                                                      (profile.channel_id, slot_utc.isoformat())).fetchone()
@@ -1444,6 +1707,70 @@ class AutopilotService:
                         slot_id, "failed", details=details,
                         retry_delay_seconds=retry_delay,
                     )
+            # Recover both the just-missed slots and records left pending if the
+            # previous process stopped after recording the miss. Candidate times
+            # are drawn from the same configured weekly cadence; existing plans,
+            # jobs, publications, and slot rows make a time unavailable.
+            recovery_times = [item for item in due_slots + recovery_due_slots if item[2] < 0]
+            for missed in self.store.pending_missed_slots(profile.channel_id):
+                # A persisted publication means an earlier attempt may already
+                # have reached YouTube. Let the publisher reconcile that record;
+                # never create replacement content while its outcome is unclear.
+                if self.store.missed_slot_has_publication_attempt(
+                    missed["slot_id"], profile.channel_id,
+                ):
+                    continue
+                for recovery_id, recovery_utc, _age in recovery_times:
+                    if not self.store.claim_recovery_slot(
+                        missed["slot_id"], profile.channel_id, recovery_id,
+                        recovery_utc.isoformat(), self._scheduler_owner,
+                        profile.visual_style_rotation,
+                    ):
+                        continue
+                    try:
+                        reused_job_id = self.store.reuse_completed_missed_job(
+                            missed["slot_id"], profile.channel_id, recovery_utc.isoformat(),
+                        )
+                        if reused_job_id:
+                            self.store.finish_slot(recovery_id, "queued", reused_job_id)
+                            created.append({"slot_id": recovery_id, "job_id": reused_job_id,
+                                            "recovery_of": missed["slot_id"], "reused": True})
+                            break
+                        with self.store._connection() as conn:
+                            existing_plan = conn.execute(
+                                "SELECT plan_id FROM content_plans WHERE channel_id=? AND intended_publication_slot=?",
+                                (profile.channel_id, recovery_utc.isoformat()),
+                            ).fetchone()
+                        if existing_plan:
+                            plan = self.store.get_plan(existing_plan["plan_id"], profile.channel_id)
+                        else:
+                            slot_style = self.store.slot_visual_style(recovery_id)
+                            topic = self._topic_for_slot(profile, recovery_utc, slot_style)
+                            plan = self.plan(profile.channel_id, ContentPlanCreate(
+                                topic=topic, intended_publication_slot=recovery_utc,
+                                min_duration_seconds=profile.target_duration_seconds * 0.9,
+                                max_duration_seconds=profile.target_duration_seconds * 1.1,
+                                visual_style_override=slot_style,
+                            ))
+                        if plan.state == "planned":
+                            plan = self.store.mark_plan_ready(
+                                plan.plan_id, profile.channel_id,
+                                accept_duration_estimate=(plan.duration_enforcement != "strict"),
+                            )
+                        job = next((item for item in self.store.list_jobs(profile.channel_id)
+                                    if item.plan_id == plan.plan_id), None)
+                        if job is None:
+                            job = self.create_job(profile.channel_id, plan.plan_id)
+                        self.store.finish_slot(recovery_id, "queued", job.job_id)
+                        self.start_job(job.job_id)
+                        created.append({"slot_id": recovery_id, "job_id": job.job_id,
+                                        "recovery_of": missed["slot_id"], "reused": False})
+                        break
+                    except Exception as exc:
+                        details = _safe_failure(f"{type(exc).__name__}: {exc}")
+                        self.store.finish_slot(recovery_id, "failed", details=details)
+                        logger.warning(f"missed autopilot slot recovery failed, slot_id={missed['slot_id']}, details={details}")
+            self.store.set_scheduler_tick(profile.channel_id, now)
         return created
 
     def qa_report(self, job_id: str) -> dict:
@@ -1493,6 +1820,10 @@ class AutopilotService:
                 "rights_state": content_review["rights_status"],
                 "repetition_warnings": repetition["warnings"],
                 "fact_verification": verification,
+                "channel_branding": {
+                    "applied": task_state.get("channel_branding_applied", []),
+                    "fallbacks": task_state.get("channel_branding_fallbacks", []),
+                },
                 "automatic_publication_allowed": (all(checks.values())
                     and bool(job.profile_snapshot.get("auto_public_enabled", False))
                     and (verification["status"] == "verified"
@@ -2027,6 +2358,13 @@ class AutopilotService:
         if not result or result.startswith("Error: "):
             if script_quality.parse_failed_draft(str(result or "")):
                 raise AutopilotError(str(result))
+            if isinstance(result, str) and result.startswith("Error: "):
+                detail = result.removeprefix("Error: ").strip()
+                if detail.startswith((
+                    "video_script_prompt exceeds ",
+                    "custom_system_prompt exceeds ",
+                )):
+                    raise AutopilotError(detail)
             raise AutopilotError("script drafting failed; check the configured MPT text provider")
         return result.strip()
 
@@ -2040,6 +2378,8 @@ class AutopilotService:
             "bgm_type", "bgm_file", "bgm_volume", "voice_name", "tts_model",
             "subtitle_enabled", "subtitle_position", "subtitle_display_mode",
             "subtitle_animation", "voice_rate", "voice_volume", "allow_unverified_publication",
+            "intro_enabled", "outro_enabled",
+            "channel_branding",
         }
         if set(overrides) - allowed:
             raise AutopilotError("unsupported manual video setting")
@@ -2047,6 +2387,15 @@ class AutopilotService:
         if not profile.enabled:
             raise AutopilotError("channel profile is disabled")
         profile_values = {**profile.model_dump(mode="json"), **overrides}
+        pinned_branding = overrides.get("channel_branding")
+        if isinstance(pinned_branding, dict):
+            for segment in ("intro", "outro"):
+                item = pinned_branding.get(segment)
+                if isinstance(item, dict):
+                    profile_values[f"{segment}_enabled"] = bool(item.get("enabled"))
+                    profile_values[f"{segment}_text"] = str(item.get("text") or "")
+                    profile_values[f"{segment}_audio"] = item.get("audio")
+        profile_values.pop("channel_branding", None)
         if "tts_provider" in overrides:
             settings = dict(profile_values.get("generation_settings") or {})
             settings["tts_provider"] = overrides["tts_provider"]
@@ -2168,8 +2517,11 @@ class AutopilotService:
         return self.store.mark_plan_ready(plan_id, channel_id, accept_duration_estimate)
 
     def create_job(self, channel_id: str, plan_id: str,
-                   parent_job_id: str | None = None) -> ProductionJob:
-        return self.store.create_job(plan_id, channel_id, self.profile_store, parent_job_id)
+                   parent_job_id: str | None = None,
+                   video_terms: str | list[str] | None = None) -> ProductionJob:
+        return self.store.create_job(
+            plan_id, channel_id, self.profile_store, parent_job_id, video_terms
+        )
 
     def start_job(self, job_id: str) -> ProductionJob:
         job = self.store.get_job(job_id)

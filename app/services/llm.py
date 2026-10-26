@@ -1275,7 +1275,9 @@ def generate_terms(
         )
         ordering_rule = (
             "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
+            "earlier terms must describe earlier visual moments. Return one term per narration beat; "
+            "repeat a term when adjacent beats stay on the same topic, and do not invent a topic "
+            "just to make the terms more varied."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。

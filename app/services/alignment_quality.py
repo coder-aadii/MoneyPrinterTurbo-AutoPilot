@@ -21,14 +21,15 @@ def evaluate(aligned: dict, script: str, policy: str = "balanced") -> dict:
     """Evaluate every word, preserving raw measurements and all diagnostic issues.
 
     Scores are CTC model scores, not probabilities of correct pronunciation.
-    Balanced admits only 0.30–0.35 isolated words bounded by confident neighbours,
+    Balanced admits isolated words scoring at least 0.15 when their measured
+    timings are valid and anchored by confident neighbours (or the audio edge),
     at most three and at most 5% of the transcript. Coverage checks are deliberately
     conservative: large gaps or sparse cues require review, even if they are silence.
     """
     if policy not in {"balanced", "strict"}:
         raise ValueError(f"unknown Hindi alignment policy: {policy}")
     limits = {
-        "confidence_threshold": 0.35, "balanced_floor": 0.30,
+        "confidence_threshold": 0.35, "balanced_floor": 0.15,
         "max_low_confidence_words": 3, "max_low_confidence_proportion": 0.05,
         "max_consecutive_low_confidence": 1, "max_neighbour_gap_seconds": 0.75,
         "min_span_coverage": 0.80, "min_cue_coverage": 0.35,
@@ -125,14 +126,24 @@ def evaluate(aligned: dict, script: str, policy: str = "balanced") -> dict:
             structural.append({"code": "temporal_coverage", "message": "substantial uncovered audio requires review"})
     for i in low_indices:
         word = words[i]
-        neighbours_ok = 0 < i < len(words) - 1 and all(
+        neighbour_indices = [j for j in (i - 1, i + 1) if 0 <= j < len(words)]
+        neighbours_ok = bool(neighbour_indices) and all(
             isinstance(words[j], dict) and _finite(words[j].get("score"))
             and words[j]["score"] >= limits["confidence_threshold"]
             and valid_times[j] for j in (i - 1, i + 1)
+            if 0 <= j < len(words)
         )
         if neighbours_ok and valid_times[i]:
-            neighbours_ok = max(word["start"] - words[i - 1]["end"],
-                                words[i + 1]["start"] - word["end"]) <= limits["max_neighbour_gap_seconds"]
+            gaps = [
+                word["start"] - words[j]["end"] if j < i
+                else words[j]["start"] - word["end"]
+                for j in neighbour_indices
+            ]
+            if i == 0:
+                gaps.append(word["start"])
+            if i == len(words) - 1:
+                gaps.append(duration - word["end"])
+            neighbours_ok = max(gaps) <= limits["max_neighbour_gap_seconds"]
         item = {"word_index": i + 1, **word}
         if (policy == "balanced" and word["score"] >= limits["balanced_floor"]
                 and neighbours_ok and valid_times[i]):

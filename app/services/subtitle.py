@@ -311,6 +311,43 @@ def validate_word_cues(subtitle_file: str, script: str) -> bool:
     return words == expected
 
 
+def write_phrase_cues_from_alignment(aligned: dict, script: str, subtitle_file: str) -> bool:
+    """Group structurally sound measured word boundaries into phrase captions."""
+    if not isinstance(aligned, dict):
+        return False
+    normalized = unicodedata.normalize(
+        "NFC", utils.normalize_script_for_subtitle_matching(script)
+    )
+    report = alignment_quality.evaluate(aligned, normalized, policy="strict")
+    words = aligned.get("words") if isinstance(aligned, dict) else None
+    if (report["structural_errors"]
+            or aligned.get("structural_errors")
+            or not isinstance(words, list)):
+        return False
+
+    phrases = []
+    current = []
+    start = end = None
+    for word in words:
+        if start is None:
+            start = word["start"]
+        current.append(word["word"])
+        end = word["end"]
+        if word["word"].rstrip().endswith(tuple(const.PUNCTUATIONS)):
+            phrases.append((start, end, " ".join(current)))
+            current, start = [], None
+    if current:
+        phrases.append((start, end, " ".join(current)))
+    if not phrases:
+        return False
+
+    cues = "\n".join(
+        utils.text_to_srt(index, text, start, end)
+        for index, (start, end, text) in enumerate(phrases, start=1)
+    ) + "\n"
+    return write_subtitle_file(subtitle_file, cues)
+
+
 def align_hindi_words(audio_file: str, script: str, subtitle_file: str, *,
                       policy: str = "balanced") -> bool:
     """Cache measured CTC results and revalidate them under the selected policy."""

@@ -171,6 +171,10 @@ class VideoParams(BaseModel):
     custom_audio_file: Optional[str] = (
         None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     )
+    # Immutable per-channel references copied into the task snapshot. Asset paths
+    # are resolved and channel-checked by the branding service at render time.
+    channel_id: str = ""
+    channel_branding: dict[str, Any] = Field(default_factory=dict)
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""

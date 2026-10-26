@@ -703,10 +703,16 @@ def _revise_script_for_duration(script: str, params: VideoParams, actual_seconds
 
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
-    if params.effective_visual_style == visual_style.SAVAGE_ANIMATED_EXPLAINER:
-        return []
     video_terms = params.video_terms
     effective_style = params.effective_visual_style or params.visual_style
+    savage_beat_count = None
+    if effective_style == visual_style.SAVAGE_ANIMATED_EXPLAINER:
+        spoken_for_stock = _represent_script(params, video_script).spoken_script
+        savage_beat_count = len(emotion_storyboard.build(
+            utils.remove_pause_tags(spoken_for_stock),
+            narrator_preset=params.narrator_preset or "desi_savage_aggressive",
+            profanity_level=params.profanity_level or "savage_monetization_aware",
+        ))
     if effective_style == visual_style.ASMR_CUTTING or params.stock_video_style == asmr.SATISFYING_ASMR_CUTTING:
         # ASMR searches are an independent visual track. Categories, not the
         # narration subject/script or script-order setting, define its queries.
@@ -715,9 +721,13 @@ def generate_terms(task_id, params, video_script):
             for _category, terms in asmr.category_queries(params.asmr_categories)
             for term in terms
         ]
-    elif visual_style.relevant_search_terms(video_script, params.video_subject):
+    elif (
+        not video_terms
+        and effective_style == visual_style.RELEVANT_STOCK
+        and visual_style.relevant_search_terms(video_script, params.video_subject)
+    ):
         video_terms = visual_style.relevant_search_terms(video_script, params.video_subject)
-    elif effective_style == visual_style.RELEVANT_STOCK:
+    elif not video_terms and effective_style == visual_style.RELEVANT_STOCK:
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=utils.remove_pause_tags(video_script),
@@ -732,14 +742,23 @@ def generate_terms(task_id, params, video_script):
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
+            amount=(
+                max(1, int(savage_beat_count or 0))
+                if effective_style == visual_style.SAVAGE_ANIMATED_EXPLAINER
+                else 8 if params.match_materials_to_script else 5
+            ),
+            match_script_order=(
+                params.match_materials_to_script
+                or effective_style == visual_style.SAVAGE_ANIMATED_EXPLAINER
+            ),
             stock_video_style=params.stock_video_style,
         )
     else:
         if isinstance(video_terms, str):
-            video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
+            video_terms = [term.strip() for term in re.split(r"[,，\n]", video_terms)]
         elif isinstance(video_terms, list):
+            if not all(isinstance(term, str) for term in video_terms):
+                raise ValueError("video_terms must contain only strings.")
             video_terms = [term.strip() for term in video_terms]
         else:
             raise ValueError("video_terms must be a string or a list of strings.")
@@ -748,6 +767,19 @@ def generate_terms(task_id, params, video_script):
         video_terms = [term for term in video_terms if term]
 
         logger.debug(f"video terms: {utils.to_json(video_terms)}")
+
+    if effective_style == visual_style.SAVAGE_ANIMATED_EXPLAINER:
+        expected_beats = int(savage_beat_count or 0)
+        if len(video_terms or []) != expected_beats:
+            _mark_task_failed(
+                task_id,
+                "terms",
+                "Savage stock keywords must map one-to-one to narration beats: "
+                f"received {len(video_terms or [])} keyword(s) for {expected_beats} beat(s). "
+                "Repeat a keyword for each beat that stays on the same topic.",
+                details={"keyword_count": len(video_terms or []), "beat_count": expected_beats},
+            )
+            return None
 
     if not video_terms:
         _mark_task_failed(
@@ -776,6 +808,7 @@ def generate_terms(task_id, params, video_script):
     if (
         not params.match_materials_to_script
         and params.stock_video_style != asmr.SATISFYING_ASMR_CUTTING
+        and effective_style != visual_style.SAVAGE_ANIMATED_EXPLAINER
     ):
         video_terms = twelvelabs.rerank_terms_by_subject(
             video_subject=params.video_subject,
@@ -1184,6 +1217,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                     policy=getattr(params, "hindi_alignment_policy", "balanced"),
                 )
                 report_file = path.join(utils.task_dir(task_id), "alignment-quality.json")
+                quality = None
                 if path.isfile(report_file):
                     with open(report_file, encoding="utf-8") as source:
                         quality = json.load(source)
@@ -1192,15 +1226,57 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                     task_artifacts.patch_script_data(task_id, alignment_quality=quality,
                                                      alignment_quality_report=report_file)
                 if not aligned:
+                    # Reuse measured word boundaries as phrases when only
+                    # confidence failed. If timings are structurally unsafe,
+                    # try local Whisper transcription without downloading a model.
+                    phrases_written = (
+                        subtitle.write_phrase_cues_from_alignment(
+                            quality, video_script, subtitle_path
+                        ) if isinstance(quality, dict) else False
+                    )
+                    if not phrases_written:
+                        subtitle.create(
+                            audio_file=audio_file,
+                            subtitle_file=subtitle_path,
+                            word_level=False,
+                            language="hi",
+                            local_only=True,
+                        )
+                    params.subtitle_display_mode = "sentence"
+                    fallback = {
+                        "requested_mode": "word_by_word",
+                        "effective_mode": "sentence",
+                        "reason": "Hindi word alignment did not meet its quality policy",
+                    }
+                    report_file = path.join(utils.task_dir(task_id), "alignment-quality.json")
+                    if path.isfile(report_file):
+                        fallback["quality_report"] = report_file
+                    sm.state.update_task(
+                        task_id,
+                        subtitle_display_mode="sentence",
+                        subtitle_alignment_fallback=fallback,
+                    )
+                    task_artifacts.patch_script_data(
+                        task_id,
+                        subtitle_display_mode="sentence",
+                        subtitle_alignment_fallback=fallback,
+                    )
+                    if not path.isfile(subtitle_path):
+                        logger.warning(
+                            "Hindi word alignment was rejected and phrase-level caption "
+                            "fallback produced no subtitle file"
+                        )
+                elif not subtitle.validate_word_cues(subtitle_path, video_script):
+                    logger.error("Gemini word subtitles are unavailable or do not match narration")
                     return ""
             else:
                 subtitle.create(
                     audio_file=audio_file, subtitle_file=subtitle_path,
                     word_level=True, language=None, local_only=True,
                 )
-            if not subtitle.validate_word_cues(subtitle_path, video_script):
-                logger.error("Gemini word subtitles are unavailable or do not match narration")
-                return ""
+                if not subtitle.validate_word_cues(subtitle_path, video_script):
+                    logger.error("Gemini word subtitles are unavailable or do not match narration")
+                    return ""
         elif subtitle_provider == "edge":
             voice.create_subtitle(
                 text=video_script,
@@ -2348,7 +2424,7 @@ def _run_pipeline(
     if (not reuse_saved_audio and stop_at in {"terms", "materials", "video"}
             and params.video_source != "local"):
         video_terms = generate_terms(task_id, params, video_script)
-        if not video_terms and params.effective_visual_style != visual_style.SAVAGE_ANIMATED_EXPLAINER:
+        if not video_terms:
             return _mark_task_failed(
                 task_id,
                 "terms",
@@ -2439,7 +2515,7 @@ def _run_pipeline(
                     if not video_script:
                         return None
                     video_terms = generate_terms(task_id, params, video_script)
-                    if not video_terms and params.effective_visual_style != visual_style.SAVAGE_ANIMATED_EXPLAINER:
+                    if not video_terms:
                         return _mark_task_failed(task_id, "terms", "failed to refresh search terms after duration revision")
                     save_script_data(task_id, video_script, video_terms, params)
                     logger.info(f"duration recovery attempt {recovery_attempts}/{params.duration_recovery_attempts}")
@@ -2530,6 +2606,107 @@ def _run_pipeline(
         )
         return {"subtitle_path": subtitle_path, **duration_metadata}
 
+    # Branding is optional and pinned in the immutable task/job snapshot. Keep
+    # the original narration file and its alignment unchanged; build a separate
+    # final track, then shift the narration cues by the measured intro duration.
+    branding = getattr(params, "channel_branding", {}) or {}
+    channel_id = getattr(params, "channel_id", "")
+    if channel_id and isinstance(branding, dict):
+        from app.services import channel_branding as branding_service
+
+        segments = []
+        skipped = []
+        for kind in ("intro", "outro"):
+            item = branding.get(kind) or {}
+            if not item.get("enabled"):
+                continue
+            asset = item.get("audio") or {}
+            try:
+                asset_path = branding_service.resolve_asset(
+                    channel_id, asset.get("asset_key"), expected_kind=kind
+                )
+                expected_hash = asset.get("content_hash")
+                if (not isinstance(expected_hash, str)
+                        or hashlib.sha256(asset_path.read_bytes()).hexdigest() != expected_hash):
+                    raise ValueError("branding audio failed its saved content-hash check")
+                measured = voice.get_audio_duration(str(asset_path))
+                if measured <= 0:
+                    raise ValueError("branding audio has zero duration")
+                cue_path = branding_service.read_subtitle(channel_id, asset, kind)
+                segments.append((kind, str(asset_path), measured, cue_path))
+            except (ValueError, OSError, TypeError) as exc:
+                skipped.append({"segment": kind, "reason": str(exc)})
+
+        if segments:
+            ordered = ([entry for entry in segments if entry[0] == "intro"]
+                       + [("narration", audio_file, actual_narration_duration, None)]
+                       + [entry for entry in segments if entry[0] == "outro"])
+            output_audio = path.join(utils.task_dir(task_id), "audio-with-branding.mp3")
+            try:
+                if not voice._concat_audio_files([entry[1] for entry in ordered], output_audio):
+                    raise RuntimeError("audio assembly failed")
+                assembled_duration = voice.get_audio_duration(output_audio)
+                if assembled_duration <= 0:
+                    raise RuntimeError("assembled audio has zero duration")
+                intro_duration = sum(entry[2] for entry in ordered
+                                     if entry[0] == "intro")
+                cue_blocks = []
+                if subtitle_path and os.path.isfile(subtitle_path):
+                    cue_blocks.append(branding_service.offset_srt(subtitle_path, intro_duration))
+                elapsed = 0.0
+                for kind, _, duration, cue in ordered:
+                    if cue:
+                        cue_blocks.append(branding_service.offset_srt(cue, elapsed))
+                    elapsed += duration
+                if cue_blocks and params.subtitle_enabled:
+                    merged_srt = path.join(utils.task_dir(task_id), "subtitle-with-branding.srt")
+                    import re
+                    blocks = []
+                    for text in cue_blocks:
+                        blocks.extend(block.strip() for block in re.split(r"\n\s*\n", text) if block.strip())
+                    with open(merged_srt, "w", encoding="utf-8") as output:
+                        for index, block in enumerate(blocks, start=1):
+                            lines = block.splitlines()
+                            lines[0] = str(index)
+                            output.write("\n".join(lines) + "\n\n")
+                    subtitle_path = merged_srt
+                audio_file = output_audio
+                # Normalize the assembled track as one unit so uploaded and
+                # generated branding matches the main narration loudness.
+                params.voice_loudness_target_lufs = -16.0
+                actual_narration_duration = assembled_duration
+                audio_duration = math.ceil(assembled_duration)
+                params.actual_narration_duration_seconds = assembled_duration
+                duration_metadata = _duration_metadata(params, narration=assembled_duration)
+                params.duration_outside_requested_range = duration_metadata[
+                    "duration_outside_requested_range"
+                ]
+                sm.state.update_task(
+                    task_id,
+                    actual_narration_duration_seconds=assembled_duration,
+                    channel_branding_applied=[entry[0] for entry in segments],
+                    channel_branding_fallbacks=skipped,
+                    duration_metadata=duration_metadata,
+                )
+                task_artifacts.patch_script_data(
+                    task_id, channel_branding_applied=[entry[0] for entry in segments],
+                    channel_branding_fallbacks=skipped,
+                    duration_metadata=duration_metadata,
+                )
+            except Exception as exc:
+                logger.warning("channel branding skipped after assembly error: task_id={}, error={}",
+                               task_id, type(exc).__name__)
+                os.remove(output_audio) if os.path.exists(output_audio) else None
+                sm.state.update_task(
+                    task_id, channel_branding_applied=[],
+                    channel_branding_fallbacks=skipped + [{
+                        "segment": "assembly", "reason": "branding audio could not be assembled"
+                    }],
+                )
+        elif skipped:
+            sm.state.update_task(task_id, channel_branding_applied=[],
+                                 channel_branding_fallbacks=skipped)
+
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
@@ -2543,6 +2720,7 @@ def _run_pipeline(
                     profanity_level=settings.profanity_level,
                 ),
                 stock_provider=params.video_source,
+                stock_terms=video_terms,
             )]
         else:
             downloaded_videos = get_video_materials(
@@ -2660,6 +2838,16 @@ def _run_pipeline(
             final_video_duration,
         )
     task_artifacts.patch_script_data(task_id, duration_metadata=duration_metadata)
+
+    if params.effective_visual_style == visual_style.SAVAGE_ANIMATED_EXPLAINER:
+        animated_explainer.cleanup_stock_media(task_id)
+    elif params.effective_visual_style == visual_style.ASMR_CUTTING:
+        removed_materials = set(
+            material.cleanup_task_stock_materials(task_id, downloaded_videos)
+        )
+        downloaded_videos = [
+            item for item in downloaded_videos if path.basename(item) not in removed_materials
+        ]
 
     logger.success(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
