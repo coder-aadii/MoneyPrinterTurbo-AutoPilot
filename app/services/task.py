@@ -89,7 +89,8 @@ def _represent_script(params, script):
 
 def _alignment_preflight_errors(params, spoken_script, source_text=None):
     language = str(getattr(params, "video_language", "") or "").casefold()
-    if not language.startswith(("hi", "hindi")):
+    if (not language.startswith(("hi", "hindi"))
+            or not getattr(params, "subtitle_enabled", True)):
         return []
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
     provider = generation_settings.resolve_task_settings(
@@ -132,7 +133,7 @@ _VIDEO_MUSIC_PROVIDERS = {
 
 
 _SUPPORTED_VIDEO_SOURCES = frozenset({
-    "pexels", "pixabay", "coverr", "local", "wavespeed",
+    "auto", "pexels", "pixabay", "coverr", "local", "wavespeed",
     "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
     "loomloom", "openai_image",
 })
@@ -389,6 +390,23 @@ def _duration_metadata(params, *, narration: float | None = None,
             final_video, params.min_duration_seconds, params.max_duration_seconds
         ),
     }
+
+
+def _write_merged_subtitles(cue_blocks: list[str], output_path: str) -> bool:
+    """Write already-offset subtitle blocks, independent of narration caption state."""
+    import re
+
+    blocks = []
+    for text in cue_blocks:
+        blocks.extend(block.strip() for block in re.split(r"\n\s*\n", text) if block.strip())
+    if not blocks:
+        return False
+    with open(output_path, "w", encoding="utf-8") as output:
+        for index, block in enumerate(blocks, start=1):
+            lines = block.splitlines()
+            lines[0] = str(index)
+            output.write("\n".join(lines) + "\n\n")
+    return True
 
 
 def _measure_video_duration(video_path: str) -> float | None:
@@ -721,12 +739,6 @@ def generate_terms(task_id, params, video_script):
             for _category, terms in asmr.category_queries(params.asmr_categories)
             for term in terms
         ]
-    elif (
-        not video_terms
-        and effective_style == visual_style.RELEVANT_STOCK
-        and visual_style.relevant_search_terms(video_script, params.video_subject)
-    ):
-        video_terms = visual_style.relevant_search_terms(video_script, params.video_subject)
     elif not video_terms and effective_style == visual_style.RELEVANT_STOCK:
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
@@ -819,6 +831,11 @@ def generate_terms(task_id, params, video_script):
 
 
 def save_script_data(task_id, video_script, video_terms, params):
+    if (params.effective_visual_style == visual_style.SAVAGE_ANIMATED_EXPLAINER
+            or params.visual_style == visual_style.SAVAGE_ANIMATED_EXPLAINER):
+        params.stock_media_policy = animated_explainer.resolve_stock_media_policy(
+            params.stock_media_policy
+        )
     settings = generation_settings.resolve_task_settings(params)
     representations = _represent_script(params, video_script)
     spoken_script = representations.spoken_script
@@ -837,6 +854,7 @@ def save_script_data(task_id, video_script, video_terms, params):
         "spoken_script_hash": hashlib.sha256(spoken_script.encode("utf-8")).hexdigest(),
         "duration_metadata": _duration_metadata(params),
         "search_terms": video_terms,
+        "stock_media_policy": params.stock_media_policy,
         "params": params,
         "fact_claims": list(getattr(params, "fact_claims", []) or []),
         "fact_evidence": list(getattr(params, "fact_evidence", []) or []),
@@ -1212,11 +1230,29 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             # contains sentence estimates, which cannot drive word captions.
             language = (getattr(params, "video_language", "") or "").lower()
             if language.startswith("hi"):
-                aligned = subtitle.align_hindi_words(
-                    audio_file, video_script, subtitle_path,
-                    policy=getattr(params, "hindi_alignment_policy", "balanced"),
-                )
                 report_file = path.join(utils.task_dir(task_id), "alignment-quality.json")
+                if re.search(r"[A-Za-z]", video_script):
+                    # The installed Hindi CTC vocabulary cannot represent Latin
+                    # letters. Keep the actual TTS transcript and use the local
+                    # transcription fallback; do not send a guaranteed failure
+                    # to the worker or claim word alignment for mixed speech.
+                    aligned = False
+                    task_artifacts._write_json_atomic(Path(report_file), {
+                        "version": 1,
+                        "policy": getattr(params, "hindi_alignment_policy", "balanced"),
+                        "accepted": False,
+                        "structural_errors": [{
+                            "code": "mixed_script_hindi_ctc_unsupported",
+                            "message": "Hindi CTC word alignment cannot represent Latin words in this narration",
+                        }],
+                        "confidence_errors": [],
+                        "warnings": [],
+                    })
+                else:
+                    aligned = subtitle.align_hindi_words(
+                        audio_file, video_script, subtitle_path,
+                        policy=getattr(params, "hindi_alignment_policy", "balanced"),
+                    )
                 quality = None
                 if path.isfile(report_file):
                     with open(report_file, encoding="utf-8") as source:
@@ -1242,11 +1278,16 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                             language="hi",
                             local_only=True,
                         )
+                    has_fallback_cues = bool(subtitle.file_to_subtitles(subtitle_path))
                     params.subtitle_display_mode = "sentence"
                     fallback = {
                         "requested_mode": "word_by_word",
-                        "effective_mode": "sentence",
-                        "reason": "Hindi word alignment did not meet its quality policy",
+                        "effective_mode": "sentence" if has_fallback_cues else "none",
+                        "reason": (
+                            "Hindi word alignment did not meet its quality policy"
+                            if has_fallback_cues else
+                            "Hindi word alignment is unavailable and local transcription produced no captions"
+                        ),
                     }
                     report_file = path.join(utils.task_dir(task_id), "alignment-quality.json")
                     if path.isfile(report_file):
@@ -1261,11 +1302,9 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                         subtitle_display_mode="sentence",
                         subtitle_alignment_fallback=fallback,
                     )
-                    if not path.isfile(subtitle_path):
-                        logger.warning(
-                            "Hindi word alignment was rejected and phrase-level caption "
-                            "fallback produced no subtitle file"
-                        )
+                    if not has_fallback_cues:
+                        logger.error("Hindi alignment and local caption fallback produced no valid cues")
+                        return ""
                 elif not subtitle.validate_word_cues(subtitle_path, video_script):
                     logger.error("Gemini word subtitles are unavailable or do not match narration")
                     return ""
@@ -1882,6 +1921,98 @@ def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
     return recovered
 
 
+def _social_metadata_language(params: VideoParams) -> str:
+    language = str(getattr(params, "video_language", "") or "").casefold()
+    return "Hindi" if language.startswith("hi") else "English"
+
+
+def _youtube_caption_context_for_params(params: VideoParams) -> str:
+    branding = getattr(params, "channel_branding", {}) or {}
+
+    def brand_segment(name: str) -> dict:
+        segment = branding.get(name, {}) if isinstance(branding, dict) else {}
+        segment = segment if isinstance(segment, dict) else {}
+        return {
+            "enabled": bool(segment.get("enabled")),
+            "text": str(segment.get("text") or "")[:240],
+            "audio_present": bool(segment.get("audio")),
+        }
+
+    context = {
+        "caption_language": _social_metadata_language(params),
+        "voice_name": str(getattr(params, "voice_name", "") or ""),
+        "narrator_preset": str(getattr(params, "narrator_preset", "") or ""),
+        "voice_rate": getattr(params, "voice_rate", 1.0),
+        "visual_style": str(getattr(params, "effective_visual_style", "") or
+                             getattr(params, "visual_style", "") or ""),
+        "profanity_level": str(getattr(params, "profanity_level", "") or ""),
+        "intro": brand_segment("intro"),
+        "outro": brand_segment("outro"),
+    }
+    return json.dumps(context, ensure_ascii=False, sort_keys=True)[:1500]
+
+
+def _youtube_caption_source_for_params(params: VideoParams, narration: str) -> str:
+    """Build caption-only context without changing the canonical TTS narration."""
+    branding = getattr(params, "channel_branding", {}) or {}
+    intro = ""
+    outro = ""
+    for name, label in (("intro", "Channel intro"), ("outro", "Channel outro")):
+        segment = branding.get(name, {}) if isinstance(branding, dict) else {}
+        if isinstance(segment, dict) and segment.get("enabled") and str(segment.get("text") or "").strip():
+            value = f"{label}: {str(segment['text']).strip()[:500]}"
+            if name == "intro":
+                intro = value
+            else:
+                outro = value
+    segments = [intro, f"Final narration: {str(narration or '').strip()}", outro]
+    segments = [segment for segment in segments if segment]
+    return "\n".join(segments)
+
+
+def _generate_completed_video_youtube_metadata(
+    task_id: str, params: VideoParams, narration: str, video_paths: list[str],
+) -> list[dict]:
+    """Generate narration-language YouTube copy for each completed output."""
+    channel_context = _youtube_caption_context_for_params(params)
+    caption_source = _youtube_caption_source_for_params(params, narration)
+    narration_fingerprint = hashlib.sha256(narration.encode("utf-8")).hexdigest()
+    caption_source_fingerprint = hashlib.sha256(caption_source.encode("utf-8")).hexdigest()
+    generated = []
+    for index, video_path in enumerate(video_paths, start=1):
+        try:
+            metadata = llm.generate_social_metadata(
+                video_subject=params.video_subject,
+                video_script=caption_source,
+                language=_social_metadata_language(params),
+                platform="youtube_shorts",
+                channel_context=channel_context,
+                max_attempts=2,
+            )
+        except Exception as exc:
+            logger.warning(
+                "YouTube metadata generation failed after video completion: "
+                "task_id={}, video_index={}, error_type={}",
+                task_id, index, type(exc).__name__,
+            )
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        generated.append({
+            "video_index": index,
+            "video_name": os.path.basename(video_path),
+            "narration_fingerprint": narration_fingerprint,
+            "caption_source_fingerprint": caption_source_fingerprint,
+            "title": str(metadata.get("title") or "")[:100],
+            "caption": str(metadata.get("caption") or ""),
+            "hashtags": list(metadata.get("hashtags") or []),
+            "channel_context_fingerprint": hashlib.sha256(
+                channel_context.encode("utf-8")
+            ).hexdigest(),
+        })
+    return generated
+
+
 def _run_cross_post(
     task_id: str,
     video_paths: tuple[str, ...],
@@ -1918,50 +2049,56 @@ def _run_cross_post(
         logger.info(
             f"cross-post started, task_id: {task_id}, platforms: {', '.join(platforms)}"
         )
-        youtube_extra = None
-        post_title = video_subject or "Check out this video! #shorts #viral"
-        if platforms:
-            has_youtube = any(platform.startswith("youtube") for platform in platforms)
-            social_platform = "youtube_shorts"
-            if not has_youtube:
-                first = (platforms[0] or "").strip().lower()
-                # llm.py resolves unknown ids to its default platform.
-                social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
-            metadata = llm.generate_social_metadata(
-                video_subject=video_subject,
-                video_script=video_script,
-                language=video_language or "",
-                platform=social_platform,
-            )
-            if has_youtube:
-                youtube_title = metadata.get("title", video_subject)
-                youtube_description = metadata.get("caption", "")
-                if unverified_publication_label:
-                    youtube_title = ("[UNVERIFIED FACTS] " + str(youtube_title))[:100]
-                    youtube_description = (
-                        "Disclosure: MPT did not verify the factual claims in this video against sources.\n\n"
-                        + str(youtube_description)
-                    )[:5000]
-                youtube_extra = {
-                    "youtube_title": youtube_title,
-                    "youtube_description": youtube_description,
-                    "tags": metadata.get("hashtags", []),
-                    "privacyStatus": youtube_privacy_status,
-                    "selfDeclaredMadeForKids": youtube_made_for_kids,
-                    "containsSyntheticMedia": True,
-                }
-            post_title = (
-                metadata.get("caption")
-                or metadata.get("title")
-                or video_subject
-                or "Check out this video! #shorts #viral"
-            )
-            if unverified_publication_label and not any(
-                platform.startswith("youtube") for platform in platforms
-            ):
-                post_title = ("[UNVERIFIED FACTS] " + str(post_title))[:100]
+        task_snapshot = sm.state.get_task(task_id) or {}
+        saved_metadata = {
+            int(item.get("video_index", 0)): item
+            for item in task_snapshot.get("youtube_metadata_by_video", [])
+            if isinstance(item, dict) and str(item.get("video_index", "")).isdigit()
+        }
+        has_youtube = any(platform.startswith("youtube") for platform in platforms)
+        social_platform = "youtube_shorts"
+        if platforms and not has_youtube:
+            first = (platforms[0] or "").strip().lower()
+            social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
 
-        for video_path in video_paths:
+        for video_index, video_path in enumerate(video_paths, start=1):
+            youtube_extra = None
+            post_title = video_subject or "Check out this video! #shorts #viral"
+            if platforms:
+                metadata = saved_metadata.get(video_index) if has_youtube else None
+                if metadata is None:
+                    metadata = llm.generate_social_metadata(
+                        video_subject=video_subject,
+                        video_script=video_script,
+                        language="Hindi" if str(video_language or "").casefold().startswith("hi") else "English",
+                        platform=social_platform,
+                    )
+                if has_youtube:
+                    youtube_title = metadata.get("title", video_subject)
+                    youtube_description = metadata.get("caption", "")
+                    if unverified_publication_label:
+                        youtube_title = ("[UNVERIFIED FACTS] " + str(youtube_title))[:100]
+                        youtube_description = (
+                            "Disclosure: MPT did not verify the factual claims in this video against sources.\n\n"
+                            + str(youtube_description)
+                        )[:5000]
+                    youtube_extra = {
+                        "youtube_title": youtube_title,
+                        "youtube_description": youtube_description,
+                        "tags": metadata.get("hashtags", []),
+                        "privacyStatus": youtube_privacy_status,
+                        "selfDeclaredMadeForKids": youtube_made_for_kids,
+                        "containsSyntheticMedia": True,
+                    }
+                post_title = (
+                    metadata.get("caption")
+                    or metadata.get("title")
+                    or video_subject
+                    or "Check out this video! #shorts #viral"
+                )
+                if unverified_publication_label and not has_youtube:
+                    post_title = ("[UNVERIFIED FACTS] " + str(post_title))[:100]
+
             pending_result_index = None
 
             def record_background_request(request_id: str) -> None:
@@ -2394,7 +2531,7 @@ def _run_pipeline(
         allowed_sources = (
             {"pexels", "pixabay", "local"}
             if effective_style == visual_style.ASMR_CUTTING
-            else {"pexels", "pixabay", "coverr"}
+            else {"auto", "pexels", "pixabay", "coverr"}
         )
         if params.video_source not in allowed_sources:
             return _mark_task_failed(
@@ -2582,10 +2719,10 @@ def _run_pipeline(
         task_id, params, spoken_script, sub_maker, audio_file
     )
 
-    if params.subtitle_enabled and params.subtitle_display_mode == "word_by_word" and not subtitle_path:
+    if params.subtitle_enabled and not subtitle_path:
         return _mark_task_failed(
             task_id, "subtitle",
-            "Word-by-word subtitles could not be aligned to the narration; "
+            "Enabled subtitles could not be aligned to the narration; "
             "review alignment-quality.json for every timing and confidence issue. "
             "The saved narration can be reused without TTS.",
         )
@@ -2609,6 +2746,9 @@ def _run_pipeline(
     # Branding is optional and pinned in the immutable task/job snapshot. Keep
     # the original narration file and its alignment unchanged; build a separate
     # final track, then shift the narration cues by the measured intro duration.
+    narration_subtitle_path = subtitle_path
+    main_narration_duration = actual_narration_duration
+    intro_duration = 0.0
     branding = getattr(params, "channel_branding", {}) or {}
     channel_id = getattr(params, "channel_id", "")
     if channel_id and isinstance(branding, dict):
@@ -2658,18 +2798,13 @@ def _run_pipeline(
                     if cue:
                         cue_blocks.append(branding_service.offset_srt(cue, elapsed))
                     elapsed += duration
-                if cue_blocks and params.subtitle_enabled:
+                # Branding cues are independently authored subtitle assets.
+                # Keep them when narration alignment failed and disabled only
+                # narration captions for this task.
+                if cue_blocks:
                     merged_srt = path.join(utils.task_dir(task_id), "subtitle-with-branding.srt")
-                    import re
-                    blocks = []
-                    for text in cue_blocks:
-                        blocks.extend(block.strip() for block in re.split(r"\n\s*\n", text) if block.strip())
-                    with open(merged_srt, "w", encoding="utf-8") as output:
-                        for index, block in enumerate(blocks, start=1):
-                            lines = block.splitlines()
-                            lines[0] = str(index)
-                            output.write("\n".join(lines) + "\n\n")
-                    subtitle_path = merged_srt
+                    if _write_merged_subtitles(cue_blocks, merged_srt):
+                        subtitle_path = merged_srt
                 audio_file = output_audio
                 # Normalize the assembled track as one unit so uploaded and
                 # generated branding matches the main narration loudness.
@@ -2713,7 +2848,11 @@ def _run_pipeline(
     try:
         if params.effective_visual_style == visual_style.SAVAGE_ANIMATED_EXPLAINER:
             downloaded_videos = [animated_explainer.render_background(
-                task_id, params.video_subject, audio_duration, subtitle_path=subtitle_path,
+                task_id, params.video_subject, audio_duration,
+                subtitle_path=narration_subtitle_path,
+                spoken_script=spoken_script,
+                narration_duration_seconds=main_narration_duration,
+                narration_offset_seconds=intro_duration,
                 emotion_beats=emotion_storyboard.build(
                     spoken_script,
                     narrator_preset=settings.narrator_preset,
@@ -2721,6 +2860,8 @@ def _run_pipeline(
                 ),
                 stock_provider=params.video_source,
                 stock_terms=video_terms,
+                caption_mode=params.subtitle_display_mode,
+                stock_media_policy=params.stock_media_policy,
             )]
         else:
             downloaded_videos = get_video_materials(
@@ -2821,6 +2962,17 @@ def _run_pipeline(
             "failed to generate final video",
         )
 
+    youtube_metadata_by_video = _generate_completed_video_youtube_metadata(
+        task_id,
+        params,
+        params.spoken_script or _represent_script(params, video_script).spoken_script,
+        final_video_paths,
+    )
+    if youtube_metadata_by_video:
+        task_artifacts.patch_script_data(
+            task_id, youtube_metadata_by_video=youtube_metadata_by_video,
+        )
+
     final_video_duration = _measure_video_duration(final_video_paths[0])
     params.actual_video_duration_seconds = final_video_duration
     duration_metadata = _duration_metadata(
@@ -2897,6 +3049,7 @@ def _run_pipeline(
         **duration_metadata,
         "subtitle_path": subtitle_path,
         "materials": downloaded_videos,
+        "youtube_metadata_by_video": youtube_metadata_by_video,
         "cross_post_state": cross_post_state,
         "cross_post_results": None,
         "cross_post_error": None,

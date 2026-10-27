@@ -50,6 +50,24 @@ MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 # 默认保持串行，与旧版行为一致；有需要时可在配置中提高库存素材并发数。
 _DEFAULT_MATERIAL_CONCURRENCY = 1
+STOCK_VIDEO_PROVIDER_PRIORITY = ("pexels", "pixabay", "coverr")
+
+
+def stock_video_provider_order(preferred: str, *, allow_coverr: bool = True) -> list[str]:
+    """Use an explicit provider exclusively; AUTO follows configured priority."""
+    preferred = str(preferred or "").strip().lower()
+    configured_order = config.app.get("stock_video_provider_order", STOCK_VIDEO_PROVIDER_PRIORITY)
+    if not isinstance(configured_order, (list, tuple)):
+        configured_order = STOCK_VIDEO_PROVIDER_PRIORITY
+    providers = [provider for provider in dict.fromkeys(
+        str(item).strip().lower() for item in configured_order)
+                 if provider in STOCK_VIDEO_PROVIDER_PRIORITY
+                 if (allow_coverr or provider != "coverr")
+                 and stock_video_provider_configured(provider)]
+    if preferred == "auto":
+        return providers
+    return [preferred] if preferred in STOCK_VIDEO_PROVIDER_PRIORITY and (
+        allow_coverr or preferred != "coverr") else []
 
 
 def _get_material_concurrency() -> int:
@@ -334,6 +352,22 @@ def get_api_key(cfg_key: str):
     with _api_key_lock:
         _api_key_counter += 1
         return api_keys[_api_key_counter % len(api_keys)]
+
+
+def stock_video_provider_configured(provider: str) -> bool:
+    """Return whether a stock provider has credentials, without exposing them."""
+    cfg_key = {
+        "pexels": "pexels_api_keys",
+        "pixabay": "pixabay_api_keys",
+        "coverr": "coverr_api_keys",
+    }.get(str(provider or "").strip().lower())
+    if cfg_key is None:
+        return False
+    try:
+        get_api_key(cfg_key)
+    except ValueError:
+        return False
+    return True
 
 
 def _redact_secret(message: str, secret: str) -> str:
@@ -2376,30 +2410,44 @@ def download_videos(
         raise NoRelevantAsmrMaterialsError(
             "Satisfying ASMR Cutting requires Pexels, Pixabay, or a reviewed local ASMR library."
         )
-    provider = "pexels"
-    remote_search_videos = search_videos_pexels
-    if source == "pixabay":
-        provider = "pixabay"
-        remote_search_videos = search_videos_pixabay
-    elif source == "coverr":
-        provider = "coverr"
-        remote_search_videos = search_videos_coverr
+    stock_searchers = {
+        "pexels": search_videos_pexels,
+        "pixabay": search_videos_pixabay,
+        "coverr": search_videos_coverr,
+    }
+    provider_order = stock_video_provider_order(
+        source, allow_coverr=stock_video_style != asmr.SATISFYING_ASMR_CUTTING,
+    )
 
     def search_videos(
         search_term: str,
         minimum_duration: int,
         video_aspect: VideoAspect,
     ) -> List[MaterialInfo]:
-        return _search_videos_with_cache(
-            provider=provider,
-            search_videos=remote_search_videos,
-            search_term=search_term,
-            minimum_duration=minimum_duration,
-            video_aspect=video_aspect,
-            require_asmr_metadata=(
-                stock_video_style == asmr.SATISFYING_ASMR_CUTTING
-            ),
-        )
+        results = []
+        require_asmr_metadata = stock_video_style == asmr.SATISFYING_ASMR_CUTTING
+        for candidate_provider in provider_order:
+            try:
+                items = _search_videos_with_cache(
+                    provider=candidate_provider,
+                    search_videos=stock_searchers[candidate_provider],
+                    search_term=search_term,
+                    minimum_duration=minimum_duration,
+                    video_aspect=video_aspect,
+                    require_asmr_metadata=require_asmr_metadata,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "stock search provider unavailable: "
+                    f"provider={candidate_provider}, error={type(exc).__name__}"
+                )
+                continue
+            results.extend(items)
+            # Relevant Stock and ASMR need alternatives after semantic/review
+            # filtering, so collect each configured provider in priority order.
+            if items and not (require_relevant_coverage or require_asmr_metadata):
+                break
+        return results
 
     material_directory = config.app.get("material_directory", "").strip()
     if stock_video_style == asmr.SATISFYING_ASMR_CUTTING:
@@ -2501,6 +2549,7 @@ def download_videos(
             raise NoRelevantAsmrMaterialsError(str(exc)) from exc
         all_asmr_results = []
         ranked_candidates = list(curated_candidates)
+        ranked_remote = []
         searched_categories = []
         metadata_candidate_duration = 0.0
         need_remote = source != "local" and sum(
@@ -2515,25 +2564,100 @@ def download_videos(
                 video_aspect=video_aspect,
             )
             all_asmr_results.extend(category_results)
-            metadata_candidate_duration = sum(
-                item.duration for _, items in all_asmr_results for item in items
-            )
             ranked_remote = []
             per_term_counts: dict[str, int] = {}
-            for search_term, item in asmr.rank_asmr_candidates(all_asmr_results):
+            for search_term, item in asmr.rank_asmr_candidates(
+                all_asmr_results, include_unreviewed=True,
+            ):
                 if per_term_counts.get(search_term, 0) >= 3:
                     continue
                 per_term_counts[search_term] = per_term_counts.get(search_term, 0) + 1
                 ranked_remote.append((search_term, item))
+            # Search terms overlap heavily. Count each ranked asset once and use
+            # the same crop/speed calculation as the renderer; summing raw search
+            # responses can report thousands of seconds from duplicate results.
+            metadata_candidate_duration = sum(usable(item) for _, item in ranked_remote)
             ranked_candidates = curated_candidates + ranked_remote
             available_duration = sum(usable(item) for _, item in ranked_candidates)
             if available_duration >= required_duration:
                 break
+        review_audit = []
+        reviewed_remote = []
+        for search_term, item in ranked_remote[:12]:
+            if asmr.has_human_asmr_quality_approval(item):
+                reviewed_remote.append((search_term, item))
+                continue
+            source_info = item.source_info if isinstance(item.source_info, dict) else {}
+            asset_id = str(source_info.get("asset_id") or "unknown")
+            try:
+                local_path = _save_material_item(item, material_directory)
+                content_hash = visual_review.sha256(local_path)
+                audit = visual_review.sample_clip(
+                    local_path, task_id, asset_id,
+                    usable_seconds=min(float(item.duration), max_clip_duration),
+                    video_aspect=getattr(video_aspect, "value", video_aspect),
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                audit = {
+                    "status": "rejected",
+                    "reason": f"Unable to sample local ASMR video evidence: {type(exc).__name__}.",
+                    "sampled_frames": [],
+                    "semantic_verification": "not_automated",
+                }
+                content_hash = ""
+                local_path = ""
+            approval = visual_review.human_approval(asset_id, content_hash) if content_hash else None
+            if approval and audit["status"] != "rejected":
+                audit.update({
+                    "status": "approved",
+                    "reason": approval["reason"],
+                    "reviewer": approval["reviewer"],
+                    "reviewed_at": approval["reviewed_at"],
+                })
+                source_info = {
+                    **source_info,
+                    "quality_review": {
+                        "status": "approved",
+                        "reviewer": approval["reviewer"],
+                        "sampled_timestamps_seconds": [
+                            frame["timestamp_seconds"]
+                            for frame in audit.get("sampled_frames", [])
+                        ],
+                        "notes": approval["reason"],
+                    },
+                    "asmr_quality_review": "approved",
+                    "asmr_quality_review_notes": approval["reason"],
+                    "asmr_reviewed_timestamps_seconds": [
+                        frame["timestamp_seconds"]
+                        for frame in audit.get("sampled_frames", [])
+                    ],
+                }
+                reviewed_remote.append((search_term, item))
+            item.source_info = {
+                **source_info,
+                "visual_review": audit,
+                "source_sha256": content_hash,
+                **({"visual_review_local_file": local_path} if local_path else {}),
+            }
+            review_audit.append({
+                "asset_id": asset_id,
+                "provider": item.provider,
+                "search_term": source_info.get("search_term") or search_term,
+                "source_page": source_info.get("source_page"),
+                "license": source_info.get("license") or source_info.get("license_name"),
+                "sha256": content_hash,
+                **audit,
+            })
+        if review_audit:
+            task_artifacts.patch_script_data(task_id, visual_review_audit=review_audit)
+        ranked_candidates = curated_candidates + reviewed_remote
         if not ranked_candidates:
             if metadata_candidate_duration:
                 raise NoRelevantAsmrMaterialsError(
-                    "Insufficient distinct ASMR footage: quality-approved 0.0s; "
-                    f"metadata-only candidates offer {metadata_candidate_duration:.1f}s but need human visual review."
+                    "Insufficient distinct ASMR footage: no clips passed visual review; "
+                    f"{len(ranked_remote)} unique metadata-matched clips offer "
+                    f"{metadata_candidate_duration:.1f}s usable duration, but no clips were approved. "
+                    "Open the failed task's Stock/ASMR visual review evidence, approve suitable clips, then retry."
                 )
             raise NoRelevantAsmrMaterialsError(
                 "No reviewed local clips or stock videos matched ASMR "
@@ -2545,9 +2669,11 @@ def download_videos(
             raise NoRelevantAsmrMaterialsError(
                 "Insufficient distinct ASMR footage: required "
                 f"{required_duration:.1f}s usable duration, quality-approved found "
-                f"{found_duration:.1f}s; metadata-only candidates offer "
-                f"{metadata_candidate_duration:.1f}s across categories: "
-                f"{', '.join(searched_categories or categories)}."
+                f"{found_duration:.1f}s; unique metadata-matched clips offer "
+                f"{metadata_candidate_duration:.1f}s usable duration across categories: "
+                f"{', '.join(searched_categories or categories)}. "
+                f"{sum(item.get('status') == 'human_review_required' for item in review_audit)} "
+                "candidate clip(s) need visual approval in the failed task details before retrying."
             )
         # Match the renderer's measured narration plus safety margin so this set
         # cannot enter the shared short-footage looping fallback.
@@ -2622,7 +2748,7 @@ def download_videos(
                         "status": "approved",
                         "reason": approval["reason"],
                         "reviewer": approval["reviewer"],
-                        "reviewed_at": approval["reviewed_at"],
+                        "reviewed_at": approval.get("reviewed_at", ""),
                     })
                 source_info = dict(source_info)
                 source_info["visual_review"] = audit

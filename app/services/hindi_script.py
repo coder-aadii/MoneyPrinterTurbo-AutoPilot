@@ -13,7 +13,8 @@ from app.utils import utils
 # Deliberately curated: unknown Latin words stay intact and are rejected by
 # the Hindi alignment worker with a useful unsupported-character diagnostic.
 PRONUNCIATIONS = {
-    "api": "एपीआई", "browser": "ब्राउज़र", "client": "क्लाइंट",
+    "ai": "एआई", "api": "एपीआई", "browser": "ब्राउज़र",
+    "chatgpt": "चैटजीपीटी", "client": "क्लाइंट",
     "cpu": "सीपीयू", "database": "डेटाबेस", "html": "एचटीएमएल",
     "http": "एचटीटीपी", "https": "एचटीटीपीएस", "iss": "आईएसएस", "javascript": "जावास्क्रिप्ट",
     "process": "प्रोसेस", "request": "रिक्वेस्ट", "response": "रिस्पॉन्स",

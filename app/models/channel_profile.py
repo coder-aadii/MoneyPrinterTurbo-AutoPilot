@@ -13,6 +13,7 @@ class ChannelProfile(BaseModel):
 
     channel_id: str = Field(default_factory=lambda: str(uuid4()))
     display_name: str = Field(min_length=1, max_length=120)
+    channel_hashtag: str = Field(default="", max_length=80)
     niche: str = Field(default="", max_length=500)
     topic_preferences: list[str] = Field(default_factory=list, max_length=100)
     language: str = Field(default="", max_length=64)

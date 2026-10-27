@@ -49,6 +49,50 @@ def test_hyphenated_technical_words_preserve_display_and_align_as_pronunciation(
     assert [item.text for item in result.display_words] == ["वाई-फाई", "Wi-Fi"]
 
 
+def test_chatgpt_and_ai_map_to_devanagari_before_hindi_alignment(tmp_path, monkeypatch):
+    editable = "क्या ChatGPT और AI शिक्षकों की मदद कर सकते हैं?"
+    params = VideoParams(
+        video_subject="AI for teachers", video_language="Hindi",
+        voice_name="gemini:Puck", subtitle_display_mode="word_by_word",
+    )
+    spoken = task._represent_script(params, editable).spoken_script
+    assert spoken == "क्या चैटजीपीटी और एआई शिक्षकों की मदद कर सकते हैं?"
+    _set_test_vocab(tmp_path, monkeypatch, spoken)
+    assert task._alignment_preflight_errors(params, spoken, editable) == []
+
+
+def test_hinglish_proper_nouns_do_not_block_hindi_tts_or_alignment_preflight(tmp_path, monkeypatch):
+    editable = (
+        "Greenland और Iceland के बीच ठंडा पानी बहता है। "
+        "इसे Denmark Strait Cataract कहते हैं।"
+    )
+    params = VideoParams(
+        video_subject="Underwater waterfall", video_language="Hindi",
+        voice_name="gemini:Puck", subtitle_display_mode="word_by_word",
+    )
+    spoken = task._represent_script(params, editable).spoken_script
+    assert "Greenland" in spoken and "Iceland" in spoken
+    _set_test_vocab(tmp_path, monkeypatch, spoken)
+    assert task._alignment_preflight_errors(params, spoken, editable) == []
+
+    with patch.object(task, "resolve_custom_audio_file", return_value=None), \
+         patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
+         patch.object(task.voice, "tts", return_value=object()) as synthesize, \
+         patch.object(task.voice, "get_audio_duration", return_value=8), \
+         patch.object(task.sm.state, "update_task"):
+        task.generate_audio("mixed-language-audio", params, editable)
+
+    assert synthesize.call_args.kwargs["text"] == spoken
+
+
+def test_english_script_does_not_use_hindi_alignment_preflight():
+    params = VideoParams(
+        video_subject="English topic", video_language="English",
+        voice_name="gemini:Puck", subtitle_display_mode="word_by_word",
+    )
+    assert task._alignment_preflight_errors(params, "Greenland Iceland Denmark Strait", "") == []
+
+
 def test_caption_display_words_receive_the_combined_spoken_timing_span():
     result = build_representations("90% लोग")
     aligned = [(0.1, 0.3, "नब्बे"), (0.3, 0.6, "प्रतिशत"), (0.7, 0.9, "लोग")]
@@ -72,13 +116,11 @@ def _set_test_vocab(tmp_path, monkeypatch, text):
     })
 
 
-def test_alignment_preflight_rejects_ambiguous_bc_and_accepts_explicit_override(tmp_path, monkeypatch):
+def test_alignment_preflight_accepts_hinglish_abbreviations_and_explicit_override(tmp_path, monkeypatch):
     plain = build_representations("सच यह है कि bc काम करता है").spoken_script
     _set_test_vocab(tmp_path, monkeypatch, plain)
     errors = subtitle.preflight_hindi_alignment_script(plain, source_text="सच यह है कि bc काम करता है")
-    assert errors[0]["code"] == "unresolved_latin_token"
-    assert errors[0]["token"] == "bc"
-    assert "will not be expanded automatically" in errors[0]["message"]
+    assert errors == []
 
     resolved = build_representations(
         "सच यह है कि bc काम करता है", pronunciation_overrides={"bc": "बी सी"}
@@ -98,18 +140,21 @@ def test_preflight_detects_unknown_alignment_characters_and_dropped_symbols(tmp_
     ))
 
 
-def test_unresolved_token_is_rejected_before_tts_and_cached_audio_avoids_tts(tmp_path, monkeypatch):
+def test_hinglish_tts_runs_and_cached_audio_avoids_repeating_tts(tmp_path, monkeypatch):
     spoken = "सच यह है कि क्लाइंट काम करता है"
     _set_test_vocab(tmp_path, monkeypatch, spoken)
     params = VideoParams(
         video_subject="client behavior", video_language="Hindi", voice_name="gemini:Puck",
         subtitle_display_mode="word_by_word",
     )
-    monkeypatch.setattr(task, "_mark_task_failed", lambda *args, **kwargs: {"failed": True})
-    with patch.object(task.voice, "tts") as tts:
+    with patch.object(task, "resolve_custom_audio_file", return_value=None), \
+         patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
+         patch.object(task.voice, "tts", return_value=object()) as tts, \
+         patch.object(task.voice, "get_audio_duration", return_value=2), \
+         patch.object(task.sm.state, "update_task"):
         result = task.generate_audio("preflight-task", params, "यह bc काम करता है")
-    assert result == (None, None, None)
-    tts.assert_not_called()
+    assert result[:2] == (str(tmp_path / "audio.mp3"), 2)
+    assert tts.call_args.kwargs["text"] == "यह bc काम करता है"
 
     audio = tmp_path / "cached.mp3"
     audio.write_bytes(b"cached audio")

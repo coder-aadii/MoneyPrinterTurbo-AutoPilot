@@ -237,6 +237,74 @@ def test_task_pipeline_falls_back_to_phrase_captions_without_tts(tmp_path):
     tts.assert_not_called()
 
 
+def test_mixed_script_without_local_transcriber_keeps_captions_required(tmp_path):
+    params = VideoParams(
+        video_subject="Ocean", video_script="Greenland और Iceland के बीच पानी बहता है।",
+        video_language="hi", voice_name="gemini:Puck-Upbeat",
+        subtitle_enabled=True, subtitle_display_mode="word_by_word",
+    )
+    state = MemoryState()
+    with patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
+            patch.object(task.sm, "state", state), \
+            patch.object(task.config, "app", dict(task.config.app, subtitle_provider="edge")), \
+            patch.object(task, "_alignment_preflight_errors", return_value=[]), \
+            patch.object(task.task_artifacts, "patch_script_data"), \
+            patch.object(subtitle, "align_hindi_words") as hindi_align, \
+            patch.object(subtitle, "create", return_value=None) as local_whisper, \
+            patch.object(task, "_mark_task_failed") as fail:
+        result = task.generate_subtitle("mixed-ocean", params, params.video_script, None, "audio.mp3")
+
+    assert result == ""
+    assert params.subtitle_enabled is True
+    assert params.subtitle_display_mode == "sentence"
+    assert state.get_task("mixed-ocean")["subtitle_alignment_fallback"]["effective_mode"] == "none"
+    report = json.loads((tmp_path / "alignment-quality.json").read_text(encoding="utf-8"))
+    assert report["structural_errors"][0]["code"] == "mixed_script_hindi_ctc_unsupported"
+    hindi_align.assert_not_called()
+    local_whisper.assert_called_once()
+    fail.assert_not_called()
+
+
+def test_full_mixed_script_video_fails_when_captions_are_unavailable(tmp_path):
+    script = "Greenland और Iceland के बीच पानी बहता है। नाम Denmark Strait Cataract है।"
+    params = VideoParams(
+        video_subject="Underwater waterfall", video_script=script,
+        video_language="hi", voice_name="gemini:Puck-Upbeat",
+        subtitle_enabled=True, subtitle_display_mode="word_by_word",
+        visual_style="savage_animated_explainer", video_source="pexels",
+    )
+    state = MemoryState()
+    final_path = str(tmp_path / "final-1.mp4")
+    with patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
+            patch.object(task.utils, "check_ffmpeg_ready", return_value=True), \
+            patch.object(task.sm, "state", state), \
+            patch.object(task.config, "app", dict(task.config.app, subtitle_provider="edge")), \
+            patch.object(task.video, "validate_subtitle_colors"), \
+            patch.object(task, "generate_script", return_value=script), \
+            patch.object(task, "_verify_script_for_policy", return_value=script), \
+            patch.object(task, "generate_terms", return_value=["ocean", "Denmark Strait"]), \
+            patch.object(task, "save_script_data"), \
+            patch.object(task, "generate_audio", return_value=("audio.mp3", 8, None)) as tts_stage, \
+            patch.object(task.voice, "get_audio_duration", return_value=8.0), \
+            patch.object(task, "_alignment_preflight_errors", return_value=[]), \
+            patch.object(task.task_artifacts, "patch_script_data"), \
+            patch.object(subtitle, "align_hindi_words") as hindi_align, \
+            patch.object(subtitle, "create", return_value=None), \
+            patch.object(task.animated_explainer, "render_background", return_value="background.mp4") as render, \
+            patch.object(task, "generate_final_videos", return_value=([final_path], [], [])), \
+            patch.object(task, "_measure_video_duration", return_value=8.0), \
+            patch.object(task, "_generate_completed_video_youtube_metadata", return_value=[]):
+        task.start("mixed-ocean-video", params, suppress_auto_upload=True)
+
+    saved = state.get_task("mixed-ocean-video")
+    assert saved["state"] == task.const.TASK_STATE_FAILED
+    assert saved["subtitle_alignment_fallback"]["effective_mode"] == "none"
+    assert params.subtitle_enabled is True
+    render.assert_not_called()
+    tts_stage.assert_called_once()
+    hindi_align.assert_not_called()
+
+
 def test_render_retry_reuses_gemini_audio_but_changed_synthesis_inputs_do_not(tmp_path):
     params = VideoParams(video_subject="Test", video_script="तू है क्लाइंट।", video_language="hi",
                          voice_name="gemini:Puck-Upbeat", subtitle_display_mode="word_by_word")

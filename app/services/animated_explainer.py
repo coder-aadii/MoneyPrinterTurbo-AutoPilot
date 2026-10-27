@@ -17,7 +17,7 @@ from loguru import logger
 from moviepy import VideoClip, VideoFileClip
 from PIL import Image, ImageDraw, ImageFont
 
-from app.services import character_library, emotion_storyboard, hindi_script, material, task_artifacts, visual_review
+from app.services import alignment_quality, character_library, emotion_storyboard, hindi_script, material, scene_spec, task_artifacts, visual_review
 from app.utils import utils
 from app.utils.subtitle_reader import file_to_subtitles
 
@@ -26,6 +26,7 @@ WIDTH, HEIGHT, FPS = 1080, 1920, 30
 _BG = (250, 249, 244)
 _TOP_PANEL = (96, 350, 984, 820)
 MAX_STOCK_CLIP_SECONDS = 5.0
+MAX_STORYBOARD_QUERIES = 3
 
 
 def _stock_candidate_keys(candidate: dict) -> set[str]:
@@ -95,6 +96,46 @@ def _caption_groups(cues: list[tuple[float, float, str]]) -> list[dict]:
     return groups
 
 
+def _sentence_groups(cues: list[tuple[float, float, str]], script: str,
+                     duration: float, offset: float) -> list[dict]:
+    """Use measured phrase endpoints without implying individual word alignment."""
+    if (not cues or alignment_quality.spoken_words(" ".join(cue[2] for cue in cues))
+            != alignment_quality.spoken_words(script)):
+        raise ValueError("sentence captions do not cover the spoken script")
+    previous_end = 0.0
+    groups = []
+    for start, end, text in cues:
+        if not (0 <= previous_end <= start < end <= duration + .001):
+            raise ValueError("sentence caption timing is invalid")
+        groups.append({"start": start + offset, "end": end + offset,
+                       "sentence": text})
+        previous_end = end
+    return groups
+
+
+def _draw_sentence_caption(draw: ImageDraw.ImageDraw, font_path: str, text: str) -> None:
+    font = _font(font_path, 43)
+    lines = []
+    line = ""
+    for word in text.split():
+        next_line = f"{line} {word}".strip()
+        if line and draw.textbbox((0, 0), next_line, font=font, stroke_width=4)[2] > WIDTH - 140:
+            lines.append(line)
+            line = word
+        else:
+            line = next_line
+    if line:
+        lines.append(line)
+    if len(lines) > 5:
+        raise ValueError("sentence caption exceeds the explainer safe area")
+    line_height = 51
+    top = 855 + (5 - len(lines)) * 10
+    for index, line in enumerate(lines):
+        draw.text((WIDTH // 2, top + index * line_height), line, font=font,
+                  anchor="mt", fill=(255, 230, 0), stroke_width=4,
+                  stroke_fill=(28, 34, 42))
+
+
 def _display_cues(cues: list[tuple[float, float, str]], display_map: list[dict]) -> list[tuple[float, float, str]]:
     """Render editable words over the measured timing span of spoken words."""
     mapped = []
@@ -123,6 +164,49 @@ def _task_display_map(task_id: str) -> list[dict]:
         return []
 
 
+def _visual_timeline(
+    beats: list[dict], cues: list[tuple[float, float, str]],
+    spoken_script: str | None, narration_duration: float, narration_offset: float,
+) -> tuple[list[dict], list[tuple[float, float, str]]]:
+    """Use verified word cues or schedule visuals without claiming alignment."""
+    expected_count = max((int(beat.get("end_word", 0)) for beat in beats), default=0)
+    cue_words = [alignment_quality.spoken_words(text) for _, _, text in cues]
+    expected_words = alignment_quality.spoken_words(spoken_script) if spoken_script else []
+    word_cues_valid = bool(
+        beats and expected_count > 0 and len(cues) == expected_count
+        and all(len(words) == 1 for words in cue_words)
+        and (not expected_words or [words[0] for words in cue_words] == expected_words)
+        and all(math.isfinite(start) and math.isfinite(end) and end > start
+                for start, end, _ in cues)
+    )
+    if word_cues_valid:
+        shifted = [(start + narration_offset, end + narration_offset, text)
+                   for start, end, text in cues]
+        resolved = emotion_storyboard.resolve(beats, shifted)
+        return [{**beat, "timing_source": "measured_word_alignment"} for beat in resolved], shifted
+    if beats and cues and expected_words and [word for _start, _end, text in cues
+                                              for word in alignment_quality.spoken_words(text)] == expected_words:
+        # Phrase endpoints can time a beat when they coincide with its word
+        # range. They do not establish karaoke timing inside that phrase.
+        ranges = []
+        cursor = 0
+        for start, end, text in cues:
+            count = len(alignment_quality.spoken_words(text))
+            ranges.append((cursor, cursor + count, start, end))
+            cursor += count
+        by_start = {start_word: start for start_word, _end_word, start, _end in ranges}
+        by_end = {end_word: end for _start_word, end_word, _start, end in ranges}
+        if all(beat.get("start_word") in by_start and beat.get("end_word") in by_end
+               for beat in beats):
+            return ([{**beat, "start": by_start[beat["start_word"]] + narration_offset,
+                      "end": by_end[beat["end_word"]] + narration_offset,
+                      "timing_source": "measured_phrase_alignment"}
+                     for beat in beats], [])
+    return emotion_storyboard.schedule_visuals_from_duration(
+        beats, narration_duration, offset=narration_offset,
+    ), []
+
+
 def _probe_video(path: str | Path) -> dict | None:
     try:
         result = subprocess.run(
@@ -142,40 +226,104 @@ def _probe_video(path: str | Path) -> dict | None:
         return None
 
 
+STOCK_MEDIA_POLICIES = {"manual_review", "auto_eligible"}
+
+
+def resolve_stock_media_policy(policy: str | None = None) -> str:
+    """Resolve and validate the task's saved stock approval policy."""
+    value = str(policy or material.config.app.get(
+        "stock_media_policy", "manual_review"
+    )).strip().casefold()
+    if value not in STOCK_MEDIA_POLICIES:
+        logger.warning("stock_media_policy_invalid value={!r}; using manual_review", value)
+        return "manual_review"
+    return value
+
+
+def _stock_eligibility(candidate: dict, *, required_seconds: float,
+                       policy: str, query: str = "") -> tuple[bool, str, dict | None]:
+    """Fail closed unless source, media integrity, format, duration and relevance pass.
+
+    Manual Review uses the existing hash-bound human approval. Automatic uses
+    only a query- and content-hash-bound local-vision decision. No local vision
+    model is installed here, so unseen footage is rejected as uncertain.
+    """
+    if policy not in STOCK_MEDIA_POLICIES:
+        return False, "invalid_stock_media_policy", None
+    provider = str(candidate.get("provider") or "").casefold()
+    if provider not in material.STOCK_VIDEO_PROVIDER_PRIORITY:
+        return False, "unsupported_provider", None
+    if not candidate.get("source_page") or not candidate.get("license"):
+        return False, "missing_source_or_license", None
+    path = candidate.get("path")
+    if not path:
+        return False, "missing_local_file", None
+    media = _probe_video(path)
+    if not media:
+        return False, "invalid_or_undecodable_media", None
+    try:
+        current_hash = task_artifacts.file_digest(path)
+    except (OSError, ValueError, TypeError):
+        return False, "file_integrity_check_failed", None
+    if not current_hash or current_hash != candidate.get("sha256"):
+        return False, "media_hash_mismatch", None
+    if (media["width"] < _TOP_PANEL[2] - _TOP_PANEL[0]
+            or media["height"] < _TOP_PANEL[3] - _TOP_PANEL[1]
+            or media["width"] <= media["height"]):
+        return False, "not_sufficient_resolution_landscape", None
+    if media["duration"] + 1 / FPS < required_seconds:
+        return False, "clip_too_short", None
+    if policy == "manual_review":
+        approval = visual_review.human_approval(str(candidate.get("asset_id") or ""), current_hash)
+        if not approval:
+            return False, "visual_relevance_unverified", None
+        return True, "manual_review_approved", approval
+
+    decision = visual_review.cached_auto_relevance(current_hash, query)
+    if decision is None:
+        visual_review.record_auto_relevance(
+            current_hash, query, "uncertain", verifier="conservative_policy",
+            model="unavailable",
+            score=None,
+            reason="No supported local vision model is installed; metadata cannot establish visual relevance.",
+        )
+        decision = visual_review.cached_auto_relevance(current_hash, query)
+        return False, "automatic_relevance_unverified", decision
+    if decision.get("verifier") != "local_vision":
+        return False, "automatic_relevance_unverified", decision
+    if decision.get("decision") != "relevant" or float(decision.get("score") or 0) < .85:
+        return False, f"automatic_visual_check_{decision.get('decision', 'uncertain')}", decision
+    return True, "local_vision_relevance_passed", decision
+
+
 def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
-    """Find decodable local files backed by source/licensing records in MPT's cache."""
-    cache_dir = Path(utils.storage_dir("cache_material_search"))
+    """Find local files in the exact provider/query search caches."""
     video_dir = Path(utils.storage_dir("cache_videos"))
-    query_terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold())
-                   if term not in {"a", "the", "above", "and", "moving", "footage"}}
-    if not query_terms:
-        return []
     candidates: dict[str, dict] = {}
-    for cache_file in cache_dir.glob("*.json"):
+    for minimum_duration in range(3, math.ceil(MAX_STOCK_CLIP_SECONDS) + 1):
         try:
-            items = json.loads(cache_file.read_text(encoding="utf-8")).get("items", [])
-        except (OSError, ValueError, TypeError):
+            items = material.material_cache.load_material_search_cache(
+                provider=provider, search_term=query, minimum_duration=minimum_duration,
+                video_aspect=material.VideoAspect.landscape,
+            )
+        except Exception as exc:
+            logger.warning(
+                "stock_cache_lookup_failed provider={} query={!r} error={}",
+                provider, query, type(exc).__name__,
+            )
+            continue
+        if not items:
             continue
         for item in items:
-            if not isinstance(item, dict):
-                continue
-            info = item.get("source_info")
-            if not isinstance(info, dict) or str(info.get("provider", "")).casefold() != provider.casefold():
+            info = item.source_info if isinstance(item.source_info, dict) else {}
+            if str(info.get("provider", "")).casefold() != provider.casefold():
                 continue
             license_name = str(info.get("license") or info.get("license_name") or "").strip()
             source_page = str(info.get("source_page") or "").strip()
-            url = str(item.get("url") or "").strip()
+            url = str(item.url or "").strip()
             if not license_name or not source_page or not url:
                 continue
-            tags = info.get("tags") or []
-            metadata_text = " ".join((str(info.get("description", "")),
-                                      str(info.get("title", "")),
-                                      " ".join(map(str, tags)))).casefold()
-            matched = query_terms & set(re.findall(r"[a-z0-9]+", metadata_text))
-            minimum_matches = min(2, len(query_terms))
-            if not minimum_matches or len(matched) < minimum_matches:
-                continue
-            digest = hashlib.md5(url.encode("utf-8")).hexdigest()
+            digest = hashlib.md5(url.split("#", 1)[0].encode("utf-8")).hexdigest()
             local = video_dir / f"vid-{digest}.mp4"
             if not local.is_file():
                 continue
@@ -189,12 +337,16 @@ def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
                 "path": str(local), "sha256": task_artifacts.file_digest(str(local)),
                 "duration": media["duration"], "width": media["width"],
                 "height": media["height"], "codec": media["codec"],
-                "tags": list(tags) if isinstance(tags, list) else [],
-                "relevance_score": len(matched),
+                "tags": list(info.get("tags") or []),
+                "relevance_score": 1,
             }
             previous = candidates.get(digest)
             if previous is None or candidate["relevance_score"] > previous["relevance_score"]:
                 candidates[digest] = candidate
+                logger.info("stock_cache_candidate provider={} query={!r} id={} cache_hit=True "
+                            "file_verified=True license={} relevance=needs_visual_policy_check",
+                            provider, query, candidate["asset_id"], bool(license_name),
+                            )
     return sorted(candidates.values(), key=lambda value: (-value["relevance_score"], value["asset_id"]))
 
 
@@ -255,6 +407,7 @@ def _search_and_cache_stock_candidate(
     minimum_duration: int = 3,
     clip_seconds: float | None = None,
     exclude_asset_ids: set[str] | None = None,
+    stock_media_policy: str = "manual_review",
 ) -> list[dict]:
     """Fetch only needed, valid candidates and try same-query replacements on failure."""
     searchers = {
@@ -265,14 +418,28 @@ def _search_and_cache_stock_candidate(
     searcher = searchers.get(provider)
     if searcher is None:
         return []
+    if not material.stock_video_provider_configured(provider):
+        logger.info(f"skipping unconfigured {provider} storyboard fallback")
+        return []
     try:
-        material.get_api_key(f"{provider}_api_keys")
         items = material._search_videos_with_cache(
             provider=provider, search_videos=searcher, search_term=query,
             minimum_duration=minimum_duration, video_aspect="16:9",
         )
     except Exception as exc:
         logger.warning(f"optional {provider} storyboard search failed: {type(exc).__name__}")
+        return []
+    logger.info("stock_search provider={} query={!r} result_count={} candidate_ids={}",
+                provider, query, len(items),
+                [str(item.source_info.get("asset_id")) for item in items
+                 if isinstance(item.source_info, dict)])
+    if (stock_media_policy == "auto_eligible"
+            and not visual_review.local_vision_verifier_available()):
+        logger.info(
+            "stock_search_rejected provider={} query={!r} reason=local_vision_unavailable "
+            "result_count={} downloaded=0",
+            provider, query, len(items),
+        )
         return []
     ranked = []
     query_terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold())
@@ -283,14 +450,34 @@ def _search_and_cache_stock_candidate(
         info = item.source_info if isinstance(item.source_info, dict) else {}
         if not info.get("license") and provider != "coverr":
             continue
+        rendition = info.get("rendition")
+        if isinstance(rendition, dict):
+            try:
+                width, height = int(rendition.get("width")), int(rendition.get("height"))
+            except (TypeError, ValueError):
+                width = height = 0
+            if (width < _TOP_PANEL[2] - _TOP_PANEL[0]
+                    or height < _TOP_PANEL[3] - _TOP_PANEL[1]
+                    or width <= height):
+                logger.info(
+                    "stock_candidate_rejected provider={} query={!r} id={} "
+                    "reason=search_rendition_not_landscape",
+                    provider, query, info.get("asset_id"),
+                )
+                continue
         tags = info.get("tags") or []
         searchable_text = " ".join((str(info.get("title") or ""),
                                      str(info.get("description") or ""),
                                      " ".join(map(str, tags))))
         words = set(re.findall(r"[a-z0-9]+", searchable_text.casefold()))
         score = len(query_terms & words)
-        if score < min(2, len(query_terms)):
+        # The provider search is itself relevance evidence. Pexels often returns
+        # sparse titles/tags, so one metadata match is enough; when metadata is
+        # absent, retain the provider-ranked result for the human review gate.
+        if words and score < 1:
             continue
+        if not words:
+            score = 1
         ranked.append((score, float(item.duration or 0), item, info, tags))
     ranked.sort(key=lambda candidate: (-candidate[0], -candidate[1]))
     scored = []
@@ -320,17 +507,41 @@ def _search_and_cache_stock_candidate(
         if attempts >= attempt_limit:
             break
         attempts += 1
+        persistent_media_dir = Path(utils.storage_dir("cache_videos"))
+        cache_path = persistent_media_dir / (
+            f"vid-{hashlib.md5(item.url.encode('utf-8')).hexdigest()}.mp4"
+        )
+        cache_hit = cache_path.is_file()
         try:
             path = material._save_material_item(
-                item, str(Path(utils.task_dir(task_id)) / "top-panel-media")
+                item, str(persistent_media_dir)
             )
-        except Exception:
+        except Exception as exc:
+            logger.info("stock_candidate_rejected provider={} query={!r} id={} reason=download_{}",
+                        provider, query, asset_id, type(exc).__name__)
             continue
         if not path:
+            logger.info("stock_candidate_rejected provider={} query={!r} id={} reason=no_local_file",
+                        provider, query, asset_id)
             continue
         media = _probe_video(path)
         if not media or media["duration"] < minimum_duration:
+            logger.info("stock_candidate_rejected provider={} query={!r} id={} reason=media_validation",
+                        provider, query, asset_id)
             continue
+        if (media["width"] < _TOP_PANEL[2] - _TOP_PANEL[0]
+                or media["height"] < _TOP_PANEL[3] - _TOP_PANEL[1]
+                or media["width"] <= media["height"]):
+            logger.info(
+                "stock_candidate_rejected provider={} query={!r} id={} "
+                "reason=not_sufficient_resolution_landscape",
+                provider, query, asset_id,
+            )
+            continue
+        logger.info("stock_candidate_local provider={} query={!r} id={} cache_hit={} downloaded={} "
+                    "verified=True license={} relevance_score={}",
+                    provider, query, asset_id, cache_hit, not cache_hit,
+                    bool(info.get("license")), score)
         candidate = {
             "provider": provider, "asset_id": asset_id,
             "source_page": info.get("source_page"),
@@ -342,15 +553,16 @@ def _search_and_cache_stock_candidate(
             "height": media["height"], "codec": media["codec"],
             "tags": list(tags) if isinstance(tags, list) else [],
             "relevance_score": score,
-            "human_approval": visual_review.human_approval(
-                asset_id, task_artifacts.file_digest(path)
-            ),
         }
+        if stock_media_policy == "manual_review":
+            candidate["human_approval"] = visual_review.human_approval(
+                asset_id, candidate["sha256"]
+            )
         content_hash_key = f"sha256:{str(candidate['sha256']).casefold()}"
         if content_hash_key in excluded or content_hash_key in seen_content_hashes:
             continue
         seen_content_hashes.add(content_hash_key)
-        if candidate["human_approval"]:
+        if candidate.get("human_approval"):
             if clip_seconds is not None:
                 candidate["prepared_path"] = _prepare_stock_candidate(
                     candidate, task_id, clip_seconds
@@ -380,12 +592,14 @@ def resolve_storyboard_media(
     provider: str = "pixabay",
     allow_unapproved_preview: bool = False,
     stock_terms: list[str] | None = None,
+    stock_media_policy: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Use one keyword per narration topic and one reviewed clip per <=5s window."""
     if isinstance(stock_terms, str):
         usable_terms = [term.strip() for term in re.split(r"[,，\n]", stock_terms) if term.strip()]
     else:
         usable_terms = [str(term).strip() for term in (stock_terms or []) if str(term).strip()]
+    policy = resolve_stock_media_policy(stock_media_policy)
     if usable_terms and beats:
         if len(usable_terms) != len(beats):
             raise ValueError(
@@ -393,17 +607,26 @@ def resolve_storyboard_media(
                 f"received {len(usable_terms)} keyword(s) for {len(beats)} beat(s). "
                 "Repeat a keyword for each beat that stays on the same topic."
             )
+        searched_queries = set()
         for index, (beat, query) in enumerate(zip(beats, usable_terms)):
-            beats[index] = {
-                **beat,
-                "visual_mode": "stock_video",
-                "stock_query": query,
-                "effective_media_type": "illustration",
-                "visual_rationale": (
-                    "Use this editable narration-topic keyword for stock search; keep the "
-                    "original character and diagram visible as the approved fallback."
-                ),
-            }
+            spec_data = beat.get("scene_spec")
+            if spec_data:
+                spec = scene_spec.validate_scene_spec(spec_data)
+                # Stock footage is an independent top-panel layer; keep the
+                # narration-linked diagram as fallback for every primitive.
+                use_stock = (query.casefold() in searched_queries or
+                             len(searched_queries) < MAX_STORYBOARD_QUERIES)
+                if use_stock:
+                    searched_queries.add(query.casefold())
+                    spec = scene_spec.validate_scene_spec({**spec.model_dump(), "stock_query": query})
+                beats[index] = {**beat, "scene_spec": spec.model_dump(),
+                                "visual_mode": "stock_video" if use_stock else "illustration",
+                                "stock_query": query if use_stock else None,
+                                "effective_media_type": "illustration"}
+            else:
+                # Legacy saved beat data remains renderable after an update.
+                beats[index] = {**beat, "visual_mode": "stock_video",
+                                "stock_query": query, "effective_media_type": "illustration"}
     elif usable_terms:
         raise ValueError(
             "Savage stock keywords cannot be mapped because narration timing produced no beats."
@@ -435,6 +658,8 @@ def resolve_storyboard_media(
 
     used_assets: set[str] = set()
     media_segments = []
+    provider_order = material.stock_video_provider_order(provider)
+    logger.info("stock_storyboard_provider requested={} eligible={}", provider, provider_order)
     for group in windows_by_query.values():
         query = group["query"]
         windows = group["windows"]
@@ -444,7 +669,9 @@ def resolve_storyboard_media(
         )
         clip_seconds = max(window["end"] - window["start"] for window in windows)
         candidates = [
-            item for item in _cached_stock_candidates(query, provider)
+            item
+            for candidate_provider in provider_order
+            for item in _cached_stock_candidates(query, candidate_provider)
             if float(item.get("duration", 0)) >= minimum_duration
             and not _stock_candidate_is_used(item, used_assets)
         ]
@@ -457,72 +684,111 @@ def resolve_storyboard_media(
             unique_candidates.append(candidate)
             cached_ids.update(keys)
         candidates = unique_candidates
+        logger.info("stock_storyboard_query provider={} query={!r} windows={} cached_candidates={}",
+                    provider, query, needed_count,
+                    [item.get("asset_id") for item in candidates])
         approved_cached = 0
         for candidate in candidates:
-            candidate["human_approval"] = visual_review.human_approval(
-                candidate["asset_id"], candidate["sha256"]
+            eligible, reason, approval = _stock_eligibility(
+                candidate, required_seconds=clip_seconds, policy=policy, query=query,
             )
-            if candidate["human_approval"]:
+            candidate["human_approval"] = approval
+            candidate["eligibility_reason"] = reason
+            if eligible:
                 candidate["prepared_path"] = _prepare_stock_candidate(
                     candidate, task_id, clip_seconds
                 )
                 candidate["preparation_failed"] = not bool(candidate["prepared_path"])
                 if candidate["prepared_path"]:
                     approved_cached += 1
-        if approved_cached < needed_count:
+        for candidate_provider in provider_order:
+            if approved_cached >= needed_count:
+                break
             excluded_keys = set(cached_ids) | set(used_assets)
-            candidates.extend(_search_and_cache_stock_candidate(
+            for candidate in candidates:
+                excluded_keys.update(_stock_candidate_keys(candidate))
+            found = _search_and_cache_stock_candidate(
                 query,
-                provider,
+                candidate_provider,
                 task_id,
                 required_count=needed_count - approved_cached,
                 minimum_duration=minimum_duration,
                 clip_seconds=clip_seconds,
                 exclude_asset_ids=excluded_keys,
-            ))
+                stock_media_policy=policy,
+            )
+            candidates.extend(found)
+            logger.info("stock_storyboard_results provider={} query={!r} result_count={} candidate_ids={}",
+                        candidate_provider, query, len(found),
+                        [item.get("asset_id") for item in found])
+            approved_cached += sum(bool(item.get("human_approval")) for item in found)
 
         for window in windows:
             beat = beats[window["beat_index"]]
             required_seconds = window["end"] - window["start"]
             selected = None
-            selected_approval = None
+            selected_evidence = None
             pending_candidate = None
+            first_rejected = None
             for candidate in candidates:
                 if candidate.get("preparation_failed"):
                     continue
                 if (_stock_candidate_is_used(candidate, used_assets)
                         or float(candidate.get("duration", 0)) < required_seconds):
                     continue
-                approval = candidate.get("human_approval")
-                if "human_approval" not in candidate:
-                    approval = visual_review.human_approval(
-                        candidate["asset_id"], candidate["sha256"]
-                    )
-                if approval:
-                    selected, selected_approval = candidate, approval
+                eligible, reason, evidence = _stock_eligibility(
+                    candidate, required_seconds=required_seconds, policy=policy, query=query,
+                )
+                candidate["eligibility_reason"] = reason
+                if eligible:
+                    selected, selected_evidence = candidate, evidence
                     break
-                if pending_candidate is None:
+                if first_rejected is None:
+                    first_rejected = (candidate, reason, evidence)
+                if reason == "visual_relevance_unverified" and pending_candidate is None:
                     pending_candidate = candidate
             if selected is None:
                 selected = pending_candidate
 
             entry = {
                 "beat_id": beat.get("beat_id"), "start": window["start"], "end": window["end"],
+                "timing_source": beat.get("timing_source"),
                 "short_visual_title": beat.get("short_visual_title"),
                 "query": query, "planned_type": "stock_video",
                 "effective_type": "illustration",
-                "selection_reason": beat.get("visual_rationale"), "fallback_reason": None,
+                "selection_reason": None, "visual_rationale": beat.get("visual_rationale"),
+                "fallback_reason": None,
                 "provider": None, "asset_id": None, "source_page": None, "license": None,
                 "license_url": None, "sha256": None, "local_path": None,
                 "approval_status": "not_found",
                 "source_url": None, "provider_download_url": None,
+                "eligibility_policy": policy,
             }
             if not selected:
-                entry["fallback_reason"] = "No relevant, decodable candidate met the requested clip duration."
+                if first_rejected:
+                    rejected, reason, evidence = first_rejected
+                    entry.update({key: rejected.get(key) for key in (
+                        "provider", "asset_id", "source_page", "license", "license_url", "sha256"
+                    )})
+                    entry["local_path"] = rejected.get("path")
+                    entry["source_url"] = rejected.get("source_page")
+                    entry["approval_status"] = "rejected"
+                    entry["rejection_reason"] = reason
+                    entry["relevance_evidence"] = evidence
+                    entry["fallback_reason"] = f"Candidate rejected: {reason}."
+                else:
+                    entry["fallback_reason"] = "No relevant, decodable candidate met the requested clip duration."
+                reject_reason = first_rejected[1] if first_rejected else "no_candidate_found"
+                reject_evidence = (
+                    first_rejected[2].get("reason")
+                    if first_rejected and isinstance(first_rejected[2], dict) else None
+                )
+                logger.info("stock_storyboard_rejected beat={} query={!r} reason={} detail={!r}",
+                            beat.get("beat_id"), query, reject_reason, reject_evidence)
                 beat["effective_media_type"] = "illustration"
                 beat["top_visual"] = (
                     "cloud_illustration"
-                    if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
+                    if beat.get("top_visual") == "stock_clouds" else beat.get("top_visual")
                 )
                 report.append(entry)
                 continue
@@ -535,13 +801,26 @@ def resolve_storyboard_media(
             if selected.get("provider") != "coverr":
                 entry["provider_download_url"] = selected.get("url")
             entry["local_path"] = selected["path"]
-            entry["approval_status"] = "approved" if selected_approval else "human_review_required"
-            if selected_approval:
-                entry["human_approval"] = selected_approval
+            entry["approval_status"] = (
+                "approved" if policy == "manual_review" else "auto_eligible"
+            ) if selected_evidence else "human_review_required"
+            entry["eligibility_policy"] = policy
+            entry["selection_reason"] = selected.get("eligibility_reason")
+            entry["relevance_evidence"] = selected_evidence
+            if selected_evidence:
+                if policy == "manual_review":
+                    entry["human_approval"] = selected_evidence
+                else:
+                    entry["automatic_relevance"] = selected_evidence
                 beat["effective_media_type"] = "stock_video"
                 beat["selected_source"] = {key: selected.get(key) for key in (
                     "provider", "asset_id", "source_page", "license", "license_url", "sha256"
                 )}
+                beat["selected_source"].update({
+                    "search_term": query,
+                    "selection_reason": selected.get("eligibility_reason"),
+                    "relevance_evidence": selected_evidence,
+                })
                 media_segments.append({
                     **selected, "start": window["start"], "end": window["end"],
                     "search_term": query,
@@ -572,11 +851,17 @@ def resolve_storyboard_media(
                     beat["effective_media_type"] = "illustration"
                     beat["top_visual"] = (
                         "cloud_illustration"
-                        if "cloud" in str(beat.get("top_visual")) else beat.get("top_visual")
+                        if beat.get("top_visual") == "stock_clouds" else beat.get("top_visual")
                     )
                     entry["fallback_reason"] = (
                         "Candidate failed the approval requirement; the illustrated scene is used."
                     )
+            logger.info("stock_storyboard_decision beat={} query={!r} candidate={} provider={} "
+                        "license={} local_verified={} relevance={} policy={} approval={} effective={} reason={!r}",
+                        beat.get("beat_id"), query, entry["asset_id"], entry["provider"],
+                        bool(entry["license"]), bool(selected.get("path") and _probe_video(selected["path"])),
+                        selected.get("relevance_score"), policy, entry["approval_status"],
+                        entry["effective_type"], entry["fallback_reason"])
             report.append(entry)
     report_path = Path(utils.task_dir(task_id)) / "top-panel-storyboard.json"
     try:
@@ -587,7 +872,7 @@ def resolve_storyboard_media(
 
 
 def cleanup_stock_media(task_id: str) -> list[str]:
-    """Remove task-local stock downloads after a successful final render, keeping source metadata."""
+    """Remove prepared task clips while keeping shared-cache Pexels sources intact."""
     task_root = Path(utils.task_dir(task_id)).resolve()
     media_dir = task_root / "top-panel-media"
     if not media_dir.exists() or media_dir.is_symlink():
@@ -605,9 +890,16 @@ def cleanup_stock_media(task_id: str) -> list[str]:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         if isinstance(report, list):
             for item in report:
-                if isinstance(item, dict) and item.get("local_path"):
-                    item["local_path"] = None
-                    item["local_media_removed"] = True
+                if not isinstance(item, dict) or not item.get("local_path"):
+                    continue
+                try:
+                    Path(item["local_path"]).resolve().relative_to(media_dir.resolve())
+                except (OSError, ValueError):
+                    if Path(item["local_path"]).is_file():
+                        item["shared_cache_retained"] = True
+                    continue
+                item["local_path"] = None
+                item["local_media_removed"] = True
             report_path.write_text(
                 json.dumps(report, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -701,15 +993,90 @@ def _draw_visual_scene(draw: ImageDraw.ImageDraw, font_path: str, visual: str,
         # Avoid collision with the synchronized captions at y=960.
 
 
+def _draw_scene_label(draw: ImageDraw.ImageDraw, font_path: str,
+                      text: str, box: tuple[int, int, int, int]) -> None:
+    """Fit validated narration text into a reusable scene card."""
+    left, top, right, bottom = box
+    for size in range(48, 25, -2):
+        font = _font(font_path, size)
+        lines = []
+        line = ""
+        for word in text.split():
+            candidate = f"{line} {word}".strip()
+            if line and draw.textbbox((0, 0), candidate, font=font)[2] > right-left-40:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+        if (len(lines) <= 2 and len(lines) * (size + 10) <= bottom-top-24
+                and all(draw.textbbox((0, 0), value, font=font)[2] <= right-left-40
+                        for value in lines)):
+            y = (top+bottom - len(lines)*(size+10))//2
+            for value in lines:
+                draw.text(((left+right)//2, y), value, font=font,
+                          fill=(40, 55, 70), anchor="mt")
+                y += size+10
+            return
+    raise ValueError("scene label does not fit the top panel")
+
+
+def _draw_scene_spec(draw: ImageDraw.ImageDraw, font_path: str,
+                     value: dict | scene_spec.SceneSpec, phase: float) -> None:
+    """Render only validated, fixed-layout primitives; never execute scene data."""
+    scene = scene_spec.validate_scene_spec(value)
+    navy, yellow, blue = (40, 55, 70), (255, 230, 0), (225, 239, 248)
+    if scene.primitive == "label":
+        boxes = [(155, 455, 925, 705)]
+    elif scene.primitive == "counter":
+        boxes = [(155, 415, 925, 620), (220, 655, 860, 785)]
+    elif len(scene.labels) > 2:
+        count = len(scene.labels)
+        gap = 28
+        width = (830 - gap*(count-1)) // count
+        boxes = [(125 + index*(width+gap), 465,
+                  125 + index*(width+gap) + width, 715)
+                 for index in range(count)]
+    else:
+        boxes = [(125, 445, 475, 735), (605, 445, 955, 735)]
+    for index, box in enumerate(boxes):
+        if index >= len(scene.labels):
+            break
+        draw.rounded_rectangle(box, radius=26, fill=blue if index % 2 else (255, 255, 255),
+                               outline=navy, width=5)
+        _draw_scene_label(draw, font_path, scene.labels[index], box)
+    if scene.primitive in {"flow", "transformation", "timeline"}:
+        progress = max(0.0, min(1.0, phase))
+        for left_box, right_box in zip(boxes, boxes[1:]):
+            x0, x1 = left_box[2] + 5, right_box[0] - 5
+            endpoint = x0 + round((x1-x0) * progress)
+            draw.line((x0, 590, endpoint, 590), fill=yellow, width=12)
+            draw.polygon(((endpoint, 590), (endpoint-16, 579), (endpoint-16, 601)), fill=yellow)
+        if scene.primitive == "transformation":
+            draw.text((540, 775), "परिवर्तन", font=_font(font_path, 30),
+                      fill=navy, anchor="mm")
+    elif scene.primitive == "comparison":
+        draw.text((540, 590), "vs", font=_font(font_path, 45),
+                  fill=navy, anchor="mm")
+    elif scene.primitive == "counter" and len(scene.labels) == 1:
+        draw.text((540, 735), "संख्या · चित्रात्मक", font=_font(font_path, 30),
+                  fill=navy, anchor="mm")
+    if scene.illustrative:
+        draw.text((540, 812), "चित्रात्मक", font=_font(font_path, 22),
+                  fill=(90, 100, 110), anchor="mm")
+
+
 def _draw_topic_scene(
     draw: ImageDraw.ImageDraw, font_path: str, beat: dict | None, phase: float,
     topic: str = "",
 ) -> None:
     """Draw a topic-neutral comparison whose beat follows aligned narration."""
+    if beat and beat.get("scene_spec"):
+        _draw_scene_spec(draw, font_path, beat["scene_spec"], phase)
+        return
     navy, red, green, yellow = (40, 55, 70), (226, 80, 65), (56, 142, 90), (255, 230, 0)
     visual = (beat or {}).get("top_visual", "topic_diagram")
-    text = str((beat or {}).get("text", "")).casefold()
-    subject_text = f"{topic} {text}".casefold()
     card_left = (80, 350, 500, 820)
     card_right = (580, 350, 1000, 820)
     if visual == "cloud_reveal":
@@ -863,8 +1230,7 @@ def _draw_topic_scene(
         draw.text((540, 745), "Request  •  Response", font=_font(font_path, 38), fill=navy, anchor="mm")
         return
 
-    if (any(word in subject_text for word in ("गाँव", "गांव", "village"))
-            and any(word in subject_text for word in ("शहर", "city"))):
+    if visual == "legacy_village_city_comparison":
         draw.rounded_rectangle(card_left, radius=34, fill=(228, 244, 222), outline=green, width=6)
         draw.rounded_rectangle(card_right, radius=34, fill=(228, 237, 249), outline=navy, width=6)
         draw.text((290, 395), "गाँव", font=_font(font_path, 48), fill=navy, anchor="mm")
@@ -886,19 +1252,19 @@ def _draw_topic_scene(
                     draw.rectangle((wx, wy, wx + 9, wy + 13), fill=yellow)
         return
 
-    # Use simple local symbols only when the narration names the subject.
-    if any(term in text for term in ("चिड़िया", "पक्षी", "bird", "tit")):
+    # Optional legacy templates remain available only by explicit visual ID.
+    if visual in {"legacy_bird", "legacy_bird_weather"}:
         draw.ellipse((380, 475, 700, 690), fill=(255, 230, 0), outline=navy, width=8)
         draw.ellipse((575, 500, 620, 545), fill=navy)
         draw.polygon(((690, 560), (800, 520), (790, 600)), fill=red)
         draw.arc((290, 420, 550, 730), 200, 350, fill=navy, width=20)
-        if any(term in text for term in ("मौसम", "बारिश", "धूप", "weather", "rain")):
+        if visual == "legacy_bird_weather":
             draw.ellipse((690, 390, 855, 555), fill=yellow, outline=navy, width=6)
             draw.arc((155, 660, 420, 840), 180, 360, fill=(120, 155, 185), width=22)
             for x in (220, 285, 350):
                 draw.line((x, 710, x - 25, 770), fill=(60, 142, 211), width=10)
         return
-    if any(term in text for term in ("space", "अंतरिक्ष", "ग्रह", "planet", "moon", "चाँद")):
+    if visual == "legacy_planet":
         draw.ellipse((330, 410, 740, 820), fill=(102, 167, 218), outline=navy, width=8)
         for x, y in ((215, 500), (850, 650), (760, 390), (250, 745)):
             draw.ellipse((x - 15, y - 15, x + 15, y + 15), fill=yellow)
@@ -919,13 +1285,6 @@ def _draw_topic_scene(
 
 def _topic_short_title(topic: str) -> str:
     text = str(topic or "").strip()
-    folded = text.casefold()
-    if "बादल" in text or "cloud" in folded:
-        return "बादल का वजन"
-    if "client" in folded and "server" in folded:
-        return "Client vs Server"
-    if "iss" in folded or "astronaut" in folded or "अंतरिक्ष" in text:
-        return "ISS में ZERO-G?"
     words = re.findall(r"[\w-]+", text, flags=re.UNICODE)
     return " ".join(words[:3]) if words else "आज का सच"
 
@@ -987,8 +1346,6 @@ def _draw_frame(topic: str, duration: float, time_seconds: float,
     # even when no external media provider or licensed asset is available.
     draw.rounded_rectangle((56, 70, WIDTH - 56, 1140), radius=44,
                            fill=(255, 255, 255), outline=(222, 225, 218), width=5)
-    is_iss_fact = any(token in f"{topic} {topic.lower()}" for token in
-                      ("ISS", "iss", "gravity", "गुरुत्व", "आईएसएस", "अंतरिक्ष स्टेशन"))
     active_beat = next((beat for beat in beats
                         if beat["start"] <= time_seconds < beat["end"]), None)
     if active_beat is None:
@@ -1013,18 +1370,18 @@ def _draw_frame(topic: str, duration: float, time_seconds: float,
                          if group["start"] <= time_seconds < group["end"]), None)
     speech_active = active_group is not None
     pose = _pose(active_beat["pose"] if active_beat else "explaining")
-    if is_iss_fact:
-        if active_beat:
-            phase = max(0.0, min(1.0, (time_seconds - active_beat["start"]) /
-                                  max(0.001, active_beat["end"] - active_beat["start"])))
-            _draw_visual_scene(draw, font_path, active_beat["top_visual"], phase, time_seconds)
-        else:
-            _draw_visual_scene(draw, font_path, "gravity_misconception", 0.0, time_seconds)
+    phase = 0.0
+    if active_beat:
+        phase = max(0.0, min(1.0, (time_seconds - active_beat["start"]) /
+                              max(0.001, active_beat["end"] - active_beat["start"])))
+    legacy_space_visuals = {
+        "gravity_misconception", "iss_gravity_comparison",
+        "earth_iss_gravity_comparison", "orbiting_iss", "shared_freefall",
+        "iss_orbit_context", "freefall_elevator_payoff",
+    }
+    if active_beat and active_beat.get("top_visual") in legacy_space_visuals and not active_beat.get("scene_spec"):
+        _draw_visual_scene(draw, font_path, active_beat["top_visual"], phase, time_seconds)
     else:
-        phase = 0.0
-        if active_beat:
-            phase = max(0.0, min(1.0, (time_seconds - active_beat["start"]) /
-                                  max(0.001, active_beat["end"] - active_beat["start"])))
         _draw_topic_scene(draw, font_path, active_beat, phase, topic)
     for segment in stock_segments or []:
         if not segment["start"] <= time_seconds < segment["end"]:
@@ -1054,7 +1411,9 @@ def _draw_frame(topic: str, duration: float, time_seconds: float,
                                          radius=10, fill=(190, 35, 35))
             panel_draw.text((_TOP_PANEL[0] + 24, _TOP_PANEL[1] + 21), label,
                             font=label_font, fill=(255, 255, 255))
-    if active_group is not None:
+    if active_group is not None and "sentence" in groups[active_group]:
+        _draw_sentence_caption(draw, font_path, groups[active_group]["sentence"])
+    elif active_group is not None:
         group = groups[active_group]
         active_word = next((index for index, cue in group["words"]
                             if cue[0] <= time_seconds < cue[1]), None)
@@ -1084,22 +1443,47 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
                       subtitle_path: str | None = None,
                       emotion_beats: list[dict] | None = None,
                       display_word_map: list[dict] | None = None,
+                      spoken_script: str | None = None,
+                      narration_duration_seconds: float | None = None,
+                      narration_offset_seconds: float = 0.0,
                       stock_provider: str = "pixabay",
                       stock_terms: list[str] | None = None,
-                      preview_unapproved_stock: bool = False) -> str:
+                      caption_mode: str = "word_by_word",
+                      preview_unapproved_stock: bool = False,
+                      stock_media_policy: str | None = None) -> str:
     """Render a 1080×1920, 30 FPS local explainer scene with the saved narrator."""
     if not math.isfinite(float(duration)) or duration <= 0:
         raise ValueError("explainer duration must be a positive finite number")
+    narration_duration = (float(narration_duration_seconds)
+                          if narration_duration_seconds is not None
+                          else float(duration) - float(narration_offset_seconds))
+    if (not math.isfinite(narration_duration) or narration_duration <= 0
+            or not math.isfinite(float(narration_offset_seconds))
+            or narration_offset_seconds < 0
+            or narration_offset_seconds + narration_duration > duration + 0.01):
+        raise ValueError("narration visual duration must fit within the audio track")
     assets = character_library.inspect_pack()
     output = output_path or os.path.join(utils.task_dir(task_id), "savage-explainer-background.mp4")
-    cues = _read_word_cues(subtitle_path)
+    subtitle_cues = _read_word_cues(subtitle_path)
+    beats, cues = _visual_timeline(
+        emotion_beats or [], subtitle_cues, spoken_script,
+        narration_duration, narration_offset_seconds,
+    )
     display_word_map = display_word_map or _task_display_map(task_id)
-    groups = _caption_groups(_display_cues(cues, display_word_map))
-    beats = emotion_storyboard.resolve(emotion_beats or [], cues)
+    if caption_mode == "sentence":
+        groups = _sentence_groups(subtitle_cues, spoken_script or "",
+                                  narration_duration, narration_offset_seconds)
+    else:
+        groups = _caption_groups(_display_cues(cues, display_word_map))
+    if subtitle_path and not groups:
+        raise ValueError("enabled explainer captions have no valid renderable cues")
+    if beats and beats[0].get("timing_source") == "estimated_visual_schedule":
+        logger.warning("visual scene timing is estimated from measured narration duration; word captions are unavailable")
     beats, stock_segments = resolve_storyboard_media(
         task_id, beats, provider=stock_provider,
         stock_terms=stock_terms,
         allow_unapproved_preview=preview_unapproved_stock,
+        stock_media_policy=stock_media_policy,
     )
     prepared_segments = []
     for segment in stock_segments:
@@ -1129,6 +1513,9 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
             for segment in prepared_segments
         ],
         "preview_unapproved_stock": preview_unapproved_stock,
+        "stock_media_policy": stock_media_policy or material.config.app.get(
+            "stock_media_policy", "manual_review"
+        ),
         "display_word_map": display_word_map,
         "size": [WIDTH, HEIGHT], "fps": FPS, "output": str(Path(output).resolve()),
     })
@@ -1162,5 +1549,33 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
         for segment in prepared_segments:
             segment["clip"].close()
     validate_media(output)
+    rendered_sources = []
+    for beat in beats:
+        overlapping = [segment for segment in prepared_segments
+                       if segment["start"] < beat["end"] and segment["end"] > beat["start"]]
+        if overlapping:
+            segment = overlapping[0]
+            selected_source = beat.get("selected_source") or {}
+            source = {
+                "type": "stock_video", "provider": segment["provider"],
+                "asset_id": segment["asset_id"], "sha256": segment["sha256"],
+                "approved": bool(segment.get("approved")),
+                "source_url": selected_source.get("source_page"),
+                "license": selected_source.get("license"),
+                "license_url": selected_source.get("license_url"),
+                "search_term": segment.get("search_term"),
+                "selection_reason": selected_source.get("selection_reason"),
+                "relevance_evidence": selected_source.get("relevance_evidence"),
+            }
+        else:
+            source = {"type": "original_illustration", "visual": beat.get("top_visual")}
+        rendered_sources.append({"beat_id": beat.get("beat_id"),
+                                 "start": beat["start"], "end": beat["end"], **source})
+        logger.info("top_panel_rendered beat={} start={:.2f} end={:.2f} source={}",
+                    beat.get("beat_id"), beat["start"], beat["end"], source)
+    task_artifacts._write_json_atomic(
+        Path(utils.task_dir(task_id)) / "top-panel-rendered-media.json",
+        {"caption_mode": caption_mode, "output": output, "sources": rendered_sources},
+    )
     task_artifacts.cache_artifact(task_id, "explainer", fingerprint, output)
     return output

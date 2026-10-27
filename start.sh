@@ -19,6 +19,13 @@ if ! "$ROOT_DIR/.venv/bin/python" -c 'import streamlit, uvicorn' >/dev/null 2>&1
   exit 1
 fi
 
+MPT_WEBUI_HOST="${MPT_WEBUI_HOST:-127.0.0.1}"
+MPT_WEBUI_PORT="${MPT_WEBUI_PORT:-8501}"
+. "$ROOT_DIR/webui-port.sh"
+if ! stop_port_owner_prompt; then
+  exit 1
+fi
+
 cleanup() {
   trap - EXIT INT TERM
   for child_pid in "${API_PID:-}" "${WEBUI_PID:-}"; do

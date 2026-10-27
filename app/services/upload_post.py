@@ -6,6 +6,7 @@ Docs: https://docs.upload-post.com
 import os
 import time
 from typing import Callable, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 import requests
@@ -171,6 +172,51 @@ class UploadPostService:
 
     def is_configured(self) -> bool:
         return bool(self.api_key and self.username and self.enabled)
+
+    def get_profile(self, username: str | None = None) -> dict:
+        """Read a profile's current social-account links without publishing."""
+        profile_username = username or self.username
+        if not self.api_key or not profile_username:
+            return {"success": False, "error": "Upload-Post profile is not configured"}
+        try:
+            response = trace_http_call(
+                "GET", requests.get,
+                f"{self.API_BASE}/api/uploadposts/users/{quote(profile_username, safe='')}",
+                headers={"Authorization": f"Apikey {self.api_key}"}, timeout=20,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                return {"success": False, "error": "Upload-Post returned an invalid profile response"}
+            profile = result.get("profile")
+            if not isinstance(profile, dict):
+                profiles = result.get("profiles")
+                profile = next((item for item in profiles or []
+                                if isinstance(item, dict) and item.get("username") == profile_username), None)
+            if not isinstance(profile, dict) or profile.get("username") != profile_username:
+                return {"success": False, "error": "Upload-Post profile could not be confirmed"}
+            return {"success": True, "profile": profile}
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            logger.warning(f"Upload-Post profile status unavailable: {type(exc).__name__}")
+            return {"success": False, "error": "Upload-Post profile status could not be confirmed"}
+
+    def connected_platform(self, platform: str, username: str | None = None) -> dict | None:
+        result = self.get_profile(username)
+        if result.get("success") is not True:
+            return None
+        profile = result["profile"]
+        accounts = profile.get("social_accounts")
+        if not isinstance(accounts, dict):
+            return None
+        account = accounts.get(platform)
+        if not isinstance(account, dict):
+            return None
+        if account.get("reauth_required") is True or profile.get("reauth_required") is True:
+            return None
+        stable_id = account.get("username") or account.get("id")
+        if not isinstance(stable_id, str) or not stable_id.strip():
+            return None
+        return {**account, "username": stable_id.strip(), "profile_username": profile["username"]}
 
     def upload_video(
         self,
@@ -401,13 +447,14 @@ class UploadPostService:
             logger.error(f"Failed to check status: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    def check_history(self, external_id: str, profile_username: str) -> dict:
-        """Look up a completed/scheduled post by the stable MPT job identifier."""
+    def check_history(self, external_id: str, profile_username: str,
+                      platform: str = "youtube") -> dict:
+        """Look up a completed/scheduled post by job identifier and platform."""
         try:
             response = trace_http_call(
                 "GET", requests.get, f"{self.API_BASE}/api/uploadposts/history",
                 params={"external_id": external_id, "profile_username": profile_username,
-                        "platform": "youtube", "limit": 10},
+                        "platform": platform, "limit": 10},
                 headers={"Authorization": f"Apikey {self.api_key}"}, timeout=30,
             )
             response.raise_for_status()

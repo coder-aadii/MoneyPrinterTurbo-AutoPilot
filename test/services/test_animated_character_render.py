@@ -1,8 +1,11 @@
 import shutil
+import json
 
+import numpy as np
 import pytest
+from moviepy import VideoClip
 
-from app.services import animated_explainer
+from app.services import animated_explainer, emotion_storyboard
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for animated video validation")
@@ -39,3 +42,110 @@ def test_canonical_avatar_pack_renders_in_animated_scene(tmp_path, monkeypatch):
         assert tuple(clip.size) == (animated_explainer.WIDTH, animated_explainer.HEIGHT)
         assert clip.duration == pytest.approx(0.2, abs=1 / animated_explainer.FPS + 0.01)
         assert clip.get_frame(0).shape == (animated_explainer.HEIGHT, animated_explainer.WIDTH, 3)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for animated video validation")
+def test_animated_scene_renders_from_audio_duration_without_subtitle_cues(tmp_path, monkeypatch):
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task_id: str(tmp_path))
+    monkeypatch.setattr(animated_explainer.task_artifacts, "load_cached_artifact", lambda *_: None)
+    monkeypatch.setattr(animated_explainer.task_artifacts, "cache_artifact", lambda *args, **kwargs: None)
+    narration = "Greenland और Iceland के बीच पानी बहता है। नाम Denmark Strait है।"
+    output = tmp_path / "mixed-script-no-captions.mp4"
+
+    result = animated_explainer.render_background(
+        "mixed-script-render", "समंदर के अंदर झरना", 0.2,
+        output_path=str(output), subtitle_path=None, spoken_script=narration,
+        narration_duration_seconds=0.2,
+        emotion_beats=emotion_storyboard.build(narration),
+    )
+
+    assert result == str(output)
+    with animated_explainer.VideoFileClip(result, audio=False) as clip:
+        assert tuple(clip.size) == (animated_explainer.WIDTH, animated_explainer.HEIGHT)
+        assert clip.duration == pytest.approx(.2, abs=1 / animated_explainer.FPS + .01)
+        assert clip.get_frame(0).shape == (animated_explainer.HEIGHT, animated_explainer.WIDTH, 3)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for animated video validation")
+def test_two_reviewed_cached_pexels_clips_are_composited_with_captions_and_character(
+    tmp_path, monkeypatch,
+):
+    script = "पहला दृश्य सुंदर है। दूसरा दृश्य अलग है।"
+    subtitle = tmp_path / "captions.srt"
+    subtitle.write_text(
+        "1\n00:00:00,100 --> 00:00:01,300\nपहला दृश्य सुंदर है।\n\n"
+        "2\n00:00:01,400 --> 00:00:02,600\nदूसरा दृश्य अलग है।\n",
+        encoding="utf-8",
+    )
+    source_clips = []
+    candidates = {}
+    for query, color, asset_id in (
+        ("first landscape", (220, 30, 30), "cached-pexels-red"),
+        ("second landscape", (25, 50, 220), "cached-pexels-blue"),
+    ):
+        path = tmp_path / f"{asset_id}.mp4"
+        def moving_frame(t, background=color):
+            frame = np.empty((1080, 1920, 3), dtype=np.uint8)
+            frame[:] = background
+            x = 80 + int((t * 280) % 1450)
+            frame[320:760, x:x + 280] = (245, 245, 245)
+            return frame
+
+        source = VideoClip(moving_frame, duration=3.5)
+        source.write_videofile(str(path), fps=24, codec="libx264", audio=False,
+                               preset="ultrafast", logger=None)
+        source.close()
+        source_clips.append(path)
+        candidates[query] = [{
+            "provider": "pexels", "asset_id": asset_id,
+            "source_page": f"https://www.pexels.com/video/{asset_id}/",
+            "license": "Pexels License", "license_url": "https://www.pexels.com/license/",
+            "url": f"https://videos.pexels.com/mock/{asset_id}.mp4",
+            "path": str(path), "sha256": animated_explainer.task_artifacts.file_digest(path),
+            "duration": 3.5, "width": 1920, "height": 1080, "codec": "h264",
+            "relevance_score": 1,
+        }]
+
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(tmp_path))
+    monkeypatch.setattr(animated_explainer.task_artifacts, "load_cached_artifact", lambda *_: None)
+    monkeypatch.setattr(animated_explainer.task_artifacts, "cache_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr(animated_explainer, "_cached_stock_candidates",
+                        lambda query, _provider: candidates[query])
+    monkeypatch.setattr(animated_explainer, "_search_and_cache_stock_candidate",
+                        lambda *_args, **_kwargs: pytest.fail("cached Pexels clips should avoid a search"))
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
+                        lambda asset_id, digest: {
+                            "asset_id": asset_id, "sha256": digest, "status": "approved",
+                            "reviewer": "offline test", "reason": "Verified relevant local mock clip.",
+                        })
+
+    output = animated_explainer.render_background(
+        "offline-stock-render", "स्थानीय परीक्षण", 2.8,
+        output_path=str(tmp_path / "stock-caption-preview.mp4"),
+        subtitle_path=str(subtitle), spoken_script=script,
+        narration_duration_seconds=2.8,
+        emotion_beats=emotion_storyboard.build(script),
+        stock_provider="pexels", stock_terms=["first landscape", "second landscape"],
+        caption_mode="sentence", stock_media_policy="manual_review",
+    )
+
+    with animated_explainer.VideoFileClip(output, audio=False) as rendered:
+        assert tuple(rendered.size) == (1080, 1920)
+        first, second = (rendered.get_frame(.6), rendered.get_frame(2.0))
+        first_early = rendered.get_frame(.25)
+        first_late = rendered.get_frame(.95)
+        assert np.mean(np.abs(first_early[430:780, 150:930].astype(float)
+                              - first_late[430:780, 150:930].astype(float))) > 2
+        first_panel = first[430:780, 150:930].mean(axis=(0, 1))
+        second_panel = second[430:780, 150:930].mean(axis=(0, 1))
+        assert np.linalg.norm(first_panel - second_panel) > 80
+        assert np.count_nonzero((first[850:1030, :, 0] > 200)
+                                & (first[850:1030, :, 1] > 170)
+                                & (first[850:1030, :, 2] < 70)) > 10
+        assert np.count_nonzero(first[1050:1850].max(axis=2) < 50) > 100
+    rendered_report = json.loads((tmp_path / "top-panel-rendered-media.json").read_text())
+    assert rendered_report["caption_mode"] == "sentence"
+    assert [source["asset_id"] for source in rendered_report["sources"]] == [
+        "cached-pexels-red", "cached-pexels-blue",
+    ]
+    assert all(source["provider"] == "pexels" for source in rendered_report["sources"])

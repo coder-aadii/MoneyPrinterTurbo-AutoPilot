@@ -23,6 +23,14 @@ class TestAutopilot(unittest.TestCase):
         self.database = Path(self.temp.name) / "profiles.sqlite3"
         self.service = autopilot.AutopilotService(self.database)
         self.addCleanup(self.service._executor.shutdown, wait=True)
+        self.social_metadata_patcher = patch.object(
+            autopilot.llm, "generate_social_metadata",
+            return_value={"title": "Generated test title",
+                          "caption": "Curious about this? 🔍🤔\nHere is the complete answer. 💡✨",
+                          "hashtags": ["#One", "#Two", "#Three", "#Four", "#Five"]},
+        )
+        self.social_metadata_patcher.start()
+        self.addCleanup(self.social_metadata_patcher.stop)
         self.profiles = [
             self.service.profile_store.create(ChannelProfile(
                 display_name="Hindi ASMR Facts", language="hi", niche="Hindi facts",
@@ -111,6 +119,212 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(job.visual_style, "relevant_stock")
         self.assertEqual(job.effective_visual_style, "relevant_stock")
         self.assertEqual(job.params_snapshot["visual_style"], "relevant_stock")
+
+    def test_youtube_metadata_is_generated_once_persisted_and_limited_to_50_words(self):
+        profile = self.profiles[0]
+        profile = self.service.profile_store.update(
+            profile.channel_id, profile.model_copy(update={"channel_hashtag": "#FactsSunLeBhai"}),
+            profile.version,
+        )
+        job = self.ready_job(topic="What makes a star", script="A star is a sphere of plasma.")
+        self.service.store.transition(job.job_id, "queued")
+        self.service.store.transition(job.job_id, "generating")
+        self.service.store.transition(job.job_id, "generated")
+        invalid = {
+            "title": "How stars shine",
+            "caption": "A concise hook " + "useful context " * 40,
+            "hashtags": ["#Stars", "#Space", "#Science", "#Astronomy", "#Shorts"],
+        }
+        rewritten = {
+            "title": "How stars shine",
+            "caption": "Why do stars shine? 🔭🤔\nThey release visible light! 🌟💡",
+            "hashtags": ["#Stars", "#Space", "#Astronomy", "#Science", "#FactsSunLeBhai"],
+        }
+        with patch.object(autopilot.llm, "generate_social_metadata", side_effect=[invalid, rewritten]) as call:
+            metadata = self.service.ensure_youtube_metadata(job.job_id)
+            reloaded = autopilot.AutopilotStore(self.database).get_job(job.job_id)
+            cached = self.service.ensure_youtube_metadata(job.job_id)
+
+        self.assertLessEqual(len(metadata["caption"].split()), 50)
+        self.assertEqual(metadata["title"], "How stars shine")
+        self.assertEqual(len(metadata["hashtags"]), 5)
+        self.assertEqual(metadata["hashtags"][-1], "#FactsSunLeBhai")
+        self.assertEqual(reloaded.youtube_metadata, metadata)
+        self.assertEqual(cached, metadata)
+        self.assertEqual(call.call_count, 2)
+        self.assertIn("Rewrite the caption", call.call_args.kwargs["caption_feedback"])
+        self.assertEqual(call.call_args.kwargs["platform"], "youtube_shorts")
+        self.assertEqual(call.call_args.kwargs["language"], "English")
+        self.assertIn("Hindi ASMR Facts", call.call_args.kwargs["channel_context"])
+
+    def test_upload_metadata_reuses_caption_saved_with_completed_task(self):
+        job = self.ready_job(topic="What makes a star", script="A star is a sphere of plasma.")
+        self.service.store.transition(job.job_id, "queued")
+        self.service.store.transition(job.job_id, "generating")
+        self.service.store.transition(job.job_id, "generated")
+        job = self.service.store.get_job(job.job_id)
+        task_id = "caption-saved-at-render"
+        narration = "A star is a sphere of plasma."
+        video_path = Path(self.temp.name) / "final.mp4"
+        source = autopilot.AutopilotService._youtube_caption_source(job, narration)
+        metadata_record = {
+            "video_index": 1,
+            "video_name": video_path.name,
+            "narration_fingerprint": hashlib.sha256(narration.encode()).hexdigest(),
+            "caption_source_fingerprint": hashlib.sha256(source.encode()).hexdigest(),
+            "title": "What Makes Stars Shine",
+            "caption": "Why do stars shine? 🔭🤔\nThey release visible light! 🌟💡",
+            "hashtags": ["#Stars", "#Space", "#Astronomy", "#Science", "#Shorts"],
+        }
+        manifest_dir = Path(self.temp.name) / "task"
+        manifest_dir.mkdir()
+        (manifest_dir / "script.json").write_text(json.dumps({
+            "spoken_script": narration,
+            "youtube_metadata_by_video": [metadata_record],
+        }), encoding="utf-8")
+        with self.service.store._connection() as conn:
+            conn.execute(
+                "UPDATE production_jobs SET mpt_task_id=?,output_artifacts_json=? WHERE job_id=?",
+                (task_id, json.dumps([str(video_path)]), job.job_id),
+            )
+
+        with patch.object(autopilot.utils, "task_dir", return_value=str(manifest_dir)), \
+                patch.object(autopilot.llm, "generate_social_metadata") as generate:
+            result = self.service.ensure_youtube_metadata(job.job_id)
+            reopened = self.service.ensure_youtube_metadata(job.job_id)
+
+        self.assertEqual(generate.call_count, 0)
+        self.assertEqual(result, reopened)
+        self.assertEqual(result["title"], "What Makes Stars Shine")
+        self.assertEqual(
+            self.service.store.get_job(job.job_id).youtube_metadata,
+            result,
+        )
+        self.assertEqual(result["narration_fingerprint"], metadata_record["narration_fingerprint"])
+
+    def test_youtube_caption_context_includes_each_videos_voice_and_channel_branding(self):
+        profile = self.profiles[1]
+        profile = self.service.profile_store.update(
+            profile.channel_id,
+            profile.model_copy(update={
+                "voice_name": "gemini:Puck-Upbeat",
+                "voice_rate": 1.1,
+                "intro_enabled": True,
+                "intro_text": "Welcome to Science Facts.",
+                "intro_audio": {"asset_key": "private-intro-asset"},
+                "outro_enabled": True,
+                "outro_text": "Follow for more science.",
+                "outro_audio": {"asset_key": "private-outro-asset"},
+                "channel_hashtag": "#ScienceFacts",
+            }), profile.version,
+        )
+        plan = self.plan(profile, "Why stars shine", "Stars emit light from hot plasma.")
+        plan = self.service.ready(profile.channel_id, plan.plan_id, True)
+        job = self.service.create_job(profile.channel_id, plan.plan_id)
+        for state in ("queued", "generating", "generated"):
+            self.service.store.transition(job.job_id, state)
+        generated = {
+            "title": "Why Do Stars Shine?",
+            "caption": "Why do stars shine? 🔭🤔\nHot plasma releases visible light. 🌟✨",
+            "hashtags": ["#Stars", "#Space", "#Astronomy", "#Science", "#ScienceFacts"],
+        }
+        with patch.object(autopilot.llm, "generate_social_metadata", return_value=generated) as call:
+            self.service.ensure_youtube_metadata(job.job_id)
+
+        context = json.loads(call.call_args.kwargs["channel_context"])
+        self.assertEqual(context["voice_name"], "gemini:Puck-Upbeat")
+        self.assertEqual(context["narrator_preset"], profile.narrator_preset)
+        self.assertEqual(context["intro"]["text"], "Welcome to Science Facts.")
+        self.assertTrue(context["intro"]["audio_present"])
+        self.assertTrue(context["outro"]["audio_present"])
+        self.assertNotIn("private-intro-asset", call.call_args.kwargs["channel_context"])
+
+    def test_youtube_hinglish_caption_rewrites_to_two_short_complete_sentences(self):
+        job = self.ready_job(
+            topic="Paisa economy mein kaise ghoomta hai",
+            script="Aakhir paisa dukaan se bank tak kaise jata hai? Economy mein ghoomta rehta hai.",
+        )
+        self.service.store.transition(job.job_id, "queued")
+        self.service.store.transition(job.job_id, "generating")
+        self.service.store.transition(job.job_id, "generated")
+        invalid = {"title": "Paisa", "caption": "Aakhir paisa kahan jata hai?" * 4,
+                   "hashtags": ["#Money", "#Economy", "#Flow", "#Facts", "#Shorts"]}
+        valid = {
+            "title": "Where Does Money Go?",
+            "caption": "Where does money go? 💸🤔\nIt moves from shops to banks! 🔄✨",
+            "hashtags": ["#MoneyFlow", "#Economy", "#CircularFlow", "#HindiFacts", "#HindiASMRFacts"],
+        }
+        with patch.object(autopilot.llm, "generate_social_metadata", side_effect=[invalid, valid]) as call:
+            metadata = self.service.ensure_youtube_metadata(job.job_id)
+
+        self.assertEqual(len(metadata["caption"].splitlines()), 3)
+        self.assertTrue(all(len(line.split()) <= 10 for line in metadata["caption"].splitlines()[:2]))
+        self.assertEqual(autopilot.AutopilotService._youtube_emoji_count(metadata["caption"]), 4)
+        self.assertEqual(len(metadata["hashtags"]), 5)
+        self.assertEqual(call.call_count, 2)
+
+    def test_youtube_caption_rejects_non_english_and_dangling_endings(self):
+        caption = (
+            "बताओ, आज क्या? 🔍🤔\n"
+            "पैसा बाजार में घूमता रहता है। 💡✨\n"
+            "#MoneyFlow #Economy #CircularFlow #HindiFacts #HindiASMRFacts"
+        )
+        errors = autopilot.AutopilotService._youtube_caption_validation_errors(
+            caption, "#HindiASMRFacts",
+        )
+        self.assertIn("incomplete phrase or question", "; ".join(errors))
+        self.assertIn("caption must be written in English", "; ".join(errors))
+
+    def test_youtube_long_script_fallback_keeps_complete_sentences(self):
+        job = self.ready_job(
+            topic="Paisa economy",
+            script=("पैसा आखिर कहाँ जाता है? दुकान से सप्लायर तक घूमता है। "
+                    "कर्मचारी उससे अपना खर्च चलाते हैं। ") * 20,
+        )
+        self.service.store.transition(job.job_id, "queued")
+        self.service.store.transition(job.job_id, "generating")
+        self.service.store.transition(job.job_id, "generated")
+        invalid = {"title": "पैसा कहाँ जाता है?", "caption": "बताओ, आज क्या?", "hashtags": []}
+        with patch.object(autopilot.llm, "generate_social_metadata", side_effect=[invalid, invalid]) as call:
+            metadata = self.service.ensure_youtube_metadata(job.job_id)
+
+        lines = metadata["caption"].splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(
+            autopilot.AutopilotService._youtube_caption_validation_errors(
+                metadata["caption"], metadata["channel_hashtag"],
+            ), [],
+        )
+        self.assertEqual(lines[0], "What makes this idea surprising? 🔍🤔")
+        self.assertEqual(lines[1], "The video explains the main process. 💡✨")
+        self.assertFalse(any("\u0900" <= char <= "\u097f" for line in lines[:2] for char in line))
+        self.assertLessEqual(len(metadata["caption"].split()), 50)
+        self.assertEqual(metadata["title"], "The Story Behind This Idea")
+        self.assertEqual(call.call_count, 2)
+
+    def test_youtube_caption_edit_requires_two_sentences_emojis_and_channel_hashtag(self):
+        job = self.ready_job(topic="How stars shine", script="Stars emit light.")
+        self.service.store.transition(job.job_id, "queued")
+        self.service.store.transition(job.job_id, "generating")
+        self.service.store.transition(job.job_id, "generated")
+        with patch.object(autopilot.llm, "generate_social_metadata", return_value={
+            "title": "Stars", "caption": "Stars shine? 🔭🤔\nThey glow. 🌟💡",
+            "hashtags": ["#Stars", "#Space", "#Science", "#Astronomy", "#HindiASMRFacts"],
+        }):
+            with self.assertRaisesRegex(autopilot.AutopilotError, "exactly five hashtags"):
+                self.service.save_youtube_caption(job.job_id, "Stars shine. #Stars #Space")
+            with self.assertRaisesRegex(autopilot.AutopilotError, "50 whitespace-separated words"):
+                self.service.save_youtube_caption(
+                    job.job_id,
+                    ("one two three four five six seven eight nine ten.\n" * 5)
+                    + "one two three four five six seven eight nine ten. 🔍🤔💡✨\n"
+                    + "#Stars #Space #Science #Astronomy #HindiASMRFacts",
+                )
+            edited = self.service.save_youtube_caption(
+                job.job_id,
+                "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #HindiASMRFacts",
+            )
+        self.assertEqual(edited["caption"].splitlines()[-1].split(), edited["hashtags"])
 
     def test_manual_video_version_keeps_source_immutable_and_links_parent(self):
         original = self.ready_job(topic="Version this video", script="Original narration remains saved.")
@@ -269,6 +483,12 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(kwargs["language"], "hi")
         self.assertIn("Hook → Interesting Fact → Explanation → Payoff", kwargs["video_script_prompt"])
         self.assertIn("clear payoff", kwargs["video_script_prompt"])
+
+    def test_operator_approval_error_names_failed_media_qa_checks(self):
+        report = {"passed": False, "checks": {"artifacts": True, "audio_track": False}}
+        with patch.object(self.service, "qa_report", return_value=report):
+            with self.assertRaisesRegex(autopilot.AutopilotError, "audio track integrity"):
+                self.service.review_job("job-with-invalid-audio", "approve")
 
     def test_flexible_plan_does_not_gate_on_estimated_script_length(self):
         plan = self.plan(topic="A flexible short fact", script="सूर्य एक तारा है।")
@@ -520,13 +740,17 @@ class TestAutopilot(unittest.TestCase):
             self.service.create_job(job.channel_id, job.plan_id)
         self.assertEqual(self.service.store.get_job(job.job_id).state, "ready")
 
-    def test_delete_job_removes_only_terminal_record_and_keeps_content_history(self):
-        job = self.ready_job(topic="Keep duplicate history after deletion")
+    def test_delete_job_removes_local_history_and_allows_same_video_to_be_regenerated(self):
+        job = self.ready_job(topic="Regenerate after permanent deletion")
         self.service.store.transition(job.job_id, "cancelled")
-        self.service.store.delete_job(job.job_id, job.channel_id)
+        result = self.service.store.delete_job(job.job_id, job.channel_id)
         with self.assertRaises(LookupError):
             self.service.store.get_job(job.job_id)
-        self.assertEqual(self.service.store.get_plan(job.plan_id, job.channel_id).state, "job_created")
+        with self.assertRaises(LookupError):
+            self.service.store.get_plan(job.plan_id, job.channel_id)
+        self.assertEqual(result["cleanup_errors"], [])
+        replacement_plan = self.plan(topic=job.topic, script=job.script)
+        self.assertEqual(replacement_plan.topic, job.topic)
 
     def test_delete_job_rejects_active_and_wrong_channel_jobs(self):
         job = self.ready_job(topic="Do not delete active job")
@@ -536,39 +760,21 @@ class TestAutopilot(unittest.TestCase):
         with self.assertRaisesRegex(autopilot.AutopilotError, "selected channel"):
             self.service.store.delete_job(job.job_id, self.profiles[1].channel_id)
 
-    def test_deleted_manual_job_can_resume_with_edited_script_without_losing_topic_history(self):
-        job = self.ready_job(topic="Recover retained manual draft")
+    def test_deleted_manual_job_can_be_created_again_from_scratch(self):
+        job = self.ready_job(topic="Recover deleted video")
         self.service.store.transition(job.job_id, "cancelled")
         self.service.store.delete_job(job.job_id, job.channel_id)
-        self.assertEqual([p.plan_id for p in self.service.list_manual_drafts(job.channel_id)], [job.plan_id])
+        self.assertEqual(self.service.list_manual_drafts(job.channel_id), [])
         self.assertEqual(self.service.list_manual_drafts(self.profiles[1].channel_id), [])
-        script = self.hindi_script(topic="new explanation")
-        plan = self.service.prepare_manual_draft(job.channel_id, job.plan_id,
-                                                 {"target_duration_seconds": 30}, script=script)
-        self.assertEqual(plan.state, "planned")
-        self.assertEqual(plan.script, script)
+        plan = self.plan(topic=job.topic, script=job.script)
         self.service.ready(job.channel_id, plan.plan_id, True)
         replacement = self.service.create_job(job.channel_id, plan.plan_id)
-        self.assertEqual(replacement.script, script)
+        self.assertEqual(replacement.script, job.script)
         self.assertEqual(replacement.profile_snapshot["publishing_policy"], "manual")
         self.assertEqual(self.service.list_manual_drafts(job.channel_id), [])
-        self.service.store.queue(replacement.job_id)
-        state = MemoryState()
-
-        def fake_render(task_id, params, suppress_auto_upload=False):
-            self.assertTrue(suppress_auto_upload)
-            self.assertEqual(params.video_script, script)
-            state.update_task(task_id, state=const.TASK_STATE_COMPLETE, progress=100,
-                              videos=["/tmp/recovered-manual.mp4"], combined_videos=[])
-
-        with patch.object(autopilot.sm, "state", state), \
-                patch.object(autopilot.task_service, "start", side_effect=fake_render), \
-                patch.object(autopilot, "probe_video_duration", return_value=30.0), \
-                patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}):
-            self.service._run_job(replacement.job_id)
-        finished = self.service.store.get_job(replacement.job_id)
-        self.assertEqual(finished.state, "generated")
-        self.assertEqual(finished.output_artifacts, ["/tmp/recovered-manual.mp4"])
+        persisted = self.service.store.get_job(replacement.job_id)
+        self.assertEqual(persisted.script, job.script)
+        self.assertEqual(persisted.state, "ready")
         self.assertEqual(self.service.store.list_publications(job.channel_id), [])
         with self.assertRaises(autopilot.InvalidTransition):
             self.service.prepare_manual_draft(job.channel_id, plan.plan_id, {}, script="Another script")
@@ -621,8 +827,30 @@ class TestAutopilot(unittest.TestCase):
         with self.assertRaises(autopilot.InvalidTransition):
             self.service.retry_with_stock_footage(job.job_id)
 
-    def test_delete_job_preserves_youtube_publication_receipt(self):
-        job = self.ready_job(topic="Keep publication receipt")
+    def test_delete_job_removes_published_receipt_locally_without_remote_delete(self):
+        job = self.ready_job(topic="Delete local record, keep remote post")
+        self.service.store.transition(job.job_id, "cancelled")
+        with self.service.store._connection() as conn:
+            conn.execute("""INSERT INTO publications (
+                publication_id,job_id,channel_id,profile_version,idempotency_key,provider_request_id,
+                state,provider_video_id,provider_url,created_at,updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("publication-id", job.job_id, job.channel_id, job.profile_version,
+                 "idem-key", "provider-request", "published", "remote-id",
+                 "https://youtu.be/remote-id", autopilot._now(), autopilot._now()))
+        result = self.service.store.delete_job(job.job_id, job.channel_id)
+        self.assertTrue(result["deleted"])
+        with self.assertRaises(LookupError):
+            self.service.store.get_job(job.job_id)
+        with self.service.store._connection() as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM publications WHERE publication_id='publication-id'"
+            ).fetchone())
+        new_plan = self.plan(topic=job.topic, script=job.script)
+        self.assertEqual(new_plan.topic, job.topic)
+
+    def test_delete_job_keeps_uncertain_publication_for_reconciliation(self):
+        job = self.ready_job(topic="Keep uncertain upload for reconciliation")
         self.service.store.transition(job.job_id, "cancelled")
         with self.service.store._connection() as conn:
             conn.execute("""INSERT INTO publications (
@@ -631,9 +859,72 @@ class TestAutopilot(unittest.TestCase):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 ("publication-id", job.job_id, job.channel_id, job.profile_version,
                  "idem-key", "provider-request", "unknown", autopilot._now(), autopilot._now()))
-        with self.assertRaisesRegex(autopilot.AutopilotError, "upload or recovery receipt"):
+        with self.assertRaisesRegex(autopilot.AutopilotError, "needs reconciliation"):
             self.service.store.delete_job(job.job_id, job.channel_id)
         self.assertEqual(self.service.store.get_job(job.job_id).state, "cancelled")
+
+    def test_delete_job_removes_task_files_and_task_state(self):
+        job = self.ready_job(topic="Delete generated local task files")
+        self.service.store.transition(job.job_id, "cancelled")
+        task_id = "hard-delete-task"
+        storage_root = Path(self.temp.name) / "storage"
+        task_directory = storage_root / "tasks" / task_id
+        task_directory.mkdir(parents=True)
+        generated = task_directory / "final.mp4"
+        generated.write_bytes(b"local generated video")
+        with self.service.store._connection() as conn:
+            conn.execute(
+                "UPDATE production_jobs SET mpt_task_id=?,output_artifacts_json=? WHERE job_id=?",
+                (task_id, json.dumps([str(generated)]), job.job_id),
+            )
+        state = MemoryState()
+        state.update_task(task_id, state=const.TASK_STATE_COMPLETE)
+        def storage_dir(sub_dir="", create=False):
+            return str(storage_root / sub_dir if sub_dir else storage_root)
+        with patch.object(autopilot.utils, "storage_dir", side_effect=storage_dir), \
+                patch.object(autopilot.sm, "state", state):
+            self.service.store.delete_job(job.job_id, job.channel_id)
+        self.assertFalse(task_directory.exists())
+        self.assertIsNone(state.get_task(task_id))
+
+    def test_publication_migration_preserves_youtube_receipt_and_allows_second_destination(self):
+        job = self.ready_job(topic="Migrate platform publication identity")
+        with self.service.store._connection() as conn:
+            conn.execute("""INSERT INTO publications (
+                publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                provider_request_id,state,provider_video_id,provider_url,receipt_json,attempt_count,
+                created_at,updated_at,publisher_backend,youtube_connection_id,youtube_channel_id,
+                resumable_session_url,platform,destination_account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-publication", job.job_id, job.channel_id, job.profile_version, None,
+                 "legacy-idempotency", "legacy-request", "unknown", "yt-remote", "https://youtu.be/yt-remote",
+                 '{"legacy":true}', 2, autopilot._now(), autopilot._now(), "youtube_direct",
+                 "legacy-connection", "UC-legacy", "encrypted-session", "youtube", "UC-legacy"))
+            conn.execute("CREATE UNIQUE INDEX legacy_publication_per_job ON publications(job_id)")
+
+        self.service.store._initialize()
+
+        with self.service.store._connection() as conn:
+            legacy = conn.execute("SELECT * FROM publications WHERE publication_id='legacy-publication'").fetchone()
+            conn.execute("""INSERT INTO publications (
+                publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                provider_request_id,state,attempt_count,created_at,updated_at,publisher_backend,
+                platform,destination_account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploading', 1, ?, ?, 'upload_post', 'instagram', ?)""",
+                ("instagram-publication", job.job_id, job.channel_id, job.profile_version, "account-a",
+                 "instagram-idempotency", "instagram-request", autopilot._now(), autopilot._now(), "178000000"))
+            publications = conn.execute("SELECT platform,destination_account_id FROM publications WHERE job_id=?",
+                                        (job.job_id,)).fetchall()
+            indexes = conn.execute("PRAGMA index_list(publications)").fetchall()
+            unique_job_only = any(index["unique"] and
+                                  [col["name"] for col in conn.execute(f"PRAGMA index_info({index['name']})")] == ["job_id"]
+                                  for index in indexes)
+        self.assertEqual(legacy["provider_video_id"], "yt-remote")
+        self.assertEqual(legacy["provider_url"], "https://youtu.be/yt-remote")
+        self.assertEqual(legacy["resumable_session_url"], "encrypted-session")
+        self.assertEqual({(row["platform"], row["destination_account_id"]) for row in publications},
+                         {("youtube", "UC-legacy"), ("instagram", "178000000")})
+        self.assertFalse(unique_job_only)
 
     def test_concurrent_job_creation_for_one_plan_is_single_use(self):
         plan = self.plan(topic="One job only")
@@ -1312,13 +1603,17 @@ class TestAutopilot(unittest.TestCase):
         self.service.store.claim(job.job_id, "task", f"{autopilot.socket.gethostname()}:{os.getpid()}")
         self.service.store.transition(job.job_id, "generated", output_artifacts_json='["/tmp/video.mp4"]', actual_duration_seconds=28)
         with self.service.store._connection() as conn:
-            conn.execute("INSERT INTO job_qa VALUES (?, 'approved', '{}', 'operator', ?, ?)", (job.job_id, autopilot._now(), autopilot._now()))
+            conn.execute("INSERT INTO job_qa VALUES (?, 'qa_passed', '{}', NULL, NULL, ?)",
+                         (job.job_id, autopilot._now()))
         uploader = MagicMock()
         uploader.upload_video.return_value = {"success": True, "request_id": "provider-request", "results": {"youtube": {"success": True, "video_id": "yt123", "url": "https://youtube.test/yt123"}}}
-        with patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}), \
+        with patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}) as fresh_qa, \
              patch.object(autopilot, "UploadPostService", return_value=uploader) as uploader_class, \
-             patch.object(autopilot.config, "app", {"upload_post_api_key": "local-secret"}):
+             patch.object(autopilot.config, "app", {"upload_post_api_key": "local-secret",
+                                                       "upload_post_enabled": True}):
+            uploader.connected_platform.return_value = {"username": "yt-account-1", "handle": "MPT Shorts"}
             result = self.service.publish_job(job.job_id)
+        fresh_qa.assert_not_called()
         self.assertEqual(result["state"], "published")
         account = uploader_class.call_args.args[0]
         self.assertEqual(account["upload_post_username"], "account-a")
@@ -1328,6 +1623,53 @@ class TestAutopilot(unittest.TestCase):
             receipt = conn.execute("SELECT * FROM publications WHERE job_id=?", (job.job_id,)).fetchone()
         self.assertEqual(receipt["provider_video_id"], "yt123")
         self.assertEqual(receipt["provider_url"], "https://youtube.test/yt123")
+
+    def test_youtube_and_instagram_publications_are_independent_destinations(self):
+        from unittest.mock import MagicMock
+        job = self.ready_job(topic="Publish separately to YouTube and Instagram")
+        self.service.store.queue(job.job_id)
+        self.service.store.claim(job.job_id, "task", f"{autopilot.socket.gethostname()}:{os.getpid()}")
+        self.service.store.transition(job.job_id, "generated", output_artifacts_json='["/tmp/video.mp4"]', actual_duration_seconds=28)
+        with self.service.store._connection() as conn:
+            conn.execute("INSERT INTO job_qa VALUES (?, 'approved', '{}', 'operator', ?, ?)",
+                         (job.job_id, autopilot._now(), autopilot._now()))
+        uploader = MagicMock()
+        uploader.connected_platform.side_effect = lambda platform, *_args: {
+            "instagram": {"username": "ig-account-42", "handle": "mpt.reels"},
+            "youtube": {"username": "yt-account-12", "handle": "MPT Shorts"},
+        }.get(platform)
+        uploader.upload_video.side_effect = [
+            {"success": True, "request_id": "instagram-request",
+             "results": {"instagram": {"success": True, "publish_id": "ig-123",
+                                          "url": "https://instagram.com/reel/ig-123/"}}},
+            {"success": True, "request_id": "youtube-request",
+             "results": {"youtube": {"success": True, "video_id": "yt-123",
+                                       "url": "https://youtube.test/yt-123"}}},
+        ]
+        with patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}), \
+             patch.object(self.service, "_validate_instagram_video"), \
+             patch.object(autopilot, "UploadPostService", return_value=uploader), \
+             patch.object(autopilot.config, "app", {
+                 "upload_post_api_key": "local-secret", "upload_post_enabled": True,
+                 "upload_post_username": "account-a",
+             }):
+            instagram = self.service.publish_job(job.job_id, platform="instagram")
+            youtube = self.service.publish_job(job.job_id, platform="youtube")
+            repeat = self.service.publish_job(job.job_id, platform="instagram")
+
+        self.assertEqual(instagram["state"], "published")
+        self.assertEqual(youtube["state"], "published")
+        self.assertEqual(repeat["state"], "published")
+        self.assertEqual(uploader.upload_video.call_count, 2)
+        with self.service.store._connection() as conn:
+            records = conn.execute(
+                "SELECT platform,destination_account_id,provider_video_id,provider_url FROM publications WHERE job_id=?",
+                (job.job_id,),
+            ).fetchall()
+        self.assertEqual({(row["platform"], row["destination_account_id"]) for row in records},
+                         {("instagram", "ig-account-42"), ("youtube", "yt-account-12")})
+        self.assertIn(("ig-123", "https://instagram.com/reel/ig-123/"),
+                      {(row["provider_video_id"], row["provider_url"]) for row in records})
 
     def test_uncertain_publication_is_reconciled_before_any_retry(self):
         from unittest.mock import MagicMock
@@ -1342,7 +1684,10 @@ class TestAutopilot(unittest.TestCase):
         uploader = MagicMock()
         uploader.check_status.return_value = {"status": "processing"}
         with patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}), \
-             patch.object(autopilot, "UploadPostService", return_value=uploader):
+             patch.object(autopilot, "UploadPostService", return_value=uploader), \
+             patch.object(autopilot.config, "app", {"upload_post_api_key": "local-secret",
+                                                       "upload_post_enabled": True}):
+            uploader.connected_platform.return_value = {"username": "yt-account-1"}
             with self.assertRaisesRegex(autopilot.AutopilotError, "no retry was submitted"):
                 self.service.publish_job(job.job_id)
         uploader.upload_video.assert_not_called()
@@ -1377,11 +1722,13 @@ class TestAutopilot(unittest.TestCase):
         with patch.object(self.service, "qa_report", return_value={"passed": True, "technical_checks_passed": True,
                                                                     "repetition_warnings": [], "checks": {}}), \
              patch.object(autopilot, "UploadPostService", return_value=uploader), \
-             patch.object(autopilot.config, "app", {"upload_post_api_key": "local-secret"}), \
+             patch.object(autopilot.config, "app", {"upload_post_api_key": "local-secret",
+                                                       "upload_post_enabled": True}), \
              patch.object(autopilot.sm.state, "get_task", return_value={
                  "fact_verification_state": "source_verified",
                  "fact_verification_script_hash": hashlib.sha256(job.script.encode("utf-8")).hexdigest(),
              }):
+            uploader.connected_platform.return_value = {"username": "yt-account-1", "handle": "MPT Shorts"}
             result = self.service.publish_job(job.job_id)
         self.assertEqual(result["state"], "scheduled")
         kwargs = uploader.upload_video.call_args.kwargs

@@ -24,7 +24,7 @@ from app.utils.request_logging import trace_sdk_call
 _max_retries = 5
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
-MAX_SCRIPT_PROMPT_LENGTH = 2000
+MAX_SCRIPT_PROMPT_LENGTH = 4000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
 # “测试模型链接”只发送一条极小请求。OpenAI SDK 默认 600 秒超时并自动重试
 # 2 次，端点不可达（代理、防火墙或 DNS 故障）时，测试按钮会先长时间挂起，
@@ -1198,9 +1198,15 @@ def generate_topic(
         result = _generate_response(prompt=prompt, app_config=app_config) if app_config is not None else _generate_response(prompt=prompt)
     except Exception as exc:
         return f"Error: topic generation failed: {type(exc).__name__}"
-    topic = str(result or "").strip().splitlines()[0].strip()
-    if not topic or topic.startswith("Error: "):
-        return "Error: topic generation is unavailable from the configured provider"
+    response_text = str(result or "").strip()
+    if response_text.startswith("Error: "):
+        # _generate_response already sanitizes provider exceptions. Preserve the
+        # actionable reason for the UI instead of replacing auth, quota, timeout,
+        # or invalid-response errors with the same generic "unavailable" message.
+        return f"Error: topic provider failed: {response_text.removeprefix('Error: ').splitlines()[0]}"
+    topic = response_text.splitlines()[0].strip() if response_text else ""
+    if not topic:
+        return "Error: configured provider returned empty topic text"
     issues = topic_quality.topic_issues(topic)
     if not issues:
         return topic
@@ -1329,7 +1335,7 @@ def generate_terms(
 {video_script}
 
 Use varied, relevant visual concepts rather than appending modifiers to one rare scientific phrase.
-For example, a narration about glowing bacteria can use "bacteria microscope", "laboratory research", and "bioluminescent ocean" when those concepts occur in the narration.
+Use concrete objects or actions actually described in each narration beat.
 Do not add unrelated filler topics or treat illustrative stock as proof of a factual claim.
 Return English search terms only, including for Hindi or Chinese narration.
 """.strip()
@@ -1409,7 +1415,7 @@ Return English search terms only, including for Hindi or Chinese narration.
 # 过长内容后调用方还需要二次裁剪。
 SOCIAL_PLATFORMS = {
     "tiktok": {"title_max": 100, "caption_max": 2200, "hashtag_count": 5},
-    "youtube_shorts": {"title_max": 100, "caption_max": 5000, "hashtag_count": 3},
+    "youtube_shorts": {"title_max": 100, "caption_max": 5000, "hashtag_count": 5},
     "instagram_reels": {"title_max": 125, "caption_max": 2200, "hashtag_count": 8},
     "facebook_reels": {"title_max": 125, "caption_max": 2200, "hashtag_count": 5},
 }
@@ -1525,6 +1531,8 @@ def build_social_metadata_prompt(
     video_script: str = "",
     language: str = DEFAULT_SOCIAL_LANGUAGE,
     platform: str = DEFAULT_SOCIAL_PLATFORM,
+    channel_context: str = "",
+    caption_feedback: str = "",
 ) -> str:
     video_subject = _limit_social_text(
         video_subject, MAX_SOCIAL_SUBJECT_LENGTH, "video_subject"
@@ -1532,10 +1540,33 @@ def build_social_metadata_prompt(
     video_script = _limit_social_text(
         video_script, MAX_SOCIAL_SCRIPT_LENGTH, "video_script"
     )
+    channel_context = _limit_social_text(channel_context, 1500, "channel_context")
+    caption_feedback = _limit_social_text(caption_feedback, 1200, "caption_feedback")
     platform = _resolve_social_platform(platform)
     spec = SOCIAL_PLATFORMS[platform]
     label = SOCIAL_PLATFORM_LABELS.get(platform, platform)
-    language_instruction = _social_language_instruction(language)
+    language_instruction = (
+        "Write the title and caption in clear, natural English, regardless of narration language."
+        if platform == "youtube_shorts"
+        else _social_language_instruction(language)
+    )
+    if platform == "youtube_shorts":
+        platform_caption_rules = """
+8. Write exactly two complete prose sentences, each on its own line, followed by one separate hashtag line. Each sentence has at most 10 whitespace-separated words, counting emojis as words. Do not add a third prose sentence.
+9. Add 3 or 4 relevant emojis across the two sentences. Use simple standalone emojis, never in hashtags.
+10. Preserve the channel personality through word choice. Sentence one is a strong curiosity hook; sentence two is a concise script-based explanation and may itself be a complete engagement question. No dangling phrases. Do not invent or exaggerate facts.
+11. Put exactly five valid, relevant, topic-specific hashtags on the final line. Include the configured channel hashtag. Hashtags count toward the 50-word total.
+12. Return the caption as a JSON string with exactly three lines: sentence one, sentence two, then the five hashtags. Encode the two line breaks as `\\n` in JSON. The `hashtags` array must contain the same five tags in the same order.
+""".strip()
+        output_example = (
+            '{"title":"Where Does Money Go?","caption":"Where does money go? 🔍🤔\\n'
+            'It keeps moving through the economy! 💸🔄\\n'
+            '#Economy #MoneyFlow #CircularFlow #Finance #ChannelName",'
+            '"hashtags":["#Economy","#MoneyFlow","#CircularFlow","#Finance","#ChannelName"]}'
+        )
+    else:
+        platform_caption_rules = "8. Follow the selected platform's natural caption style and formatting."
+        output_example = '{"title":"...","caption":"...","hashtags":["#example","#video"]}'
 
     prompt = f"""
 # Role: Short-Video Social Media Copywriter
@@ -1547,12 +1578,14 @@ Write engaging publishing metadata for a short video that will be posted on {lab
 1. Respond ONLY with a single valid minified JSON object. No markdown, no code fences, no commentary.
 2. The JSON must contain exactly these keys: "title", "caption", "hashtags".
 3. "title": a catchy hook, at most {spec["title_max"]} characters.
-4. "caption": an engaging description that ends with a call to action, at most {spec["caption_max"]} characters. Do not put hashtags inside the caption.
-5. "hashtags": a JSON array of exactly {spec["hashtag_count"]} strings. Each must start with "#", contain no spaces, and be relevant to the topic and to {label}.
+4. "caption": an engaging description, at most {spec["caption_max"]} characters. Follow the platform-specific caption structure below.
+5. "hashtags": a JSON array of exactly {spec["hashtag_count"]} strings. Each must start with "#", contain no spaces, and be relevant to the topic and to {label}. For YouTube Shorts, choose relevant, discoverability-oriented hashtags; avoid unrelated trend bait.
 6. {language_instruction}
+7. Use only facts supported by the narration. Do not add claims, dates, statistics, promises, or channel details absent from the supplied context.
+{platform_caption_rules}
 
 ## Output Example
-{{"title":"...","caption":"...","hashtags":["#example","#video"]}}
+{output_example}
 
 ## Context
 ### Video Subject
@@ -1560,6 +1593,12 @@ Write engaging publishing metadata for a short video that will be posted on {lab
 
 ### Video Script
 {video_script}
+
+### Channel Configuration
+{channel_context or "Use the channel style already reflected in the narration."}
+
+### Caption Rewrite Feedback
+{caption_feedback or "No rewrite requested."}
 """.strip()
     return prompt
 
@@ -1612,6 +1651,9 @@ def generate_social_metadata(
     video_script: str = "",
     language: str = DEFAULT_SOCIAL_LANGUAGE,
     platform: str = DEFAULT_SOCIAL_PLATFORM,
+    channel_context: str = "",
+    caption_feedback: str = "",
+    max_attempts: int | None = None,
 ) -> dict:
     """
     生成短视频发布文案元数据。
@@ -1633,11 +1675,14 @@ def generate_social_metadata(
         video_script=video_script,
         language=language,
         platform=platform,
+        channel_context=channel_context,
+        caption_feedback=caption_feedback,
     )
     logger.info(f"generating social metadata: platform={platform}, language={language}")
 
     response = ""
-    for i in range(_max_retries):
+    attempts = _max_retries if max_attempts is None else max(1, min(_max_retries, int(max_attempts)))
+    for i in range(attempts):
         try:
             response = _generate_response(prompt)
             if isinstance(response, str) and response.startswith("Error: "):
@@ -1649,7 +1694,7 @@ def generate_social_metadata(
         except Exception as e:
             logger.warning(f"failed to parse social metadata: {str(e)}")
 
-        if i < _max_retries - 1:
+        if i < attempts - 1:
             logger.warning(
                 f"failed to generate social metadata, trying again... {i + 1}"
             )

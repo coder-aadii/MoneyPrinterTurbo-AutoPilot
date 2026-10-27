@@ -1,5 +1,6 @@
 import ast
 import copy
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,24 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from webui.autopilot_view import group_video_attempts, sync_manual_style_state
+
+
+def test_manual_job_handle_is_saved_before_worker_submission():
+    source = (Path(__file__).parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_autopilot_create_video"
+    )
+    statements = [ast.get_source_segment(source, node) for node in function.body]
+    active_assignment = next(
+        index for index, text in enumerate(statements)
+        if 'st.session_state["autopilot_active_job"] = job.job_id' in text
+    )
+    worker_submission = next(
+        index for index, text in enumerate(statements) if "service.start_job(job.job_id)" in text
+    )
+    assert active_assignment < worker_submission
 
 
 def test_manual_style_defaults_to_savage_and_keeps_later_user_selection():
@@ -298,12 +317,15 @@ def test_gallery_card_uses_playable_thumbnail_and_one_overflow_menu():
     code = '''
 import html
 import streamlit as st
+import re
 from datetime import datetime
 from types import SimpleNamespace
 autopilot_service = SimpleNamespace(get_service=lambda: SimpleNamespace())
 sm = SimpleNamespace(state=SimpleNamespace(get_task=lambda _: None))
 _autopilot_video_output = lambda _: None
 _autopilot_failure_help = lambda message: message
+_gallery_instagram_destination = lambda _job, _service: None
+_gallery_youtube_destination = lambda _job, _service: None
 job = SimpleNamespace(job_id="gallery-test", topic="A long title", state="failed",
     output_artifacts=[], created_at=datetime(2026, 10, 23), params_snapshot={"video_aspect": "9:16"},
     profile_snapshot={}, actual_duration_seconds=31.2, duration_estimate_seconds=31.2,
@@ -341,6 +363,218 @@ job = SimpleNamespace(job_id="gallery-test", topic="A long title", state="failed
                 if keyword.arg == "width") == 190
     assert next(keyword.value.value for keyword in popover.keywords
                 if keyword.arg == "on_change") == "rerun"
+
+
+def test_gallery_selection_uses_stable_native_thumbnail_button_and_toggles_on_rerun():
+    node = _main_function("_toggle_autopilot_gallery_selection")
+    source_path = Path(__file__).resolve().parents[2] / "webui" / "Main.py"
+    source = source_path.read_text(encoding="utf-8")
+    code = '''
+import streamlit as st
+st.session_state.setdefault("gallery_selection_mode_channel-a", True)
+st.session_state.setdefault("gallery_selected_jobs_channel-a", [])
+'''
+    code += ast.get_source_segment(source, node)
+    code += '''
+st.button("Select video", key="gallery_select_job-stable-id",
+          on_click=_toggle_autopilot_gallery_selection,
+          args=("channel-a", "job-stable-id"))
+'''
+    app = AppTest.from_string(code).run()
+    app.button(key="gallery_select_job-stable-id").click().run()
+    assert app.session_state["gallery_selected_jobs_channel-a"] == ["job-stable-id"]
+    app.button(key="gallery_select_job-stable-id").click().run()
+    assert app.session_state["gallery_selected_jobs_channel-a"] == []
+
+
+def test_gallery_pagination_caps_each_page_at_18_and_clamps_after_removal():
+    node = _main_function("_autopilot_gallery_page")
+    namespace = {"math": math}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "gallery.py", "exec"), namespace)
+    paginate = namespace["_autopilot_gallery_page"]
+    groups = list(range(37))
+    first, page, pages = paginate(groups, 1)
+    assert (len(first), page, pages) == (18, 1, 3)
+    second, page, pages = paginate(groups, 2)
+    assert (second[0], len(second), page, pages) == (18, 18, 2, 3)
+    last, page, pages = paginate(groups, 99)
+    assert (last, page, pages) == ([36], 3, 3)
+    empty, page, pages = paginate([], 3)
+    assert (empty, page, pages) == ([], 1, 1)
+
+
+def test_gallery_approve_action_runs_before_closing_overflow_menu():
+    node = _main_function("_render_autopilot_gallery_card")
+    close_menu = _main_function("_close_autopilot_gallery_action_menu")
+    edit_callback = _main_function("_queue_autopilot_video_edit")
+    code = '''
+import html
+import streamlit as st
+from contextlib import contextmanager
+from datetime import datetime
+from types import SimpleNamespace
+st.session_state.setdefault("reviewed", [])
+st.session_state["gallery_actions_approved-job"] = True
+class Store:
+    @contextmanager
+    def _connection(self):
+        yield SimpleNamespace(execute=lambda *_: SimpleNamespace(fetchone=lambda: {"state":"qa_passed"}))
+class Service:
+    store = Store()
+    def review_job(self, job_id, decision):
+        st.session_state["reviewed"].append((job_id, decision))
+        return {"qa_state":"approved"}
+service = Service()
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+sm = SimpleNamespace(state=SimpleNamespace(get_task=lambda _: None))
+_autopilot_video_output = lambda _: None
+_autopilot_failure_help = lambda message: message
+_gallery_instagram_destination = lambda *_: None
+_gallery_youtube_destination = lambda *_: None
+job = SimpleNamespace(job_id="approved-job", topic="Ready to approve", state="generated",
+    output_artifacts=[], created_at=datetime(2026, 10, 26), params_snapshot={"video_aspect":"9:16"},
+    profile_snapshot={"publishing_policy":"scheduled_public"}, actual_duration_seconds=31,
+    duration_estimate_seconds=31, mpt_task_id=None, failure_details="",
+    intended_publication_slot=None, script="", visual_style="relevant_stock")
+'''
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    for function in (close_menu, edit_callback, node):
+        code += ast.get_source_segment(source, function) + "\n"
+    code += '\n_render_autopilot_gallery_card(job, "channel-a", None, [])\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    app.button(key="gallery_approve_approved-job").click().run()
+    assert not app.exception
+    assert app.session_state["reviewed"] == [("approved-job", "approve")]
+
+
+def test_gallery_approval_failure_uses_top_right_toast_with_qa_details():
+    node = _main_function("_render_autopilot_gallery_card")
+    close_menu = _main_function("_close_autopilot_gallery_action_menu")
+    edit_callback = _main_function("_queue_autopilot_video_edit")
+    code = '''
+import html
+import streamlit as st
+from contextlib import contextmanager
+from datetime import datetime
+from types import SimpleNamespace
+st.session_state["gallery_actions_qa-failed-job"] = True
+class Store:
+    @contextmanager
+    def _connection(self):
+        yield SimpleNamespace(execute=lambda *_: SimpleNamespace(fetchone=lambda: {"state":"qa_passed"}))
+class Service:
+    store = Store()
+    def review_job(self, job_id, decision):
+        raise RuntimeError("Approval blocked by video QA (audio track integrity). Open View Details for the full report.")
+service = Service()
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+sm = SimpleNamespace(state=SimpleNamespace(get_task=lambda _: None))
+_autopilot_video_output = lambda _: None
+_autopilot_failure_help = lambda message: message
+_gallery_instagram_destination = lambda *_: None
+_gallery_youtube_destination = lambda *_: None
+job = SimpleNamespace(job_id="qa-failed-job", topic="Rendered video", state="generated",
+    output_artifacts=[], created_at=datetime(2026, 10, 26), params_snapshot={"video_aspect":"9:16"},
+    profile_snapshot={"publishing_policy":"scheduled_public"}, actual_duration_seconds=31,
+    duration_estimate_seconds=31, mpt_task_id=None, failure_details="",
+    intended_publication_slot=None, script="", visual_style="relevant_stock")
+'''
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    for function in (close_menu, edit_callback, node):
+        code += ast.get_source_segment(source, function) + "\n"
+    code += '\n_render_autopilot_gallery_card(job, "channel-a", None, [])\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    app.button(key="gallery_approve_qa-failed-job").click().run()
+    assert not app.exception
+    assert len(app.toast) == 1
+    assert "audio track integrity" in app.toast[0].value
+
+
+def test_successfully_generated_manual_video_can_open_upload_without_approval_step():
+    node = _main_function("_render_autopilot_gallery_card")
+    close_menu = _main_function("_close_autopilot_gallery_action_menu")
+    edit_callback = _main_function("_queue_autopilot_video_edit")
+    code = '''
+import html
+import streamlit as st
+from contextlib import contextmanager
+from datetime import datetime
+from types import SimpleNamespace
+st.session_state["gallery_actions_manual-job"] = True
+class Store:
+    @contextmanager
+    def _connection(self):
+        yield SimpleNamespace(execute=lambda *_: SimpleNamespace(fetchone=lambda: {"state":"qa_passed"}))
+class Service:
+    store = Store()
+service = Service()
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+sm = SimpleNamespace(state=SimpleNamespace(get_task=lambda _: None))
+_autopilot_video_output = lambda _: None
+_autopilot_failure_help = lambda message: message
+_gallery_instagram_destination = lambda *_: None
+_gallery_youtube_destination = lambda *_: {"username":"channel-a", "handle":"Test channel"}
+job = SimpleNamespace(job_id="manual-job", topic="Rendered video", state="generated",
+    output_artifacts=["/storage/final.mp4"], created_at=datetime(2026, 10, 26),
+    params_snapshot={"video_aspect":"9:16"}, profile_snapshot={"publishing_policy":"manual"},
+    actual_duration_seconds=31, duration_estimate_seconds=31, mpt_task_id=None,
+    failure_details="", intended_publication_slot=None, script="", visual_style="relevant_stock")
+'''
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    for function in (close_menu, edit_callback, node):
+        code += ast.get_source_segment(source, function) + "\n"
+    code += '\n_render_autopilot_gallery_card(job, "channel-a", None, [])\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    button_keys = {item.key for item in app.button}
+    assert "gallery_approve_manual-job" not in button_keys
+    assert "gallery_publish_youtube_manual-job" in button_keys
+    app.button(key="gallery_publish_youtube_manual-job").click().run()
+    assert not app.exception
+    assert app.session_state["gallery_publish_confirm"] == ("manual-job", "youtube", "channel-a")
+
+
+def test_youtube_upload_dialog_reviews_and_saves_caption_before_posting():
+    node = _main_function("_render_autopilot_gallery_publish_dialog")
+    node.decorator_list = []
+    code = '''
+import re
+import streamlit as st
+from datetime import datetime
+from types import SimpleNamespace
+st.session_state.setdefault("published", [])
+st.session_state.setdefault("saved_caption", "")
+st.rerun = lambda **kwargs: None
+metadata = {"title":"Where Does Money Go?", "caption":"Stars shine? 🔭🤔\\nThey glow. 🌟💡\\n#Stars #Space #Science #Astronomy #TestChannel",
+    "hashtags":["#Stars","#Space","#Science","#Astronomy","#TestChannel"],
+    "narration_fingerprint":"12345678", "context_fingerprint":"abcdefgh"}
+service = SimpleNamespace(
+    ensure_youtube_metadata=lambda _job_id: metadata,
+    youtube_caption_validation_errors=lambda _job_id, _caption: [],
+    save_youtube_caption=lambda _job_id, caption: st.session_state.__setitem__("saved_caption", caption),
+    publish_job=lambda job_id, platform, destination_account_id: st.session_state["published"].append(
+        (job_id, platform, destination_account_id)) or {"state":"published"},
+)
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+_gallery_instagram_destination = lambda *_: None
+_gallery_youtube_destination = lambda *_: {"username":"channel-a", "handle":"Test channel"}
+job = SimpleNamespace(job_id="caption-job", topic="पैसा कहाँ जाता है?", created_at=datetime(2026, 10, 26))
+'''
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    code += ast.get_source_segment(source, node)
+    code += '\n_render_autopilot_gallery_publish_dialog(job, "youtube", "channel-a")\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    assert any("Where Does Money Go?" in item.value for item in app.get("markdown"))
+    app.text_area(key="gallery_youtube_caption_caption-job_12345678_abcdefgh").set_value(
+        "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #TestChannel"
+    ).run()
+    app.button(key="gallery_publish_confirm_submit").click().run()
+    assert not app.exception
+    assert app.session_state["saved_caption"] == "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #TestChannel"
+    assert app.session_state["published"] == [("caption-job", "youtube", "channel-a")]
 
 
 def test_gallery_media_lookup_rejects_paths_outside_storage(tmp_path):
@@ -422,7 +656,7 @@ _render_autopilot_gallery_video_modal(videos)
     assert any(item.value == "2 of 2" for item in app.get("caption"))
 
 
-def test_gallery_removal_requires_confirmation_and_targets_only_selected_job():
+def test_gallery_permanent_delete_requires_confirmation_and_targets_only_selected_job():
     main = Path(__file__).resolve().parents[2] / "webui" / "Main.py"
     source = main.read_text(encoding="utf-8")
     dialog = next(node for node in ast.parse(source).body
@@ -432,7 +666,9 @@ def test_gallery_removal_requires_confirmation_and_targets_only_selected_job():
 import streamlit as st
 from types import SimpleNamespace
 st.session_state.setdefault("removed", [])
-service = SimpleNamespace(store=SimpleNamespace(delete_job=lambda job_id, channel_id: st.session_state["removed"].append((job_id, channel_id))))
+service = SimpleNamespace(store=SimpleNamespace(
+    delete_job=lambda job_id, channel_id: st.session_state["removed"].append((job_id, channel_id))
+    or {"cleanup_errors": []}))
 autopilot_service = SimpleNamespace(get_service=lambda: service)
 job = SimpleNamespace(job_id="selected-job", topic="Selected video")
 '''
@@ -446,3 +682,68 @@ _render_autopilot_gallery_delete_dialog(job, "channel-a")
     app.button(key="gallery_delete_confirm").click().run()
     assert not app.exception
     assert app.session_state["removed"] == [("selected-job", "channel-a")]
+
+
+def test_bulk_gallery_remove_clears_selection_and_removes_grouped_attempts():
+    node = _main_function("_render_autopilot_gallery_bulk_delete_dialog")
+    node.decorator_list = []
+    code = '''
+import streamlit as st
+from types import SimpleNamespace
+st.session_state.setdefault("gallery_selected_jobs_channel-a", ["newest"])
+st.session_state.setdefault("gallery_selection_mode_channel-a", True)
+st.session_state.setdefault("removed", [])
+st.rerun = lambda **kwargs: None
+service = SimpleNamespace(store=SimpleNamespace(
+    delete_job=lambda job_id, channel_id: st.session_state["removed"].append((job_id, channel_id))
+    or {"cleanup_errors": []}))
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+old = SimpleNamespace(job_id="older", topic="Same video")
+new = SimpleNamespace(job_id="newest", topic="Same video")
+groups = [[new, old]]
+'''
+    code += ast.get_source_segment(
+        (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8"),
+        node,
+    )
+    code += '\n_render_autopilot_gallery_bulk_delete_dialog(groups, "channel-a")\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    app.checkbox(key="gallery_bulk_delete_confirmed").set_value(True).run()
+    app.button(key="gallery_bulk_delete_submit").click().run()
+    assert not app.exception
+    assert app.session_state["removed"] == [
+        ("newest", "channel-a"), ("older", "channel-a")
+    ]
+    assert app.session_state["gallery_selected_jobs_channel-a"] == []
+    assert app.session_state["gallery_selection_mode_channel-a"] is False
+    assert app.session_state["gallery_bulk_delete_result"][0] == ["newest", "older"]
+
+
+def test_gallery_multi_download_zip_has_safe_names_and_a_size_limit(tmp_path):
+    import zipfile
+    from io import BytesIO
+
+    source = Path(__file__).resolve().parents[2] / "webui" / "Main.py"
+    module = ast.parse(source.read_text(encoding="utf-8"))
+    helper = next(node for node in module.body if isinstance(node, ast.FunctionDef)
+                  and node.name == "_build_autopilot_gallery_zip")
+    code = "import os, re, zipfile\nfrom io import BytesIO\nfrom pathlib import Path\n"
+    code += ast.get_source_segment(source.read_text(encoding="utf-8"), helper)
+    namespace = {}
+    exec(compile(code, str(source), "exec"), namespace)
+
+    first = tmp_path / "unsafe name.mp4"
+    first.write_bytes(b"first video")
+    second = tmp_path / "unsafe name.mp4.copy"
+    second.write_bytes(b"second video")
+    jobs = [SimpleNamespace(job_id="job-one"), SimpleNamespace(job_id="job-two")]
+    archive_bytes = namespace["_build_autopilot_gallery_zip"](
+        [(jobs[0], str(first)), (jobs[1], str(second))]
+    )
+    with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
+        assert archive.namelist() == ["job-one-unsafe_name.mp4", "job-two-unsafe_name.mp4.copy"]
+        assert archive.read(archive.namelist()[0]) == b"first video"
+
+    with pytest.raises(ValueError, match="256 MB"):
+        namespace["_build_autopilot_gallery_zip"]([(jobs[0], str(first))], max_total_bytes=2)

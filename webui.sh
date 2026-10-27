@@ -15,6 +15,7 @@ export PYTHONPATH="$CURRENT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 # 最终出现 502。默认绑定并打开 127.0.0.1，与 Windows 启动脚本保持一致。
 MPT_WEBUI_HOST="${MPT_WEBUI_HOST:-127.0.0.1}"
 MPT_WEBUI_PORT="${MPT_WEBUI_PORT:-8501}"
+. "$CURRENT_DIR/webui-port.sh"
 
 if [ -x "$CURRENT_DIR/.venv/bin/python" ]; then
   set -- "$CURRENT_DIR/.venv/bin/python" -m streamlit
@@ -28,28 +29,9 @@ else
   exit 1
 fi
 
-port_available() {
-  WEBUI_HOST="$MPT_WEBUI_HOST" WEBUI_PORT="$MPT_WEBUI_PORT" python3 - <<'PY' 2>/dev/null
-import os
-import socket
-import sys
-
-host = os.environ.get("WEBUI_HOST", "127.0.0.1")
-port = int(os.environ.get("WEBUI_PORT", "8501"))
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    try:
-        sock.bind((host, port))
-    except OSError:
-        sys.exit(1)
-sys.exit(0)
-PY
-}
-
 # Use the requested port exactly. Silently choosing 8502 can leave an older MPT
 # instance serving the familiar 8501 URL while the updated app runs elsewhere.
-if ! port_available; then
-  echo "***** WebUI port $MPT_WEBUI_PORT is already in use on $MPT_WEBUI_HOST. *****"
-  echo "***** Stop the older MPT terminal with Ctrl+C, then run ./start.sh again. *****"
+if ! stop_port_owner_prompt; then
   exit 1
 fi
 

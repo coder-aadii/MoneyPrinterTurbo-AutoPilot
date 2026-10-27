@@ -127,6 +127,9 @@ class VideoParams(BaseModel):
     match_materials_to_script: bool = False
     stock_video_style: StockVideoStyle = "default"
     visual_style: VisualStyle = "savage_animated_explainer"
+    # Per-task approval policy for external stock used by the Savage explainer.
+    # None inherits the app-level setting, whose fail-closed default is manual review.
+    stock_media_policy: Literal["manual_review", "auto_eligible"] | None = None
     effective_visual_style: Literal["savage_animated_explainer", "asmr_cutting", "relevant_stock"] | None = None
     visual_style_reason: str = ""
     fact_claims: list[str] = Field(default_factory=list, max_length=20)

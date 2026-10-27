@@ -53,6 +53,29 @@ def _has_key(data, key):
 class TestUploadPostService(unittest.TestCase):
     @patch("app.services.upload_post.config.app", _CONFIG_BASE)
     @patch("app.services.upload_post.requests.get")
+    def test_connected_platform_uses_read_only_profile_status_and_stable_account_id(self, mock_get):
+        response = _mock_response()
+        response.json.return_value = {"profile": {
+            "username": "testuser",
+            "social_accounts": {
+                "instagram": {"username": "ig-9981", "handle": "mpt.reels", "reauth_required": False},
+                "youtube": None,
+            },
+        }}
+        mock_get.return_value = response
+        service = UploadPostService()
+
+        connected = service.connected_platform("instagram")
+        disconnected = service.connected_platform("youtube")
+
+        self.assertEqual(connected["username"], "ig-9981")
+        self.assertEqual(connected["handle"], "mpt.reels")
+        self.assertIsNone(disconnected)
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertIn("/api/uploadposts/users/testuser", mock_get.call_args.args[0])
+
+    @patch("app.services.upload_post.config.app", _CONFIG_BASE)
+    @patch("app.services.upload_post.requests.get")
     def test_history_lookup_is_scoped_to_external_id_profile_and_youtube(self, mock_get):
         response = _mock_response()
         response.json.return_value = {"history": [{"external_id": "job-1", "platform": "youtube", "success": True}]}

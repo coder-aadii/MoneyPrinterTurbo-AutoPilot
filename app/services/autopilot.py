@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import socket
+import subprocess
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -150,6 +152,16 @@ def _youtube_receipt_result(results: Any) -> dict:
     return {}
 
 
+def _platform_receipt_result(results: Any, platform: str) -> dict:
+    if isinstance(results, dict):
+        entry = results.get(platform) or {}
+        return entry if isinstance(entry, dict) else {}
+    if isinstance(results, list):
+        return next((entry for entry in results if isinstance(entry, dict)
+                     and entry.get("platform") == platform), {})
+    return {}
+
+
 def _script_similarity(left: str, right: str) -> float:
     left_words, right_words = normalize_content(left).split(), normalize_content(right).split()
     if not left_words or not right_words:
@@ -288,6 +300,7 @@ class AutopilotStore:
                     mpt_task_id TEXT,
                     worker_owner TEXT,
                     output_artifacts_json TEXT NOT NULL DEFAULT '[]',
+                    youtube_metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -318,14 +331,17 @@ class AutopilotStore:
                     reviewer TEXT NOT NULL, notes TEXT NOT NULL, reviewed_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS publications (
-                    publication_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES production_jobs(job_id),
+                    publication_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES production_jobs(job_id),
                     channel_id TEXT NOT NULL, profile_version INTEGER NOT NULL, account_username TEXT,
                     idempotency_key TEXT NOT NULL UNIQUE, provider_request_id TEXT NOT NULL UNIQUE,
                     state TEXT NOT NULL, provider_video_id TEXT, provider_url TEXT,
                     receipt_json TEXT, failure_details TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     publisher_backend TEXT NOT NULL DEFAULT 'upload_post', youtube_connection_id TEXT,
-                    youtube_channel_id TEXT, resumable_session_url TEXT, retry_after TEXT
+                    youtube_channel_id TEXT, resumable_session_url TEXT, retry_after TEXT,
+                    platform TEXT NOT NULL DEFAULT 'youtube', destination_account_id TEXT NOT NULL DEFAULT '',
+                    provider_schedule_id TEXT, next_check_at TEXT,
+                    UNIQUE(job_id, platform, destination_account_id)
                 );
                 CREATE TABLE IF NOT EXISTS job_content_reviews (
                     job_id TEXT PRIMARY KEY REFERENCES production_jobs(job_id),
@@ -343,9 +359,57 @@ class AutopilotStore:
                 ("publisher_backend", "TEXT NOT NULL DEFAULT 'upload_post'"),
                 ("youtube_connection_id", "TEXT"), ("youtube_channel_id", "TEXT"),
                 ("resumable_session_url", "TEXT"), ("retry_after", "TEXT"),
+                ("platform", "TEXT NOT NULL DEFAULT 'youtube'"),
+                ("destination_account_id", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in publication_columns:
                     conn.execute(f"ALTER TABLE publications ADD COLUMN {column} {definition}")
+            # Old installations allowed only one publication per job. Rebuild the
+            # same table with a destination-scoped key while preserving all legacy
+            # YouTube receipts and resumable session state.
+            unique_job_index = False
+            for index in conn.execute("PRAGMA index_list(publications)").fetchall():
+                if not index["unique"]:
+                    continue
+                indexed_columns = [row["name"] for row in conn.execute(
+                    f"PRAGMA index_info({index['name']})"
+                ).fetchall()]
+                if indexed_columns == ["job_id"]:
+                    unique_job_index = True
+                    break
+            if unique_job_index:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("""CREATE TABLE publications_multi (
+                    publication_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES production_jobs(job_id),
+                    channel_id TEXT NOT NULL, profile_version INTEGER NOT NULL, account_username TEXT,
+                    idempotency_key TEXT NOT NULL UNIQUE, provider_request_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL, provider_video_id TEXT, provider_url TEXT,
+                    receipt_json TEXT, failure_details TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    publisher_backend TEXT NOT NULL DEFAULT 'upload_post', youtube_connection_id TEXT,
+                    youtube_channel_id TEXT, resumable_session_url TEXT, retry_after TEXT,
+                    platform TEXT NOT NULL DEFAULT 'youtube', destination_account_id TEXT NOT NULL DEFAULT '',
+                    provider_schedule_id TEXT, next_check_at TEXT,
+                    UNIQUE(job_id, platform, destination_account_id)
+                )""")
+                conn.execute("""INSERT INTO publications_multi (
+                    publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                    provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,
+                    attempt_count,created_at,updated_at,publisher_backend,youtube_connection_id,
+                    youtube_channel_id,resumable_session_url,retry_after,platform,destination_account_id,
+                    provider_schedule_id,next_check_at)
+                    SELECT publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                    provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,
+                    attempt_count,created_at,updated_at,publisher_backend,youtube_connection_id,
+                    youtube_channel_id,resumable_session_url,retry_after,COALESCE(platform,'youtube'),
+                    COALESCE(NULLIF(destination_account_id,''),NULLIF(youtube_channel_id,''),
+                             NULLIF(account_username,''),''),provider_schedule_id,next_check_at
+                    FROM publications""")
+                conn.execute("DROP TABLE publications")
+                conn.execute("ALTER TABLE publications_multi RENAME TO publications")
+                conn.commit()
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_publications_destination "
+                         "ON publications(job_id, platform, destination_account_id)")
             job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(production_jobs)")}
             if "parent_job_id" not in job_columns:
                 conn.execute("ALTER TABLE production_jobs ADD COLUMN parent_job_id TEXT")
@@ -366,6 +430,10 @@ class AutopilotStore:
             if "last_scheduler_tick_at" not in runtime_columns:
                 conn.execute("ALTER TABLE channel_runtime ADD COLUMN last_scheduler_tick_at TEXT")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(production_jobs)")}
+            if "youtube_metadata_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE production_jobs ADD COLUMN youtube_metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
             if "worker_owner" not in columns:
                 conn.execute("ALTER TABLE production_jobs ADD COLUMN worker_owner TEXT")
             if "fact_review_notes" not in columns:
@@ -436,6 +504,8 @@ class AutopilotStore:
             failure_details=row["failure_details"], attempt_count=row["attempt_count"],
             mpt_task_id=row["mpt_task_id"], worker_owner=row["worker_owner"],
             output_artifacts=json.loads(row["output_artifacts_json"]),
+            youtube_metadata=(json.loads(row["youtube_metadata_json"])
+                              if "youtube_metadata_json" in row.keys() else {}),
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
@@ -824,32 +894,126 @@ class AutopilotStore:
             raise LookupError("production job not found")
         return self._job_from_row(row)
 
-    def delete_job(self, job_id: str, channel_id: str) -> None:
-        """Remove a terminal manual job record without deleting media or receipts."""
+    def save_youtube_metadata(self, job_id: str, metadata: dict) -> None:
+        serialized = json.dumps(metadata, ensure_ascii=False)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE production_jobs SET youtube_metadata_json=? WHERE job_id=?",
+                (serialized, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("production job not found")
+
+    def delete_job(self, job_id: str, channel_id: str) -> dict:
+        """Permanently remove one terminal local job and its task-owned artifacts."""
+        task_id = None
+        shared_task_id = False
+        shared_task_files = False
+        safe_task_id = False
+        task_dir = None
+        shared_artifacts: set[str] = set()
+        artifact_paths: list[Path] = []
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute("SELECT channel_id,state,intended_publication_slot FROM production_jobs WHERE job_id=?",
-                                   (job_id,)).fetchone()
+                row = conn.execute("SELECT * FROM production_jobs WHERE job_id=?", (job_id,)).fetchone()
                 if row is None:
                     raise LookupError("production job not found")
                 if row["channel_id"] != channel_id:
                     raise AutopilotError("job does not belong to the selected channel")
                 if row["state"] not in {"failed", "generated", "cancelled"}:
-                    raise InvalidTransition("only failed, generated, or cancelled jobs can be deleted")
-                if row["intended_publication_slot"]:
-                    raise AutopilotError("scheduled jobs are retained in channel history")
-                if conn.execute("SELECT 1 FROM publications WHERE job_id=?", (job_id,)).fetchone():
-                    raise AutopilotError("jobs with a YouTube upload or recovery receipt cannot be deleted")
-                if conn.execute("SELECT 1 FROM autopilot_slots WHERE job_id=?", (job_id,)).fetchone():
-                    raise AutopilotError("jobs linked to scheduler history cannot be deleted")
+                    raise InvalidTransition("only completed, failed, or cancelled jobs can be permanently deleted")
+                publications = conn.execute(
+                    "SELECT state FROM publications WHERE job_id=?", (job_id,)
+                ).fetchall()
+                if any(item["state"] in {"uploading", "unknown"} for item in publications):
+                    raise AutopilotError(
+                        "an upload is still in progress or needs reconciliation; resolve it before deleting local tracking"
+                    )
+                job = self._job_from_row(row)
+                task_id = job.mpt_task_id
+                other_jobs = conn.execute(
+                    "SELECT mpt_task_id,output_artifacts_json FROM production_jobs WHERE job_id<>?",
+                    (job_id,),
+                ).fetchall()
+                shared_task_id = bool(task_id and any(
+                    other["mpt_task_id"] == task_id for other in other_jobs
+                ))
+                other_artifacts = set()
+                for other in other_jobs:
+                    try:
+                        other_artifacts.update(
+                            str(Path(item).resolve(strict=False))
+                            for item in json.loads(other["output_artifacts_json"] or "[]")
+                        )
+                    except (OSError, ValueError, TypeError):
+                        continue
+                artifact_paths = [Path(item) for item in job.output_artifacts]
+                shared_artifacts = {
+                    str(item.resolve(strict=False)) for item in artifact_paths
+                    if str(item.resolve(strict=False)) in other_artifacts
+                }
+                if task_id and not shared_task_id:
+                    tasks_root = Path(utils.storage_dir("tasks")).resolve()
+                    candidate = tasks_root / task_id
+                    if (re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id)
+                            and not candidate.is_symlink()
+                            and candidate.resolve(strict=False).parent == tasks_root):
+                        safe_task_id = True
+                        candidate_resolved = candidate.resolve(strict=False)
+                        shared_task_files = any(
+                            Path(path).resolve(strict=False).is_relative_to(candidate_resolved)
+                            for path in other_artifacts
+                        )
+                        if not shared_task_files:
+                            task_dir = candidate
+
+                # Keep scheduler slot uniqueness/audit history, but detach its
+                # local job reference so deleting the job cannot resubmit it.
+                conn.execute(
+                    "UPDATE autopilot_slots SET job_id=NULL,details=? WHERE job_id=?",
+                    ("Local video deleted by user; remote publication is unchanged.", job_id),
+                )
+                conn.execute("UPDATE production_jobs SET parent_job_id=NULL WHERE parent_job_id=?", (job_id,))
+                # These are local receipts only; no remote delete request is made.
+                conn.execute("DELETE FROM publications WHERE job_id=?", (job_id,))
                 for table in ("job_qa", "job_fact_reviews", "job_content_reviews"):
                     conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
                 conn.execute("DELETE FROM production_jobs WHERE job_id=? AND channel_id=?", (job_id, channel_id))
+                conn.execute("DELETE FROM content_plans WHERE plan_id=?", (row["plan_id"],))
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
+        cleanup_errors = []
+        if task_id and not shared_task_id:
+            try:
+                if task_dir and task_dir.exists():
+                    shutil.rmtree(task_dir)
+                elif not safe_task_id:
+                    cleanup_errors.append(f"task {task_id}: unsafe local path; files retained")
+                if safe_task_id and hasattr(sm.state, "delete_task"):
+                    sm.state.delete_task(task_id)
+            except OSError as exc:
+                cleanup_errors.append(f"task {task_id}: {type(exc).__name__}")
+                logger.warning("local task cleanup failed after permanent deletion: task_id={}, error={}",
+                               task_id, type(exc).__name__)
+        elif task_dir is None and (shared_task_id or shared_task_files):
+            cleanup_errors.append("task files are shared with another video version and were retained")
+        storage_root = Path(utils.storage_dir()).resolve()
+        for artifact in artifact_paths:
+            resolved = artifact.resolve(strict=False)
+            if str(resolved) in shared_artifacts or (task_dir and resolved.is_relative_to(task_dir.resolve())):
+                continue
+            if artifact.is_symlink() or not resolved.is_relative_to(storage_root) or not artifact.is_file():
+                continue
+            try:
+                artifact.unlink()
+            except OSError as exc:
+                cleanup_errors.append(f"artifact {artifact.name}: {type(exc).__name__}")
+                logger.warning("local artifact cleanup failed after permanent deletion: path={}, error={}",
+                               artifact.name, type(exc).__name__)
+        return {"job_id": job_id, "deleted": True, "cleanup_errors": cleanup_errors}
 
     def list_slots(self, channel_id: str, limit: int = 200) -> list[dict]:
         with self._connection() as conn:
@@ -1314,12 +1478,13 @@ class AutopilotService:
             publisher = UploadPostService({"upload_post_api_key": api_key,
                                            "upload_post_username": row["account_username"],
                                            "upload_post_enabled": True})
+            platform = row["platform"] or "youtube"
             if row["state"] == "scheduled":
-                history = publisher.check_history(row["job_id"], row["account_username"])
+                history = publisher.check_history(row["job_id"], row["account_username"], platform)
                 records = history.get("history") or []
                 match = next((item for item in records if isinstance(item, dict)
                               and item.get("external_id") == row["job_id"]
-                              and str(item.get("platform", "")).startswith("youtube")), None)
+                              and item.get("platform") == platform), None)
                 if match and match.get("success") is True:
                     video_id = match.get("platform_post_id")
                     if isinstance(video_id, list):
@@ -1342,13 +1507,20 @@ class AutopilotService:
                 job = self.store.get_job(row["job_id"])
                 state = "scheduled" if job.profile_snapshot.get("publishing_policy") == "scheduled_public" else "published"
                 next_check = (job.intended_publication_slot.astimezone(timezone.utc) + timedelta(minutes=5)).isoformat() if state == "scheduled" and job.intended_publication_slot else None
-                youtube = _youtube_receipt_result(status.get("results"))
-                with self.store._connection() as conn:
-                    conn.execute("UPDATE publications SET state=?,provider_schedule_id=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=NULL,next_check_at=?,updated_at=? WHERE publication_id=?",
-                                 (state, status.get("job_id") or status.get("schedule_id"),
-                                  youtube.get("video_id") or youtube.get("id") if isinstance(youtube, dict) else None,
-                                  youtube.get("url") or youtube.get("video_url") if isinstance(youtube, dict) else None,
-                                  _safe_receipt(status), next_check, _now(), row["publication_id"]))
+                platform_result = _platform_receipt_result(status.get("results"), platform)
+                if platform_result.get("success") is True:
+                    remote_id = (platform_result.get("video_id") or platform_result.get("video_reel_id")
+                                 or platform_result.get("publish_id") or platform_result.get("post_id")
+                                 or platform_result.get("id"))
+                    remote_url = platform_result.get("url") or platform_result.get("post_url")
+                    with self.store._connection() as conn:
+                        conn.execute("UPDATE publications SET state=?,provider_schedule_id=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=NULL,next_check_at=?,updated_at=? WHERE publication_id=?",
+                                     (state, status.get("job_id") or status.get("schedule_id"),
+                                      remote_id, remote_url, _safe_receipt(status), next_check, _now(), row["publication_id"]))
+                else:
+                    with self.store._connection() as conn:
+                        conn.execute("UPDATE publications SET state='failed',receipt_json=?,failure_details=?,next_check_at=NULL,updated_at=? WHERE publication_id=?",
+                                     (_safe_receipt(status), _safe_failure(platform_result.get("error") or "Upload-Post completed without platform confirmation"), _now(), row["publication_id"]))
             elif remote_status == "failed":
                 with self.store._connection() as conn:
                     conn.execute("UPDATE publications SET state='failed',receipt_json=?,failure_details=?,updated_at=? WHERE publication_id=?",
@@ -1873,6 +2045,409 @@ class AutopilotService:
             )[:5000]
         return title, description
 
+    @staticmethod
+    def _youtube_caption_context(job: ProductionJob) -> tuple[str, str, str]:
+        profile = job.profile_snapshot or {}
+        params = job.params_snapshot or {}
+        language = "English"
+        context = {
+            "channel": profile.get("display_name", ""),
+            "channel_hashtag": AutopilotService._youtube_channel_hashtag(job),
+            "caption_language": "English",
+            "niche": profile.get("niche", ""),
+            "topic_preferences": profile.get("topic_preferences", []),
+            "storytelling_style": profile.get("script_style", ""),
+            "visual_style": (params.get("effective_visual_style")
+                             or params.get("visual_style") or job.effective_visual_style
+                             or job.visual_style),
+            "narrator_preset": params.get("narrator_preset") or profile.get("narrator_preset", ""),
+            "profanity_level": params.get("profanity_level") or profile.get("profanity_level", ""),
+            "voice_name": params.get("voice_name") or profile.get("voice_name", ""),
+            "voice_rate": params.get("voice_rate", profile.get("voice_rate", 1.0)),
+            "intro": {
+                "enabled": bool(profile.get("intro_enabled")),
+                "text": str(profile.get("intro_text") or "")[:240],
+                "audio_present": bool(profile.get("intro_audio")),
+            },
+            "outro": {
+                "enabled": bool(profile.get("outro_enabled")),
+                "text": str(profile.get("outro_text") or "")[:240],
+                "audio_present": bool(profile.get("outro_audio")),
+            },
+        }
+        context_text = json.dumps(context, ensure_ascii=False, sort_keys=True)
+        context_fingerprint = hashlib.sha256(context_text.encode("utf-8")).hexdigest()
+        return language, context_text[:1500], context_fingerprint
+
+    @staticmethod
+    def _youtube_caption_source(job: ProductionJob, narration: str) -> str:
+        profile = job.profile_snapshot or {}
+        segments = []
+        intro = str(profile.get("intro_text") or "").strip()
+        outro = str(profile.get("outro_text") or "").strip()
+        if profile.get("intro_enabled") and intro:
+            segments.append(f"Channel intro: {intro[:500]}")
+        segments.append(f"Final narration: {str(narration or '').strip()}")
+        if profile.get("outro_enabled") and outro:
+            segments.append(f"Channel outro: {outro[:500]}")
+        return "\n".join(segments)
+
+    @staticmethod
+    def _youtube_channel_hashtag(job: ProductionJob) -> str:
+        profile = job.profile_snapshot or {}
+        value = profile.get("channel_hashtag") or profile.get("display_name") or ""
+        return next(iter(llm._normalize_hashtags([str(value)], 1)), "")
+
+    @staticmethod
+    def _youtube_caption_body_errors(body: str) -> list[str]:
+        errors = []
+        body = " ".join(str(body or "").split())
+        if not body:
+            return ["caption body is empty"]
+        if not AutopilotService._youtube_text_looks_english(body):
+            errors.append("caption must be written in English")
+        if len(body.split()) > 10:
+            errors.append("each caption sentence must contain at most 10 words")
+        if "#" in body:
+            errors.append("hashtags must be separate trailing tokens")
+        for opening, closing in (("(", ")"), ("[", "]"), ("“", "”"), ('"', '"')):
+            if body.count(opening) != body.count(closing):
+                errors.append("caption has unbalanced punctuation")
+                break
+
+        ending = body.rstrip()
+        while ending:
+            category = unicodedata.category(ending[-1])
+            if ending[-1] in "'\"’”)]}" or category in {"So", "Sk", "Cf", "Mn", "Me"}:
+                ending = ending[:-1].rstrip()
+            else:
+                break
+        if not ending or ending[-1] not in ".!?।॥":
+            errors.append("caption ends without a complete sentence mark")
+            return errors
+        if re.search(r"[.!?।॥]", ending[:-1]):
+            errors.append("each caption line must contain exactly one sentence")
+
+        final_text = re.sub(r"[.!?।॥]+$", "", ending).rstrip()
+        final_word_match = re.search(r"([^\s,;:!?।॥]+)$", final_text, flags=re.UNICODE)
+        if final_word_match:
+            final_word = final_word_match.group(1).casefold()
+            dangling = {
+                "a", "an", "and", "are", "because", "but", "for", "how", "if", "of",
+                "or", "the", "to", "when", "where", "which", "who", "why", "with",
+                "अगर", "और", "कहाँ", "कब", "क्यों", "क्योंकि", "कैसे", "क्या", "के",
+                "की", "का", "कौन", "लेकिन", "जिसमें", "जिससे", "तक", "तो", "पर", "में", "से", "या",
+            }
+            if final_word in dangling:
+                errors.append("caption ends with an incomplete phrase or question")
+        return errors
+
+    @staticmethod
+    def _youtube_emoji_count(text: str) -> int:
+        return len(re.findall(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", text))
+
+    @classmethod
+    def _youtube_caption_validation_errors(
+        cls, caption: str, required_hashtag: str = "",
+    ) -> list[str]:
+        lines = [" ".join(line.split()) for line in str(caption or "").splitlines()]
+        lines = [line for line in lines if line]
+        tokens = str(caption or "").split()
+        errors = []
+        if len(tokens) > 50:
+            errors.append("caption exceeds 50 whitespace-separated words")
+        hashtag_tokens = [token for token in tokens if token.startswith("#")]
+        if len(hashtag_tokens) != 5:
+            errors.append("caption must contain exactly five hashtags")
+        valid_hashtag = re.compile(r"^#[\w]+$", flags=re.UNICODE)
+        if any(not valid_hashtag.fullmatch(tag) for tag in hashtag_tokens):
+            errors.append("hashtags must use # followed by letters, numbers, or underscores")
+        if len({tag.casefold() for tag in hashtag_tokens}) != len(hashtag_tokens):
+            errors.append("hashtags must be unique")
+        hashtag_line = lines[-1].split() if lines else []
+        if hashtag_line != hashtag_tokens:
+            errors.append("five hashtags must share their own final line")
+        if required_hashtag and required_hashtag.casefold() not in {
+            tag.casefold() for tag in hashtag_tokens
+        }:
+            errors.append("caption is missing the configured channel hashtag")
+        body_lines = lines[:-1] if hashtag_line == hashtag_tokens else lines
+        if len(body_lines) != 2:
+            errors.append("caption must contain exactly two complete sentences on separate lines")
+        for line in body_lines:
+            errors.extend(cls._youtube_caption_body_errors(line))
+        emoji_count = cls._youtube_emoji_count(" ".join(body_lines))
+        if emoji_count not in {3, 4}:
+            errors.append("caption must contain three or four emojis")
+        return list(dict.fromkeys(errors))
+
+    @staticmethod
+    def _youtube_text_looks_english(text: str) -> bool:
+        value = str(text or "")
+        romanized_hindi = re.compile(
+            r"\b(aakhir|aur|hai|hain|ka|kahaan|kahan|kaise|ke|ki|kya|mein|paisa|"
+            r"se|tak|tum|tumhara|yeh|woh)\b", flags=re.IGNORECASE,
+        )
+        return bool(re.search(r"[A-Za-z]", value)) and not bool(
+            re.search(r"[\u0900-\u097f]", value) or romanized_hindi.search(value)
+        )
+
+    @staticmethod
+    def _youtube_title_is_english(title: str) -> bool:
+        return AutopilotService._youtube_text_looks_english(title)
+
+    @staticmethod
+    def _deterministic_youtube_title() -> str:
+        """Return a readable English fallback title without translating or inventing claims."""
+        return "The Story Behind This Idea"
+
+    @staticmethod
+    def _youtube_caption_parts(raw_caption: str, raw_hashtags) -> tuple[str, list[str]]:
+        inline_hashtags = re.findall(r"(?<!\w)#[\w]+", str(raw_caption or ""), flags=re.UNICODE)
+        body_with_lines = re.sub(r"(?<!\w)#\S+", " ", str(raw_caption or ""), flags=re.UNICODE)
+        body_lines = [" ".join(line.split()).strip(" ,;—–-") for line in body_with_lines.splitlines()]
+        body = "\n".join(line for line in body_lines if line)
+        if isinstance(raw_hashtags, str):
+            hashtags = [raw_hashtags, *inline_hashtags]
+        elif isinstance(raw_hashtags, (list, tuple)):
+            hashtags = [*raw_hashtags, *inline_hashtags]
+        else:
+            hashtags = inline_hashtags
+        return body, hashtags
+
+    @staticmethod
+    def _compose_youtube_caption(body: str, hashtags: list[str]) -> str:
+        body_lines = [" ".join(line.split()) for line in str(body or "").splitlines()]
+        body_lines = [line for line in body_lines if line]
+        return "\n".join([*body_lines, " ".join(hashtags)])
+
+    @staticmethod
+    def _youtube_derived_hashtags(job: ProductionJob, narration: str) -> list[str]:
+        profile = job.profile_snapshot or {}
+        sources = [job.topic, profile.get("niche", ""), *profile.get("topic_preferences", []), narration[:2400]]
+        stopwords = {
+            "about", "after", "again", "also", "are", "because", "been", "being", "between",
+            "from", "have", "here", "into", "just", "more", "most", "over", "that", "their",
+            "there", "these", "they", "this", "through", "what", "when", "where", "which", "while",
+            "with", "your", "you", "the", "and", "for", "but", "not", "how", "why", "who", "does",
+            "can", "will", "क्या", "कैसे", "कहाँ", "कब", "क्यों", "तुम्हारी", "तुम्हारे", "तुम", "आप",
+            "अगर", "असल", "और", "एक", "इस", "इसे", "है", "हो", "हैं", "का", "की", "के", "को", "में",
+            "नहीं", "पर", "से", "तक", "तो", "वह", "यह", "या", "जो", "भी", "कि", "लिए", "उसके",
+        }
+        candidates = []
+        for source in sources:
+            if not isinstance(source, str):
+                continue
+            words = re.findall(r"[^\W_]+", source, flags=re.UNICODE)
+            meaningful = [word for word in words if len(word) > 1 and word.casefold() not in stopwords]
+            if 2 <= len(meaningful) <= 4:
+                candidates.append("#" + "".join(word[:1].upper() + word[1:] for word in meaningful))
+            candidates.extend("#" + word[:1].upper() + word[1:] for word in meaningful)
+        if str(profile.get("language", "")).lower().startswith("hi"):
+            candidates.append("#HindiFacts")
+        seed_source = str(job.topic or profile.get("niche", ""))
+        seed_words = [
+            word for word in re.findall(r"[^\W_]+", seed_source, flags=re.UNICODE)
+            if len(word) > 1 and word.casefold() not in stopwords
+        ]
+        if seed_words:
+            seed = seed_words[0][:1].upper() + seed_words[0][1:]
+            candidates.extend([f"#{seed}Facts", f"#{seed}Explained"])
+        candidates.append("#YouTubeShorts")
+        return llm._normalize_hashtags(candidates, 20)
+
+    @classmethod
+    def _youtube_caption_hashtags(cls, raw_hashtags, job: ProductionJob, narration: str) -> list[str]:
+        generic = {"#shorts", "#viral", "#trending", "#fyp", "#video", "#reels", "#creator", "#content"}
+        candidates = llm._normalize_hashtags(raw_hashtags, 20)
+        candidates = [tag for tag in candidates if tag.casefold() not in generic]
+        candidates.extend(cls._youtube_derived_hashtags(job, narration))
+        candidates.extend(["#TopicFacts", "#ScriptExplained", "#VideoExplained", "#YouTubeShorts"])
+        channel_tag = cls._youtube_channel_hashtag(job)
+        selected = []
+        for tag in candidates:
+            if channel_tag and tag.casefold() == channel_tag.casefold():
+                continue
+            if tag.casefold() not in {item.casefold() for item in selected}:
+                selected.append(tag)
+            if len(selected) == 4:
+                break
+        if channel_tag:
+            selected.append(channel_tag)
+        return selected[:5]
+
+    @classmethod
+    def _deterministic_youtube_caption(
+        cls, narration: str, job: ProductionJob, hashtags: list[str],
+    ) -> str:
+        script = re.sub(r"(?<!\w)#\S+", " ", str(narration or ""), flags=re.UNICODE)
+        script = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", " ", script)
+        script = " ".join(script.split())
+        sentences = re.split(r"(?<=[.!?।॥])\s+", script)
+        complete_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if (sentence[-1] not in ".!?"
+                    or re.search(r"[\u0900-\u097f]", sentence)
+                    or cls._youtube_caption_body_errors(sentence)):
+                continue
+            if len(sentence.split()) <= 8:
+                complete_sentences.append(sentence)
+            if len(complete_sentences) == 2:
+                break
+
+        subject = "this idea"
+        hook = f"What makes {subject} surprising? 🔍🤔"
+        explanation = "The video explains the main process."
+
+        if complete_sentences and complete_sentences[0].endswith(("?", "？")):
+            hook = f"{complete_sentences[0]} 🔍🤔"
+            if len(complete_sentences) > 1:
+                explanation = complete_sentences[1]
+            else:
+                explanation = "The video explains the idea."
+        elif len(complete_sentences) > 1:
+            explanation = complete_sentences[1]
+        elif complete_sentences:
+            explanation = complete_sentences[0]
+        lines = [hook, f"{explanation} 💡✨"]
+        caption = cls._compose_youtube_caption("\n".join(lines), hashtags)
+        if cls._youtube_caption_validation_errors(caption, cls._youtube_channel_hashtag(job)):
+            fallback_lines = ["What is the key idea? 🔍🤔", "The narration explains the process. 💡✨"]
+            caption = cls._compose_youtube_caption("\n".join(fallback_lines), hashtags)
+        return caption
+
+    def ensure_youtube_metadata(self, job_id: str) -> dict:
+        """Return persistent script-aware YouTube copy, generating it if absent or stale."""
+        job = self.store.get_job(job_id)
+        if job.state != "generated":
+            raise AutopilotError("YouTube caption generation requires a completed video")
+        narration = job.script or ""
+        task_manifest = {}
+        if job.mpt_task_id:
+            manifest_path = Path(utils.task_dir(job.mpt_task_id)) / "script.json"
+            try:
+                task_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                narration = str(task_manifest.get("spoken_script") or task_manifest.get("script") or narration)
+            except (OSError, ValueError, TypeError):
+                pass
+        language, context_text, context_fingerprint = self._youtube_caption_context(job)
+        narration_fingerprint = hashlib.sha256(narration.encode("utf-8")).hexdigest()
+        caption_source = self._youtube_caption_source(job, narration)
+        caption_source_fingerprint = hashlib.sha256(caption_source.encode("utf-8")).hexdigest()
+        channel_hashtag = self._youtube_channel_hashtag(job)
+        metadata = job.youtube_metadata or {}
+        if (metadata.get("narration_fingerprint") == narration_fingerprint
+                and metadata.get("context_fingerprint") == context_fingerprint
+                and not self._youtube_caption_validation_errors(
+                    metadata.get("caption", ""), channel_hashtag,
+                )):
+            return metadata
+
+        def generate(feedback=""):
+            return llm.generate_social_metadata(
+                video_subject=job.topic,
+                video_script=caption_source,
+                language=language,
+                platform="youtube_shorts",
+                channel_context=context_text,
+                caption_feedback=feedback,
+                max_attempts=1,
+            )
+
+        task_metadata = task_manifest.get("youtube_metadata_by_video", [])
+        output_name = Path(job.output_artifacts[0]).name if job.output_artifacts else ""
+        saved_for_video = next((
+            item for item in task_metadata
+            if isinstance(item, dict)
+            and item.get("video_name") == output_name
+            and item.get("narration_fingerprint") == narration_fingerprint
+            and item.get("caption_source_fingerprint") == caption_source_fingerprint
+        ), None)
+        generated = saved_for_video or generate()
+        body, raw_hashtags = self._youtube_caption_parts(
+            generated.get("caption", ""), generated.get("hashtags"),
+        )
+        hashtags = self._youtube_caption_hashtags(raw_hashtags, job, narration)
+        caption = self._compose_youtube_caption(body, hashtags)
+        validation_errors = self._youtube_caption_validation_errors(caption, channel_hashtag)
+        if not self._youtube_title_is_english(generated.get("title", "")):
+            validation_errors.append("title must be written in English")
+        if validation_errors:
+            feedback = (
+                "Rewrite the caption to fix these local validation errors: "
+                + "; ".join(validation_errors)
+                + ". Use exactly two complete sentences on separate lines, at most 10 words per sentence, "
+                  "include three or four emojis, remain faithful to the narration, and stay under 50 words total. "
+                  "Use exactly five relevant hashtags, and include the configured channel hashtag. Previous caption: "
+                + caption[:600]
+            )
+            try:
+                rewritten = generate(feedback)
+                rewritten_body, rewritten_raw_tags = self._youtube_caption_parts(
+                    rewritten.get("caption", ""), rewritten.get("hashtags"),
+                )
+                rewritten_tags = self._youtube_caption_hashtags(rewritten_raw_tags, job, narration)
+                rewritten_caption = self._compose_youtube_caption(rewritten_body, rewritten_tags)
+                rewritten_errors = self._youtube_caption_validation_errors(rewritten_caption, channel_hashtag)
+                if not self._youtube_title_is_english(rewritten.get("title", "")):
+                    rewritten_errors.append("title must be written in English")
+                if not rewritten_errors:
+                    generated, caption, hashtags = rewritten, rewritten_caption, rewritten_tags
+                    validation_errors = []
+                else:
+                    validation_errors = rewritten_errors
+            except Exception as exc:
+                logger.warning(
+                    "YouTube caption rewrite failed; using deterministic script fallback: "
+                    "job_id={}, error_type={}", job_id, type(exc).__name__,
+                )
+
+        if validation_errors:
+            caption = self._deterministic_youtube_caption(
+                narration, job, hashtags,
+            )
+            hashtags = caption.split()[-5:]
+        result = {
+            "platform": "youtube",
+            "title": (str(generated.get("title") or "")[:100]
+                      if self._youtube_title_is_english(generated.get("title", ""))
+                      else self._deterministic_youtube_title()),
+            "caption": caption,
+            "hashtags": hashtags,
+            "channel_hashtag": channel_hashtag,
+            "narration_fingerprint": narration_fingerprint,
+            "caption_source_fingerprint": caption_source_fingerprint,
+            "context_fingerprint": context_fingerprint,
+            "generated_at": _now(),
+        }
+        self.store.save_youtube_metadata(job_id, result)
+        return result
+
+    def youtube_caption_validation_errors(self, job_id: str, caption: str) -> list[str]:
+        metadata = self.ensure_youtube_metadata(job_id)
+        return self._youtube_caption_validation_errors(
+            caption, metadata.get("channel_hashtag", ""),
+        )
+
+    def save_youtube_caption(self, job_id: str, caption: str) -> dict:
+        metadata = self.ensure_youtube_metadata(job_id)
+        normalized = "\n".join(
+            " ".join(line.split()) for line in str(caption or "").splitlines()
+            if line.strip()
+        )
+        errors = self._youtube_caption_validation_errors(
+            normalized, metadata.get("channel_hashtag", ""),
+        )
+        if errors:
+            raise AutopilotError("Invalid YouTube caption: " + "; ".join(errors))
+        hashtags = normalized.split()[-5:]
+        metadata = {**metadata, "caption": normalized, "hashtags": hashtags}
+        self.store.save_youtube_metadata(job_id, metadata)
+        return metadata
+
     def _material_sources_for_job(self, job: ProductionJob) -> list[dict]:
         if not job.mpt_task_id:
             return []
@@ -1998,7 +2573,21 @@ class AutopilotService:
     def review_job(self, job_id: str, decision: str, reviewer: str = "operator", notes: str = "") -> dict:
         report = self.qa_report(job_id)
         if not report["passed"]:
-            raise AutopilotError("QA failed; incomplete or invalid media cannot be approved")
+            labels = {
+                "artifacts": "video file availability",
+                "duration": "duration requirements",
+                "subtitles": "subtitle file availability",
+                "audio": "audio file availability",
+                "material_references": "source media references",
+                "orientation": "video orientation",
+                "audio_track": "audio track integrity",
+            }
+            failed_checks = [labels.get(name, name.replace("_", " "))
+                             for name, passed in (report.get("checks") or {}).items() if not passed]
+            details = ", ".join(failed_checks) if failed_checks else "technical media checks"
+            raise AutopilotError(
+                f"Approval blocked by video QA ({details}). Open View Details for the full report."
+            )
         if decision not in {"approve", "reject"}:
             raise ValueError("decision must be approve or reject")
         job = self.store.get_job(job_id)
@@ -2013,122 +2602,277 @@ class AutopilotService:
             return self.publish_job(job_id)
         return {"job_id": job_id, "qa_state": state, "report": report}
 
-    def publish_job(self, job_id: str) -> dict:
+    def upload_post_destination(self, job: ProductionJob, platform: str) -> dict | None:
+        """Return a live, confirmed Upload-Post destination for this job profile."""
+        if platform not in {"instagram", "youtube"}:
+            return None
+        profile_username = (job.profile_snapshot.get("upload_post_username")
+                            or config.app.get("upload_post_username", ""))
+        api_key = config.app.get("upload_post_api_key", "")
+        if not profile_username or not api_key or not config.app.get("upload_post_enabled", False):
+            return None
+        publisher = UploadPostService({
+            "upload_post_api_key": api_key, "upload_post_username": profile_username,
+            "upload_post_enabled": True,
+        })
+        try:
+            account = publisher.connected_platform(platform, profile_username)
+        except Exception:
+            return None
+        if not account:
+            return None
+        return {**account, "account_username": profile_username}
+
+    def publish_job(self, job_id: str, platform: str = "youtube",
+                    destination_account_id: str | None = None) -> dict:
+        if platform not in {"youtube", "instagram"}:
+            raise AutopilotError("unsupported publication platform")
         job = self.store.get_job(job_id)
+        profile = job.profile_snapshot
+        backend = profile.get("publishing_backend", "upload_post")
+        if platform == "instagram" and backend == "youtube_direct":
+            backend = "upload_post"
+        if platform == "instagram":
+            destination = self.upload_post_destination(job, platform)
+            if not destination:
+                raise AutopilotError("Instagram is not connected to the configured Upload-Post profile")
+            resolved_destination_id = destination["username"]
+            if destination_account_id and destination_account_id != resolved_destination_id:
+                raise AutopilotError("Instagram destination changed; refresh the connected account before publishing")
+        elif backend == "youtube_direct":
+            resolved_destination_id = profile.get("youtube_channel_id") or ""
+        else:
+            destination = self.upload_post_destination(job, platform)
+            if not destination:
+                raise AutopilotError(f"{platform.capitalize()} is not connected to the configured Upload-Post profile")
+            resolved_destination_id = destination["username"]
+
         with self.store._connection() as conn:
             qa = conn.execute("SELECT state,reviewed_by FROM job_qa WHERE job_id=?", (job_id,)).fetchone()
-            existing = conn.execute("SELECT * FROM publications WHERE job_id=?", (job_id,)).fetchone()
-        if job.state != "generated" or not qa or qa["state"] != "approved":
-            raise AutopilotError("publication requires a generated job with passed QA and approval")
-        fresh_qa = self.qa_report(job_id)
-        if not fresh_qa["passed"]:
-            raise AutopilotError("publication blocked because current artifact QA failed")
-        profile = job.profile_snapshot
-        if profile.get("publishing_policy") in {"automatic_public", "scheduled_public"}:
+            existing = conn.execute(
+                "SELECT * FROM publications WHERE job_id=? AND platform=? AND destination_account_id=?",
+                (job_id, platform, resolved_destination_id),
+            ).fetchone()
+            if existing is None:
+                # Rows written by older clients after migration may still carry
+                # the schema default destination. Adopt only an unambiguous row.
+                existing = conn.execute(
+                    "SELECT * FROM publications WHERE job_id=? AND platform=? AND destination_account_id='' AND account_username IS ?",
+                    (job_id, platform,
+                     profile.get("upload_post_username") or config.app.get("upload_post_username", "")
+                     if backend != "youtube_direct" else None),
+                ).fetchone()
+                if existing is not None and resolved_destination_id:
+                    conn.execute("UPDATE publications SET destination_account_id=? WHERE publication_id=?",
+                                 (resolved_destination_id, existing["publication_id"]))
+        policy = profile.get("publishing_policy", "manual")
+        operator_managed = policy in {"manual", "private", "unlisted"}
+        qa_ready = bool(qa and (qa["state"] == "approved"
+                                or (operator_managed and qa["state"] == "qa_passed")))
+        if job.state != "generated" or not qa_ready:
+            raise AutopilotError("publication requires a successfully generated video with completed QA")
+        # The render pipeline already recorded successful technical QA before
+        # setting the job to generated. Manual/private uploads should not rerun
+        # that check against transient worker state; unattended public policies
+        # still require fresh QA and explicit approval.
+        if not operator_managed:
+            fresh_qa = self.qa_report(job_id)
+            if not fresh_qa["passed"]:
+                raise AutopilotError("publication blocked because current artifact QA failed")
+        if policy in {"automatic_public", "scheduled_public"}:
             task_state = sm.state.get_task(job.mpt_task_id) if job.mpt_task_id else None
             verification = self._fact_verification_for_job(job, task_state)
-            unattended = profile.get("publishing_policy") in {
-                "automatic_public", "scheduled_public"
-            }
-            if (verification["status"] != "verified" and unattended
+            if (verification["status"] != "verified"
                     and not profile.get("allow_unverified_publication", False)):
                 raise AutopilotError(
                     "unattended public publishing of unverified facts requires explicit channel opt-in"
                 )
             if not self._public_requirements_pass(job):
                 raise AutopilotError("public publishing requires channel opt-in and passing originality, rights, repetition, and technical QA checks")
-        if profile.get("publishing_policy") == "automatic_public" and not profile.get("auto_public_enabled", False):
+        if policy == "automatic_public" and not profile.get("auto_public_enabled", False):
             raise AutopilotError("automatic public publishing is not explicitly enabled for this channel")
         if not self._job_runnable(job):
             raise AutopilotError("channel is paused; publication is held until it is resumed")
-        publication_title, publication_description = self._publication_metadata(job)
-        if profile.get("publishing_backend", "upload_post") == "youtube_direct":
-            return self._publish_youtube_direct(
-                job, existing, title=publication_title,
-                description=publication_description,
+        title, description = self._publication_metadata(job)
+        youtube_metadata = None
+        if platform == "youtube":
+            youtube_metadata = self.ensure_youtube_metadata(job_id)
+            title = youtube_metadata["title"]
+            description = youtube_metadata["caption"]
+        if backend == "youtube_direct":
+            if platform != "youtube":
+                raise AutopilotError("the direct YouTube connector cannot publish Instagram videos")
+            return self._publish_youtube_direct(job, existing, title=title, description=description)
+        if platform == "instagram":
+            self._validate_instagram_video(job)
+        return self._publish_upload_post_platform(
+            job, platform, resolved_destination_id, existing, title=title,
+            description=description, youtube_metadata=youtube_metadata,
+        )
+
+    @staticmethod
+    def _validate_instagram_video(job: ProductionJob) -> None:
+        if not job.output_artifacts or not os.path.isfile(job.output_artifacts[0]):
+            raise AutopilotError("Instagram upload requires a readable completed video")
+        path = job.output_artifacts[0]
+        try:
+            youtube_direct._validate_mp4(path)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels,pix_fmt",
+                 "-of", "json", path], capture_output=True, text=True, timeout=20, check=False,
             )
-        username = profile.get("upload_post_username")
+            data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+            streams = data.get("streams") or []
+            video_stream = next(item for item in streams if item.get("codec_type") == "video")
+            audio_stream = next((item for item in streams if item.get("codec_type") == "audio"), None)
+            duration = float((data.get("format") or {}).get("duration"))
+            numerator, denominator = (video_stream.get("avg_frame_rate") or "0/1").split("/", 1)
+            fps = float(numerator) / max(float(denominator), 1.0)
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, KeyError, StopIteration) as exc:
+            raise AutopilotError("Instagram could not validate this video's media metadata") from exc
+        size = os.path.getsize(path)
+        width, height = int(video_stream.get("width") or 0), int(video_stream.get("height") or 0)
+        ratio = width / height if width and height else 0
+        if size > 300 * 1024 * 1024 or not 3 <= duration <= 900:
+            raise AutopilotError("Instagram Reels require a 3–900 second video no larger than 300 MB")
+        if (not width or not height or max(width, height) > 1920 or not 0.01 <= ratio <= 10
+                or not 23 <= fps <= 60):
+            raise AutopilotError("Instagram Reels require supported dimensions, aspect ratio, and 23–60 FPS")
+        if video_stream.get("codec_name") not in {"h264", "hevc"} or not str(video_stream.get("pix_fmt", "")).startswith("yuv420"):
+            raise AutopilotError("Instagram Reels require H.264/HEVC video with 4:2:0 pixel format")
+        if (not audio_stream or audio_stream.get("codec_name") != "aac"
+                or int(audio_stream.get("sample_rate") or 0) > 48000
+                or int(audio_stream.get("channels") or 0) not in {1, 2}):
+            raise AutopilotError("Instagram Reels require AAC audio with one or two channels at 48 kHz or below")
+
+    def _publish_upload_post_platform(self, job: ProductionJob, platform: str,
+                                      destination_account_id: str, existing,
+                                      *, title: str, description: str = "",
+                                      youtube_metadata: dict | None = None) -> dict:
+        profile = job.profile_snapshot
+        username = (profile.get("upload_post_username")
+                    or config.app.get("upload_post_username", ""))
         if not username:
-            self._record_publication_preflight_failure(job, None, "no Upload-Post account is pinned in this job profile")
-            raise AutopilotError("this job has no pinned Upload-Post account")
-        schedule_date = None
-        if profile.get("publishing_policy") == "scheduled_public" and job.intended_publication_slot:
-            schedule_date = job.intended_publication_slot.astimezone(ZoneInfo(profile.get("timezone", "UTC"))).replace(tzinfo=None).isoformat()
-        if not self._job_runnable(job):
-            raise AutopilotError("channel is paused; publication is held until it is resumed")
+            raise AutopilotError("this job has no pinned Upload-Post profile")
+        account = {"upload_post_api_key": config.app.get("upload_post_api_key", ""),
+                   "upload_post_username": username, "upload_post_enabled": True}
+        publisher = UploadPostService(account)
+        publication_id = existing["publication_id"] if existing else str(uuid4())
         retry = False
         if existing:
             if existing["state"] in {"published", "scheduled"}:
                 return dict(existing)
-            if existing["state"] == "unknown":
-                status = UploadPostService({"upload_post_api_key": config.app.get("upload_post_api_key", ""),
-                                            "upload_post_username": username, "upload_post_enabled": True}).check_status(existing["provider_request_id"])
+            if existing["state"] in {"unknown", "uploading"}:
+                status = publisher.check_status(existing["provider_request_id"])
                 if status.get("status") == "completed":
-                    resolved_state = "scheduled" if profile.get("publishing_policy") == "scheduled_public" else "published"
-                    next_check = (job.intended_publication_slot.astimezone(timezone.utc) + timedelta(minutes=5)).isoformat() if resolved_state == "scheduled" and job.intended_publication_slot else None
-                    with self.store._connection() as conn:
-                        youtube = _youtube_receipt_result(status.get("results"))
-                        conn.execute("UPDATE publications SET state=?,provider_schedule_id=?,provider_video_id=?,provider_url=?,receipt_json=?,next_check_at=?,updated_at=? WHERE job_id=?",
-                                     (resolved_state, status.get("job_id") or status.get("schedule_id"),
-                                      youtube.get("video_id") or youtube.get("id"), youtube.get("url") or youtube.get("video_url"),
-                                      _safe_receipt(status), next_check, _now(), job_id))
-                    return {"job_id": job_id, "state": resolved_state, "receipt": status}
+                    result = _platform_receipt_result(status.get("results"), platform)
+                    if result.get("success") is True:
+                        resolved_state = "scheduled" if profile.get("publishing_policy") == "scheduled_public" else "published"
+                        with self.store._connection() as conn:
+                            conn.execute(
+                                "UPDATE publications SET state=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=NULL,updated_at=? WHERE publication_id=?",
+                                (resolved_state, result.get("video_reel_id") or result.get("publish_id") or result.get("post_id") or result.get("id"),
+                                 result.get("url") or result.get("post_url"), _safe_receipt(status), _now(), publication_id),
+                            )
+                        return {"job_id": job.job_id, "platform": platform, "state": resolved_state, "receipt": status}
                 if status.get("status") == "failed":
                     with self.store._connection() as conn:
-                        conn.execute("UPDATE publications SET state='failed',receipt_json=?,updated_at=? WHERE job_id=?",
-                                     (_safe_receipt(status), _now(), job_id))
+                        conn.execute("UPDATE publications SET state='failed',receipt_json=?,failure_details=?,updated_at=? WHERE publication_id=?",
+                                     (_safe_receipt(status), _safe_failure(status.get("message") or "Upload-Post reports failure"), _now(), publication_id))
                 raise AutopilotError("prior upload outcome is not confirmed; provider status was checked and no retry was submitted")
             if existing["state"] == "failed":
-                status = UploadPostService({"upload_post_api_key": config.app.get("upload_post_api_key", ""),
-                                            "upload_post_username": username, "upload_post_enabled": True}).check_status(existing["provider_request_id"])
+                status = publisher.check_status(existing["provider_request_id"])
                 receipt = json.loads(existing["receipt_json"] or "{}")
-                confirmed_failure = status.get("status") == "failed" or (receipt.get("success") is False and not receipt.get("request_id"))
+                confirmed_failure = status.get("status") == "failed" or (
+                    receipt.get("success") is False and not receipt.get("request_id")
+                )
                 if not confirmed_failure:
                     raise AutopilotError("retry is blocked until Upload-Post confirms the prior request failed")
-                with self.store._connection() as conn:
-                    conn.execute("UPDATE publications SET state='uploading',failure_details=NULL,attempt_count=attempt_count+1,next_check_at=?,updated_at=? WHERE job_id=?",
-                                 ((datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(), _now(), job_id))
                 retry = True
-            else:
+            elif existing["state"] != "failed":
                 return dict(existing)
-        if profile.get("publishing_policy") == "scheduled_public":
-            if not job.intended_publication_slot:
-                self._record_publication_preflight_failure(job, username, "scheduled public publishing requires a pinned publication slot")
-                raise AutopilotError("scheduled public publishing requires a pinned publication slot")
-            if job.intended_publication_slot <= datetime.now(timezone.utc):
-                self._record_publication_preflight_failure(job, username, "publication slot passed before rendering completed")
-                raise AutopilotError("scheduled publication slot has passed; choose a future slot or approve an immediate policy")
-        request_id = hashlib.sha256(f"mpt-autopilot:{job_id}".encode()).hexdigest()[:32]
+
+        policy = profile.get("publishing_policy", "manual")
+        schedule_date = None
+        if policy == "scheduled_public":
+            if not job.intended_publication_slot or job.intended_publication_slot <= datetime.now(timezone.utc):
+                raise AutopilotError("scheduled publication requires a future pinned publication slot")
+            schedule_date = job.intended_publication_slot.astimezone(
+                ZoneInfo(profile.get("timezone", "UTC"))
+            ).replace(tzinfo=None).isoformat()
+        attempt = (int(existing["attempt_count"]) + 1) if retry else 1
+        request_id = hashlib.sha256(
+            f"mpt-publication:{job.job_id}:{platform}:{destination_account_id}:{attempt}".encode()
+        ).hexdigest()[:32]
+        now = _now()
         if not retry:
-            now = _now()
+            try:
+                with self.store._connection() as conn:
+                    conn.execute("""INSERT INTO publications
+                        (publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                         provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,
+                         attempt_count,created_at,updated_at,publisher_backend,platform,destination_account_id,next_check_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'uploading', NULL, NULL, NULL, NULL, 1, ?, ?,
+                                'upload_post', ?, ?, ?)""",
+                        (publication_id, job.job_id, job.channel_id, job.profile_version, username,
+                         request_id, request_id, now, now, platform, destination_account_id,
+                         (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()))
+            except sqlite3.IntegrityError as exc:
+                raise AutopilotError("publication already reserved for this destination; reconcile before retrying") from exc
+        else:
             with self.store._connection() as conn:
-                conn.execute("INSERT INTO publications (publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,attempt_count,created_at,updated_at,next_check_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'uploading', NULL, NULL, NULL, NULL, 1, ?, ?, ?)",
-                             (str(uuid4()), job_id, job.channel_id, job.profile_version, username, request_id, request_id, now, now,
-                              (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()))
-        account = {"upload_post_api_key": config.app.get("upload_post_api_key", ""),
-                   "upload_post_username": username, "upload_post_enabled": True}
-        privacy = {"private": "private", "unlisted": "unlisted", "scheduled_public": "private", "automatic_public": "public"}.get(profile.get("publishing_policy"), "private")
+                cursor = conn.execute("""UPDATE publications SET state='uploading',failure_details=NULL,
+                    attempt_count=?,idempotency_key=?,provider_request_id=?,next_check_at=?,updated_at=?
+                    WHERE publication_id=? AND state='failed'""",
+                    (attempt, request_id, request_id,
+                     (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(), now, publication_id))
+                if cursor.rowcount != 1:
+                    raise AutopilotError("publication retry reservation changed; reconcile before retrying")
         try:
-            result = UploadPostService(account).upload_video(job.output_artifacts[0], publication_title,
-                platforms=["youtube"], youtube_extra={"privacyStatus": privacy,
-                "selfDeclaredMadeForKids": bool(config.app.get("upload_post_youtube_made_for_kids", False))},
+            youtube_extra = None
+            if platform == "youtube":
+                privacy = {"private": "private", "unlisted": "unlisted",
+                           "scheduled_public": "private", "automatic_public": "public"}.get(policy, "private")
+                youtube_extra = {
+                    "privacyStatus": privacy,
+                    "selfDeclaredMadeForKids": bool(config.app.get("upload_post_youtube_made_for_kids", False)),
+                    "youtube_title": title[:100],
+                    "youtube_description": description,
+                    "tags": (youtube_metadata or {}).get("hashtags", []),
+                }
+            result = publisher.upload_video(
+                job.output_artifacts[0], title, platforms=[platform], youtube_extra=youtube_extra,
                 request_id=request_id, idempotency_key=request_id,
-                scheduled_date=schedule_date, timezone_name=profile.get("timezone"), external_id=job.job_id)
-            status = ("scheduled" if profile.get("publishing_policy") == "scheduled_public" else "published") if result.get("success") else ("unknown" if result.get("request_id") else "failed")
-            platform_result = _youtube_receipt_result(result.get("results"))
-            video_id = platform_result.get("video_id") or platform_result.get("id") if isinstance(platform_result, dict) else None
-            video_url = platform_result.get("url") or platform_result.get("video_url") if isinstance(platform_result, dict) else None
+                scheduled_date=schedule_date, timezone_name=profile.get("timezone"),
+                external_id=job.job_id,
+            )
+            platform_result = _platform_receipt_result(result.get("results"), platform)
+            success = result.get("success") is True and platform_result.get("success") is True
+            state = (("scheduled" if schedule_date else "published") if success
+                     else ("unknown" if result.get("request_id") else "failed"))
+            remote_id = (platform_result.get("video_id") or platform_result.get("video_reel_id")
+                         or platform_result.get("publish_id") or platform_result.get("post_id")
+                         or platform_result.get("id"))
+            remote_url = platform_result.get("url") or platform_result.get("post_url")
+            next_check = ((job.intended_publication_slot.astimezone(timezone.utc)
+                           + timedelta(minutes=5)).isoformat() if state == "scheduled" else
+                          (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+                          if state == "unknown" else None)
             with self.store._connection() as conn:
-                schedule_id = (result.get("job_id") or result.get("schedule_id")) if status == "scheduled" else None
-                next_check = (job.intended_publication_slot.astimezone(timezone.utc) + timedelta(minutes=5)).isoformat() if status == "scheduled" and job.intended_publication_slot else None
-                conn.execute("UPDATE publications SET state=?,provider_request_id=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=?,updated_at=?,provider_schedule_id=?,next_check_at=? WHERE job_id=?",
-                             (status, result.get("request_id", request_id), video_id, video_url, _safe_receipt(result),
-                              None if result.get("success") else _safe_failure(result.get("error", "upload failed")), _now(), schedule_id, next_check, job_id))
-            return {"job_id": job_id, "state": status, "receipt": result}
+                conn.execute("""UPDATE publications SET state=?,provider_request_id=?,provider_video_id=?,
+                    provider_url=?,receipt_json=?,failure_details=?,updated_at=?,provider_schedule_id=?,next_check_at=?
+                    WHERE publication_id=?""",
+                    (state, result.get("request_id", request_id), remote_id, remote_url, _safe_receipt(result),
+                     None if success else _safe_failure(result.get("error") or platform_result.get("error") or "upload failed"),
+                     _now(), result.get("job_id") or result.get("schedule_id") if state == "scheduled" else None,
+                     next_check, publication_id))
+            return {"job_id": job.job_id, "platform": platform, "state": state, "receipt": result}
         except Exception as exc:
             with self.store._connection() as conn:
-                conn.execute("UPDATE publications SET state='unknown',failure_details=?,updated_at=? WHERE job_id=?",
-                             (_safe_failure(f"{type(exc).__name__}: {exc}"), _now(), job_id))
+                conn.execute("UPDATE publications SET state='unknown',failure_details=?,next_check_at=?,updated_at=? WHERE publication_id=?",
+                             (_safe_failure(f"{type(exc).__name__}: {exc}"),
+                              (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(), _now(), publication_id))
             raise AutopilotError("upload outcome is uncertain; reconcile the persisted request before retrying") from exc
 
     def _publish_youtube_direct(
@@ -2153,12 +2897,15 @@ class AutopilotService:
             raise AutopilotError("pinned YouTube connection is missing, changed, or bound to another destination")
         context = self._direct_session_context(job, connection_id, expected_channel_id, job.output_artifacts[0])
 
-        # Re-read the unique job reservation here; callers may have raced after their
-        # initial status read. SQLite's unique(job_id) publication index prevents a
-        # second insert from being initiated for the same production job.
+        # Re-read the destination-scoped reservation here; callers may have raced
+        # after their initial status read.
         with self.store._connection() as conn:
-            current = conn.execute("SELECT * FROM publications WHERE job_id=?", (job.job_id,)).fetchone()
+            current = conn.execute(
+                "SELECT * FROM publications WHERE job_id=? AND platform='youtube' AND destination_account_id=?",
+                (job.job_id, expected_channel_id),
+            ).fetchone()
         existing = current
+        publication_id = existing["publication_id"] if existing else str(uuid4())
         retry = False
         if existing:
             if existing["state"] in {"published", "scheduled"}:
@@ -2184,18 +2931,18 @@ class AutopilotService:
                 except Exception as exc:
                     retry_after = getattr(exc, "retry_after", None)
                     with self.store._connection() as conn:
-                        conn.execute("UPDATE publications SET state='unknown',failure_details=?,retry_after=?,updated_at=? WHERE job_id=?",
+                        conn.execute("UPDATE publications SET state='unknown',failure_details=?,retry_after=?,updated_at=? WHERE publication_id=?",
                                      (_safe_failure(f"{type(exc).__name__}: {exc}"),
                                       (datetime.now(timezone.utc) + timedelta(seconds=retry_after)).isoformat() if retry_after else None,
-                                      _now(), job.job_id))
+                                      _now(), publication_id))
                     raise AutopilotError("resumable upload remains uncertain; the same session was reconciled and no new upload was started") from exc
             if existing["state"] == "failed":
                 if existing["retry_after"] and datetime.fromisoformat(existing["retry_after"]) > datetime.now(timezone.utc):
                     raise AutopilotError("YouTube rate limit is active; retry after the recorded Retry-After time")
                 if existing["resumable_session_url"]:
                     with self.store._connection() as conn:
-                        conn.execute("UPDATE publications SET state='unknown',failure_details=NULL,updated_at=? WHERE job_id=?",
-                                     (_now(), job.job_id))
+                        conn.execute("UPDATE publications SET state='unknown',failure_details=NULL,updated_at=? WHERE publication_id=?",
+                                     (_now(), publication_id))
                     try:
                         session_url, legacy_unverified = self._load_direct_session(
                             existing, job, connection_id, expected_channel_id, job.output_artifacts[0], context)
@@ -2207,30 +2954,40 @@ class AutopilotService:
                     except Exception as exc:
                         retry_after = getattr(exc, "retry_after", None)
                         with self.store._connection() as conn:
-                            conn.execute("UPDATE publications SET state='unknown',failure_details=?,retry_after=?,updated_at=? WHERE job_id=?",
+                            conn.execute("UPDATE publications SET state='unknown',failure_details=?,retry_after=?,updated_at=? WHERE publication_id=?",
                                          (_safe_failure(f"{type(exc).__name__}: {exc}"),
                                           (datetime.now(timezone.utc) + timedelta(seconds=retry_after)).isoformat() if retry_after else None,
-                                          _now(), job.job_id))
+                                          _now(), publication_id))
                         raise AutopilotError("same resumable session remains uncertain; no new insert was started") from exc
                 if not (existing["failure_details"] or "").startswith("confirmed_rejection:"):
                     raise AutopilotError("previous YouTube insert outcome is not confirmed rejected; inspect YouTube Studio before creating another upload")
                 # Only a persisted, provider-confirmed rejection with no session URL
                 # permits an explicit operator retry to make a fresh videos.insert.
                 with self.store._connection() as conn:
-                    cursor = conn.execute("UPDATE publications SET state='uploading',failure_details=NULL,retry_after=NULL,attempt_count=attempt_count+1,updated_at=? WHERE job_id=? AND state='failed' AND resumable_session_url IS NULL",
-                                          (_now(), job.job_id))
+                    cursor = conn.execute("UPDATE publications SET state='uploading',failure_details=NULL,retry_after=NULL,attempt_count=attempt_count+1,updated_at=? WHERE publication_id=? AND state='failed' AND resumable_session_url IS NULL",
+                                          (_now(), publication_id))
                     if cursor.rowcount != 1:
                         raise AutopilotError("publication retry reservation changed concurrently; reconcile before retrying")
                 retry = True
             elif existing["state"] not in {"unknown", "uploading"}:
                 return dict(existing)
-        request_id = hashlib.sha256(f"mpt-autopilot:{job.job_id}".encode()).hexdigest()[:32]
+        request_id = hashlib.sha256(
+            f"mpt-publication:{job.job_id}:youtube:{expected_channel_id}".encode()
+        ).hexdigest()[:32]
         now = _now()
         if not retry:
             try:
                 with self.store._connection() as conn:
-                    conn.execute("INSERT INTO publications (publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,attempt_count,created_at,updated_at,publisher_backend,youtube_connection_id,youtube_channel_id) VALUES (?, ?, ?, ?, NULL, ?, ?, 'uploading', NULL, NULL, NULL, NULL, 1, ?, ?, 'youtube_direct', ?, ?)",
-                                 (str(uuid4()), job.job_id, job.channel_id, job.profile_version, request_id, request_id, now, now, connection_id, expected_channel_id))
+                    conn.execute("""INSERT INTO publications
+                        (publication_id,job_id,channel_id,profile_version,account_username,idempotency_key,
+                         provider_request_id,state,provider_video_id,provider_url,receipt_json,failure_details,
+                         attempt_count,created_at,updated_at,publisher_backend,youtube_connection_id,
+                         youtube_channel_id,platform,destination_account_id)
+                        VALUES (?, ?, ?, ?, NULL, ?, ?, 'uploading', NULL, NULL, NULL, NULL, 1, ?, ?,
+                                'youtube_direct', ?, ?, 'youtube', ?)""",
+                        (publication_id, job.job_id, job.channel_id, job.profile_version,
+                         request_id, request_id, now, now, connection_id, expected_channel_id,
+                         expected_channel_id))
             except sqlite3.IntegrityError as exc:
                 raise AutopilotError("publication reservation already exists; reconcile it before retrying") from exc
         policy = profile.get("publishing_policy", "manual")
@@ -2255,10 +3012,10 @@ class AutopilotService:
             if confirmed:
                 failure = f"confirmed_rejection: {failure}"
             with self.store._connection() as conn:
-                conn.execute("UPDATE publications SET state=?,failure_details=?,retry_after=?,updated_at=? WHERE job_id=?",
+                conn.execute("UPDATE publications SET state=?,failure_details=?,retry_after=?,updated_at=? WHERE publication_id=?",
                              ("failed" if confirmed else "unknown", failure,
                               (datetime.now(timezone.utc) + timedelta(seconds=retry_after)).isoformat() if retry_after else None,
-                              _now(), job.job_id))
+                              _now(), publication_id))
             if confirmed:
                 raise AutopilotError("YouTube rejected the publication; inspect the recorded failure before retrying") from exc
             raise AutopilotError("YouTube upload outcome is uncertain; the persisted resumable session must be reconciled before retrying") from exc
@@ -2288,15 +3045,16 @@ class AutopilotService:
     def _save_direct_session(self, job_id: str, session_url: str, context: dict):
         encrypted = self.youtube_connections.encrypt_session(session_url, context)
         with self.store._connection() as conn:
-            row = conn.execute("SELECT channel_id,youtube_connection_id,youtube_channel_id,publisher_backend,state FROM publications WHERE job_id=?",
-                               (job_id,)).fetchone()
+            row = conn.execute("SELECT channel_id,youtube_connection_id,youtube_channel_id,publisher_backend,state FROM publications WHERE job_id=? AND publisher_backend='youtube_direct' AND platform='youtube' AND destination_account_id=?",
+                               (job_id, context["youtube_channel_id"])).fetchone()
             if (row is None or row["publisher_backend"] != "youtube_direct" or row["channel_id"] != context["local_channel_id"]
                     or row["youtube_connection_id"] not in (None, context["connection_id"])
                     or row["youtube_channel_id"] not in (None, context["youtube_channel_id"])
                     or row["state"] not in {"uploading", "unknown"}):
                 raise AutopilotError("refusing to persist a YouTube session for a different job or destination")
-            cursor = conn.execute("UPDATE publications SET resumable_session_url=?,youtube_connection_id=COALESCE(youtube_connection_id,?),youtube_channel_id=COALESCE(youtube_channel_id,?),updated_at=? WHERE job_id=? AND publisher_backend='youtube_direct' AND state IN ('uploading','unknown')",
-                         (encrypted, context["connection_id"], context["youtube_channel_id"], _now(), job_id))
+            cursor = conn.execute("UPDATE publications SET resumable_session_url=?,youtube_connection_id=COALESCE(youtube_connection_id,?),youtube_channel_id=COALESCE(youtube_channel_id,?),updated_at=? WHERE job_id=? AND publisher_backend='youtube_direct' AND platform='youtube' AND destination_account_id=? AND state IN ('uploading','unknown')",
+                         (encrypted, context["connection_id"], context["youtube_channel_id"], _now(), job_id,
+                          context["youtube_channel_id"]))
             if cursor.rowcount != 1:
                 raise AutopilotError("publication changed before its YouTube session could be persisted")
 
@@ -2312,10 +3070,11 @@ class AutopilotService:
         receipt = {"id": video_id, "snippet": result.get("snippet", {}), "status": result.get("status", {})}
         next_check = (job.intended_publication_slot.astimezone(timezone.utc) + timedelta(minutes=5)).isoformat() if state == "scheduled" and job.intended_publication_slot else None
         with self.store._connection() as conn:
-            cursor = conn.execute("UPDATE publications SET state=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=NULL,next_check_at=?,youtube_connection_id=COALESCE(youtube_connection_id,?),youtube_channel_id=COALESCE(youtube_channel_id,?),updated_at=? WHERE job_id=? AND publisher_backend='youtube_direct' AND channel_id=? AND (youtube_connection_id IS NULL OR youtube_connection_id=?) AND (youtube_channel_id IS NULL OR youtube_channel_id=?)",
+            youtube_channel_id = job.profile_snapshot.get("youtube_channel_id")
+            cursor = conn.execute("UPDATE publications SET state=?,provider_video_id=?,provider_url=?,receipt_json=?,failure_details=NULL,next_check_at=?,youtube_connection_id=COALESCE(youtube_connection_id,?),youtube_channel_id=COALESCE(youtube_channel_id,?),updated_at=? WHERE job_id=? AND publisher_backend='youtube_direct' AND platform='youtube' AND destination_account_id=? AND channel_id=? AND (youtube_connection_id IS NULL OR youtube_connection_id=?) AND (youtube_channel_id IS NULL OR youtube_channel_id=?)",
                          (state, video_id, video_url, _safe_receipt(receipt), next_check,
                           job.profile_snapshot.get("youtube_connection_id"), job.profile_snapshot.get("youtube_channel_id"),
-                          _now(), job.job_id, job.channel_id, job.profile_snapshot.get("youtube_connection_id"),
+                          _now(), job.job_id, youtube_channel_id, job.channel_id, job.profile_snapshot.get("youtube_connection_id"),
                           job.profile_snapshot.get("youtube_channel_id")))
             if cursor.rowcount != 1:
                 raise AutopilotError("YouTube receipt could not be bound to its immutable publication record")
@@ -2715,6 +3474,14 @@ class AutopilotService:
                     "output artifacts retained"
                 ))
                 return
+            if report["passed"]:
+                try:
+                    self.ensure_youtube_metadata(job_id)
+                except Exception as exc:
+                    logger.warning(
+                        "YouTube caption preparation deferred until upload: job_id={}, error_type={}",
+                        job_id, type(exc).__name__,
+                    )
             with self.store._connection() as conn:
                 conn.execute("INSERT OR REPLACE INTO job_qa VALUES (?, ?, ?, NULL, NULL, ?)",
                              (job_id, "qa_passed" if report["passed"] else "qa_failed", json.dumps(report), _now()))

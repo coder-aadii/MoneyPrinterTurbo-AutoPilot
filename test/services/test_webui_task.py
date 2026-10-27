@@ -141,6 +141,29 @@ def test_webui_runtime_config_updates_do_not_use_blocking_writes():
     assert direct_writes == []
 
 
+def test_webui_exposes_stock_eligibility_policy_for_savage_tasks():
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_render_video_settings"
+    )
+    source = ast.get_source_segment(WEBUI_MAIN.read_text(encoding="utf-8"), function)
+    assert '"Stock footage eligibility"' in source
+    assert '"manual_review"' in source
+    assert '"auto_eligible"' in source
+    assert "params.stock_media_policy = stable_selectbox" in source
+
+    review_function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_render_savage_stock_review"
+    )
+    review_source = ast.get_source_segment(WEBUI_MAIN.read_text(encoding="utf-8"), review_function)
+    assert "st.video" in review_source
+    assert "visual_review.human_approval" in review_source
+    assert "visual_review.record_human_review" in review_source
+    assert "sha256(candidate_path)" in review_source
+
+
 def test_webui_delete_keeps_task_state_when_file_removal_fails(tmp_path):
     """A failed directory removal must leave the task available for retry."""
     tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
@@ -283,15 +306,16 @@ def test_task_summary_tolerates_directory_removed_during_scan():
     ],
 )
 @pytest.mark.parametrize(
-    ("task_state", "has_video"),
+    ("task_state", "has_video", "no_subtitles"),
     [
-        (const.TASK_STATE_COMPLETE, True),
-        (const.TASK_STATE_FAILED, True),
-        (const.TASK_STATE_FAILED, False),
+        (const.TASK_STATE_COMPLETE, True, False),
+        (const.TASK_STATE_COMPLETE, True, True),
+        (const.TASK_STATE_FAILED, True, False),
+        (const.TASK_STATE_FAILED, False, False),
     ],
 )
 def test_terminal_task_renders_subject_named_video_download(
-    tmp_path, ui_config, expected_open_count, task_state, has_video
+    tmp_path, ui_config, expected_open_count, task_state, has_video, no_subtitles
 ):
     """完成任务应提供成片下载，并按 WebUI 配置决定是否自动打开目录。"""
     tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
@@ -392,6 +416,9 @@ def test_terminal_task_renders_subject_named_video_download(
             "warnings": [
                 {"code": "batch_materials_reused", "video_index": 2, "count": 3}
             ],
+            "subtitle_alignment_fallback": (
+                {"effective_mode": "none"} if no_subtitles else {}
+            ),
             "video_subject": "A day: in / Shanghai?",
         },
     )
@@ -409,7 +436,12 @@ def test_terminal_task_renders_subject_named_video_download(
         open_task_folder.assert_not_called()
         return
     assert fake_st.videos == [str(video_path)]
-    assert fake_st.warnings == ["Video 2 reused 3 source clips."]
+    if no_subtitles:
+        assert len(fake_st.warnings) == 2
+        assert "no subtitles" in fake_st.warnings[0]
+        assert fake_st.warnings[1] == "Video 2 reused 3 source clips."
+    else:
+        assert fake_st.warnings == ["Video 2 reused 3 source clips."]
     assert fake_st.downloads == [
         (
             "Download Video",
@@ -477,6 +509,22 @@ def test_submit_generation_copies_params_before_starting_worker():
     assert submitted_params == params
     assert submitted_params is not params
     webui_task.sm.state.delete_task("copied-params-test")
+
+
+def test_webui_selected_pexels_is_saved_in_generation_snapshot(tmp_path, monkeypatch):
+    from app.services import task
+    from app.services.state import MemoryState
+
+    script = "समुद्र में एक जीव रहता है।"
+    params = VideoParams(video_subject="समुद्री जीव", video_script=script,
+                         video_source="pexels", video_language="hi")
+    monkeypatch.setattr(webui_task.sm, "state", MemoryState())
+    monkeypatch.setattr(task.utils, "task_dir", lambda _task: str(tmp_path))
+    with patch.object(webui_task._task_manager, "add_task") as add_task:
+        webui_task.submit_generation("webui-provider", params, capture_logs=False)
+    submitted = add_task.call_args.kwargs["params"]
+    task.save_script_data("webui-provider", script, ["sea creature"], submitted)
+    assert json.loads((tmp_path / "script.json").read_text())["params"]["video_source"] == "pexels"
 
 
 def test_submit_generation_keeps_voxcpm_reference_audio_out_of_params():

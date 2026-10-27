@@ -72,8 +72,20 @@ def test_live_pixabay_144459_metadata_and_rendition_are_accepted_for_portrait():
 def test_single_relevant_six_second_clip_reports_insufficient_unique_footage(tmp_path):
     candidate = _candidate(144459, "kinetic sand, sand, cutting, asmr")
     with patch.dict(material.config.app, {"material_directory": str(tmp_path)}), \
-            patch.object(material, "_search_videos_with_cache", return_value=[candidate]):
-        with pytest.raises(material.NoRelevantAsmrMaterialsError, match="Insufficient distinct ASMR footage"):
+            patch.object(material, "_search_videos_with_cache", return_value=[candidate]), \
+            patch.object(material, "_save_material_item", return_value=str(tmp_path / "candidate.mp4")), \
+            patch.object(material.visual_review, "sha256", return_value="a" * 64), \
+            patch.object(material.visual_review, "sample_clip", return_value={
+                "status": "human_review_required",
+                "sampled_frames": [{"timestamp_seconds": 1.0}],
+                "reason": "Confirm the visible cutting action and crop.",
+            }), patch.object(material.visual_review, "human_approval", return_value=None), \
+            patch.object(material.task_artifacts, "patch_script_data"), \
+            patch.object(material.utils, "task_dir", return_value=str(tmp_path / "task")):
+        with pytest.raises(
+            material.NoRelevantAsmrMaterialsError,
+            match=r"Insufficient distinct ASMR footage.*unique metadata-matched clips offer 6\.0s usable duration",
+        ):
             material.download_videos(
                 task_id="test-pixabay-asmr",
                 search_terms=[],

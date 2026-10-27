@@ -24,6 +24,82 @@ def _registry_path() -> Path:
     return Path(__file__).resolve().parents[2] / "storage" / "visual_reviews" / "relevant_stock.json"
 
 
+def _auto_relevance_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "storage" / "visual_reviews" / "auto_relevance.json"
+
+
+def local_vision_verifier_available() -> bool:
+    """No supported local image/video semantic verifier is bundled with MPT."""
+    return False
+
+
+def cached_auto_relevance(content_hash: str, query: str) -> dict | None:
+    """Return a local-vision decision scoped to exact bytes and search intent."""
+    query_hash = hashlib.sha256(" ".join(query.casefold().split()).encode("utf-8")).hexdigest()
+    try:
+        records = json.loads(_auto_relevance_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    for record in records if isinstance(records, list) else []:
+        if (isinstance(record, dict) and record.get("sha256") == content_hash
+                and record.get("query_sha256") == query_hash
+                and record.get("verifier") in {"local_vision", "conservative_policy"}
+                and record.get("decision") in {"relevant", "irrelevant", "uncertain"}):
+            return record
+    return None
+
+
+def record_auto_relevance(
+    content_hash: str,
+    query: str,
+    decision: str,
+    *,
+    verifier: str,
+    model: str,
+    score: float | None,
+    reason: str,
+) -> None:
+    """Persist a completed local vision result, bound to clip bytes and query."""
+    if (verifier not in {"local_vision", "conservative_policy"}
+            or decision not in {"relevant", "irrelevant", "uncertain"}):
+        raise ValueError("automatic relevance decisions require a supported verifier")
+    if not re.fullmatch(r"[0-9a-f]{64}", content_hash.casefold()):
+        raise ValueError("automatic relevance requires the actual SHA-256 file hash")
+    if not model.strip() or len(reason.strip()) < 10:
+        raise ValueError("automatic relevance model and reason are required")
+    if verifier != "local_vision" and decision == "relevant":
+        raise ValueError("conservative policy cannot mark footage relevant without visual evidence")
+    if decision == "relevant" and (score is None or not 0.0 <= float(score) <= 1.0):
+        raise ValueError("a relevant automatic decision requires a bounded confidence score")
+    query_hash = hashlib.sha256(" ".join(query.casefold().split()).encode("utf-8")).hexdigest()
+    path = _auto_relevance_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        records = []
+    records = [item for item in records if not (
+        isinstance(item, dict) and item.get("sha256") == content_hash
+        and item.get("query_sha256") == query_hash
+    )]
+    records.append({
+        "sha256": content_hash.casefold(), "query_sha256": query_hash,
+        "decision": decision, "verifier": verifier, "model": model.strip()[:160],
+        "score": score, "reason": reason.strip()[:1200],
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+    })
+    descriptor, temp_name = tempfile.mkstemp(prefix=".auto-relevance-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(records, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

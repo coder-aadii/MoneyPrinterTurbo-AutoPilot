@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from app.services import scene_spec
+
 AUTO = "auto"
 ASMR_CUTTING = "asmr_cutting"
 RELEVANT_STOCK = "relevant_stock"
@@ -118,40 +120,14 @@ def preset_for(style: str) -> StylePreset:
     except KeyError as exc:
         raise ValueError(f"unsupported visual style: {style}") from exc
 
-# Keep this small and transparent. Provider search terms are still generated from
-# the approved narration; these cues only decide whether literal/contextual visuals
-# are a plausible first choice.
-_DIRECT_VISUAL_CUES = (
-    r"\bbutterfl(?:y|ies)\b", r"तितल(?:ी|ियाँ|ियों)",
-    r"\bjupiter\b", r"great red spot", r"बृहस्पति", r"गुरु ग्रह",
-    r"\bplanet(?:s)?\b", r"\bmoon\b", r"\bstar(?:s)?\b",
-    r"\banimal(?:s)?\b", r"\bbird(?:s)?\b", r"\bplant(?:s)?\b",
-    r"\bocean\b", r"\bvolcano\b", r"\bmountain(?:s)?\b",
-    r"\bspace\b", r"\bforest\b", r"\bflower(?:s)?\b",
-    r"जानवर", r"पक्षी", r"पेड़", r"समुद्र", r"ज्वालामुखी", r"पहाड़",
-    r"अंतरिक्ष", r"जंगल", r"फूल",
-)
-
-
 def has_direct_visual_opportunity(script: str, topic: str = "") -> bool:
-    text = f"{topic}\n{script}".lower()
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _DIRECT_VISUAL_CUES)
-
-
-def relevant_search_terms(script: str, topic: str = "") -> list[str]:
-    """Return safe, contextual search phrases for known concrete subjects."""
-    text = f"{topic}\n{script}".lower()
-    if re.search(r"butterfl|तितल", text):
-        return [
-            "butterfly basking in sunlight", "butterfly opening wings",
-            "butterfly flying in nature", "butterfly close up",
-        ]
-    if re.search(r"jupiter|great red spot|बृहस्पति|गुरु ग्रह", text):
-        return [
-            "Jupiter Great Red Spot NASA", "Jupiter planet space NASA",
-            "Jupiter storm scientific visualization",
-        ]
-    return []
+    """Prefer stock for narration beats that present a subject, not a relation."""
+    text = script or topic
+    sentences = [part.strip() for part in re.split(r"[।?!\n]+", text) if part.strip()]
+    if not sentences:
+        return False
+    plans = [scene_spec.plan_scene(sentence) for sentence in sentences]
+    return sum(plan.primitive == "label" for plan in plans) >= max(1, len(plans) // 2)
 
 
 def initial_selection(requested: str, script: str, topic: str = "") -> tuple[str, str]:
@@ -168,7 +144,7 @@ def initial_selection(requested: str, script: str, topic: str = "") -> tuple[str
     if requested != AUTO:
         raise ValueError(f"unsupported visual style: {requested}")
     text = f"{topic}\n{script}".casefold()
-    if any(term in text for term in ("cutting", "satisfying", "soap", "kinetic sand", "स्लाइम")):
+    if any(term in text for term in ("cutting", "satisfying", "slicing", "asmr", "काट")):
         return ASMR_CUTTING, "AUTO selected ASMR Cutting for an explicitly satisfying-cutting topic."
     if has_direct_visual_opportunity(script, topic):
         return RELEVANT_STOCK, (

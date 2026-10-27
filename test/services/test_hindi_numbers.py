@@ -40,7 +40,7 @@ def test_tts_receives_normalized_text_while_editable_script_is_preserved(tmp_pat
 
 
 def test_tts_receives_hinglish_pronunciations_without_markdown(tmp_path):
-    editable = "तू **Client** है, YouTube पर 90% वीडियो देखता है।"
+    editable = "तू **Client** है, YouTube पर 90% वीडियो देखता है। ChatGPT और AI भी मदद करते हैं।"
     params = VideoParams(
         video_subject="Hinglish", video_script=editable,
         video_language="hi", visual_style="relevant_stock", voice_name="test:voice",
@@ -53,6 +53,7 @@ def test_tts_receives_hinglish_pronunciations_without_markdown(tmp_path):
         task.generate_audio("hinglish-audio", params, editable)
 
     assert synthesize.call_args.kwargs["text"] == (
-        "तू क्लाइंट है, यूट्यूब पर नब्बे प्रतिशत वीडियो देखता है।"
+        "तू क्लाइंट है, यूट्यूब पर नब्बे प्रतिशत वीडियो देखता है। "
+        "चैटजीपीटी और एआई भी मदद करते हैं।"
     )
     assert params.video_script == editable

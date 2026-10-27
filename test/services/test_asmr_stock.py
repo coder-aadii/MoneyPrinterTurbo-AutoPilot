@@ -170,6 +170,59 @@ class TestAsmrStock(unittest.TestCase):
         self.assertEqual(len(ranked), 1)
         self.assertIs(ranked[0][1], duplicate)
 
+    def test_unreviewed_matching_candidates_are_sampled_then_multiple_approved_clips_are_used(self):
+        from pathlib import Path
+
+        first = _candidate("sand-a", "https://cdn.test/sand-a.mp4",
+                           tags="kinetic sand cutting asmr macro", duration=7)
+        second = _candidate("sand-b", "https://cdn.test/sand-b.mp4",
+                            tags="kinetic sand slicing satisfying", duration=7)
+        for item in (first, second):
+            item.source_info.pop("asmr_quality_review")
+            item.source_info.pop("asmr_reviewed_timestamps_seconds")
+            item.source_info.pop("asmr_quality_review_notes")
+        task_dir = "/tmp/asmr-reviewed-task"
+        candidates = [first, second]
+        saved_files = []
+
+        def download(materials, **_kwargs):
+            return [
+                (term, item, f"{task_dir}/{item.source_info['asset_id']}.mp4")
+                for term, item in materials
+            ]
+
+        approval = {
+            "reviewer": "test reviewer",
+            "reason": "The sampled frames clearly show distinct cutting actions and usable crops.",
+            "reviewed_at": "2026-10-26T00:00:00+00:00",
+        }
+        with patch.object(material, "_search_terms_in_parallel", side_effect=lambda search_terms, **_kwargs: [
+            (term, candidates) for term in search_terms
+        ]), patch.object(material, "_save_material_item", side_effect=lambda item, _directory: (
+            saved_files.append(item.source_info["asset_id"]) or
+            f"{task_dir}/{item.source_info['asset_id']}.mp4"
+        )), patch.object(material.visual_review, "sha256", side_effect=lambda path: Path(path).stem), \
+                patch.object(material.visual_review, "sample_clip", return_value={
+                    "status": "human_review_required",
+                    "sampled_frames": [{"timestamp_seconds": 1.0}],
+                    "reason": "Human scene and crop check is required.",
+                }), patch.object(material.visual_review, "human_approval", return_value=approval), \
+                patch.object(material.task_artifacts, "patch_script_data"), \
+                patch.object(material, "_download_materials_in_parallel", side_effect=download), \
+                patch.object(material.asmr_library, "_sha256", side_effect=lambda path: Path(path).stem), \
+                patch.object(material.asmr_library, "probe", return_value=(7.0, 1080, 1920)), \
+                patch.object(material, "_persist_material_sources"), \
+                patch.object(material.utils, "task_dir", return_value=task_dir):
+            paths = material.download_videos(
+                task_id="asmr-reviewed-task", search_terms=[], source="pixabay",
+                audio_duration=10, max_clip_duration=7,
+                stock_video_style=asmr.SATISFYING_ASMR_CUTTING,
+                asmr_categories=["kinetic_sand"],
+            )
+
+        self.assertEqual(saved_files, ["sand-a", "sand-b"])
+        self.assertEqual(set(paths), {f"{task_dir}/sand-a.mp4", f"{task_dir}/sand-b.mp4"})
+
     def test_canonical_url_dedup_removes_query_and_fragment(self):
         self.assertEqual(
             asmr.canonical_media_url("HTTPS://CDN.test:443/a.mp4/?sig=1#x"),
@@ -267,7 +320,7 @@ class TestAsmrStock(unittest.TestCase):
         ) as download:
             with self.assertRaisesRegex(
                 material.NoRelevantAsmrMaterialsError,
-                r"required 10.1s usable duration, quality-approved found 10.0s; metadata-only candidates offer 10.0s.*kinetic_sand, soap",
+                r"required 10.1s usable duration, quality-approved found 10.0s; unique metadata-matched clips offer 10.0s usable duration.*kinetic_sand, soap",
             ):
                 material.download_videos(
                     task_id="asmr-insufficient", search_terms=[], source="pixabay",

@@ -104,6 +104,7 @@ class ProductionJob(BaseModel):
     mpt_task_id: str | None = None
     worker_owner: str | None = Field(default=None, exclude=True)
     output_artifacts: list[str] = Field(default_factory=list)
+    youtube_metadata: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 

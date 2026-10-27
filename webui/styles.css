@@ -246,6 +246,12 @@ div[class*="st-key-gallery_card_"]:hover div[data-testid="stVerticalBlockBorderW
     box-shadow: 0 5px 18px rgba(0, 0, 0, 0.10);
 }
 
+div[class*="st-key-gallery_card_"]:has(.mpt-gallery-select-indicator.is-selected)
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-color: #5b8cff !important;
+    box-shadow: 0 0 0 2px rgba(91, 140, 255, 0.28);
+}
+
 div[class*="st-key-gallery_thumbnail_slot_"] {
     position: relative !important;
     width: 100% !important;
@@ -290,6 +296,95 @@ div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stImage"] img {
 div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"] {
     margin: 0 !important;
     padding: 0 !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]
+[data-testid="stElementContainer"][class*="st-key-gallery_select_"] {
+    position: absolute !important;
+    z-index: 3 !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]
+[data-testid="stElementContainer"][class*="st-key-gallery_select_"] [data-testid="stButton"] {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]
+[data-testid="stElementContainer"][class*="st-key-gallery_select_"] [data-testid="stTooltipHoverTarget"] {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block !important;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]
+[data-testid="stElementContainer"][class*="st-key-gallery_select_"] button {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    border-radius: inherit !important;
+    color: transparent !important;
+    background: transparent !important;
+    font-size: 0 !important;
+    cursor: pointer !important;
+    transition: background-color 160ms ease, box-shadow 160ms ease;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_select_"] button:focus-visible {
+    outline: 3px solid #80b7ff !important;
+    outline-offset: -4px !important;
+    box-shadow: inset 0 0 0 3px rgba(25, 95, 205, 0.45) !important;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"] [data-testid="stElementContainer"]:has(.mpt-gallery-select-indicator) {
+    position: absolute !important;
+    z-index: 4 !important;
+    inset: 0 !important;
+    pointer-events: none !important;
+}
+
+.mpt-gallery-select-indicator {
+    position: absolute;
+    top: 0.45rem;
+    right: 0.45rem;
+    display: grid;
+    place-items: center;
+    width: 1.65rem;
+    height: 1.65rem;
+    border: 2px solid rgba(255, 255, 255, 0.95);
+    border-radius: 50%;
+    color: white;
+    background: rgba(15, 22, 35, 0.42);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+    font-size: 0.9rem;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.mpt-gallery-select-indicator.is-selected {
+    border-color: #3185ff;
+    background: #3185ff;
+    font-weight: 800;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]:has(.mpt-gallery-select-indicator.is-selected) [data-testid="stImage"] img {
+    filter: brightness(0.84);
+    transition: filter 160ms ease;
+}
+
+div[class*="st-key-gallery_thumbnail_slot_"]:has(.mpt-gallery-select-indicator) .mpt-gallery-duration {
+    pointer-events: none !important;
 }
 
 div[class*="st-key-gallery_thumbnail_slot_"] [class*="st-key-gallery_play_"] {

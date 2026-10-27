@@ -4,7 +4,74 @@ from unittest.mock import patch
 import pytest
 
 from app.models.schema import MaterialInfo
-from app.services import animated_explainer
+from app.services import animated_explainer, emotion_storyboard, material, scene_spec
+
+
+def test_visual_timeline_uses_audio_duration_when_only_sentence_cues_exist():
+    narration = "Greenland और Iceland के बीच पानी बहता है। नाम Denmark Strait है।"
+    beats = emotion_storyboard.build(narration)
+    scheduled, word_cues = animated_explainer._visual_timeline(
+        beats, [(0.0, 5.0, narration)], narration, 12.0, 2.0,
+    )
+
+    assert len(scheduled) == len(beats) == 2
+    assert word_cues == []
+    assert scheduled[0]["start"] == 2.0
+    assert scheduled[-1]["end"] == 14.0
+    assert all(item["timing_source"] == "estimated_visual_schedule" for item in scheduled)
+
+
+def test_visual_timeline_keeps_measured_word_cues_and_branding_offset():
+    narration = "एक दो। तीन चार।"
+    beats = emotion_storyboard.build(narration)
+    scheduled, word_cues = animated_explainer._visual_timeline(
+        beats,
+        [(0.0, .3, "एक"), (.3, .6, "दो।"), (.6, .9, "तीन"), (.9, 1.2, "चार।")],
+        narration, 1.2, 1.0,
+    )
+
+    assert scheduled[0]["start"] == 1.0
+    assert scheduled[-1]["end"] == 2.2
+    assert all(item["timing_source"] == "measured_word_alignment" for item in scheduled)
+    assert len(word_cues) == 4
+
+
+def test_mixed_language_storyboard_limits_stock_queries_without_word_cues(tmp_path, monkeypatch):
+    narration = (
+        "अबे ये साला समंदर है या साइंस की कोई चूतियागिरी?! "
+        "दुनिया का सबसे बड़ा झरना जमीन पर नहीं, समंदर के अंदर छिपा है! "
+        "अब सवाल ये है, पानी के अंदर पानी गिर कैसे रहा है? "
+        "भाई, असली खेल है तापमान और डेंसिटी का! "
+        "ठंडा पानी ज्यादा भारी यानी घना होता है, इसलिए गर्म पानी के नीचे डूबने लगता है। "
+        "Greenland और Iceland के बीच यही ठंडा पानी समुद्र की गहरी ढलान से नीचे बहता है! "
+        "और ये ढलान करीब साढ़े तीन किलोमीटर की है! "
+        "नाम है Denmark Strait Cataract! "
+        "ऊपर समंदर बिल्कुल नॉर्मल दिखता है, और नीचे इतना बड़ा कांड चल रहा है! "
+        "साला प्रकृति भी गजब की इंजीनियर निकली!"
+    )
+    terms = [
+        "deep ocean", "underwater waterfall", "ocean currents", "temperature gradient",
+        "cold water sinking", "Greenland sea", "underwater canyon", "Denmark Strait",
+        "ocean surface", "nature landscape",
+    ]
+    beats = emotion_storyboard.build(narration)
+    scheduled, cues = animated_explainer._visual_timeline(beats, [], narration, 50.0, 0.0)
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(tmp_path))
+    monkeypatch.setattr(animated_explainer, "_cached_stock_candidates", lambda *_args: [])
+    monkeypatch.setattr(
+        animated_explainer, "_search_and_cache_stock_candidate",
+        lambda *_args, **_kwargs: [],
+    )
+    resolved, segments = animated_explainer.resolve_storyboard_media(
+        "mixed-storyboard", scheduled, provider="pexels", stock_terms=terms,
+    )
+
+    assert cues == []
+    assert len(resolved) == len(beats) == len(terms) == 10
+    assert segments == []
+    report = json.loads((tmp_path / "top-panel-storyboard.json").read_text(encoding="utf-8"))
+    assert 1 <= len({entry["query"] for entry in report}) <= 3
+    assert all(entry["timing_source"] == "estimated_visual_schedule" for entry in report)
 
 
 class RecordingDraw:
@@ -17,19 +84,15 @@ class RecordingDraw:
         return record
 
 
-def test_village_city_comparison_uses_distinct_house_tree_and_skyline_art():
-    draw = RecordingDraw()
-    with patch.object(animated_explainer, "_font", return_value=object()):
-        animated_explainer._draw_topic_scene(
-            draw, "unused-font", {"text": "गाँव और शहर का अंतर", "top_visual": "topic_diagram"},
-            phase=0.25, topic="Village vs City",
-        )
-
-    names = [call[0] for call in draw.calls]
-    texts = [call[1][1] for call in draw.calls if call[0] == "text"]
-    assert "polygon" in names
-    assert names.count("rectangle") >= 10
-    assert "गाँव" in texts and "शहर" in texts
+def test_comparison_scene_uses_validated_labels_without_a_topic_branch():
+    from PIL import Image, ImageChops, ImageDraw
+    scene = scene_spec.plan_scene("गाँव बनाम शहर।")
+    assert scene.primitive == "comparison"
+    assert scene.labels == ["गाँव", "शहर"]
+    canvas = Image.new("RGB", (1080, 900), "white")
+    animated_explainer._draw_scene_spec(
+        ImageDraw.Draw(canvas), animated_explainer._font_path(), scene, .5)
+    assert ImageChops.difference(canvas, Image.new("RGB", canvas.size, "white")).getbbox()
 
 
 def test_client_server_beats_render_distinct_contextual_scenes():
@@ -88,6 +151,10 @@ def test_unapproved_stock_uses_fallback_unless_preview_is_explicit(tmp_path, mon
     monkeypatch.setattr(animated_explainer, "_search_and_cache_stock_candidate", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(animated_explainer.visual_review, "human_approval", lambda *_args: None)
     monkeypatch.setattr(animated_explainer.visual_review, "sample_clip", lambda *_a, **_k: {})
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 10, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "abc123")
     monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(tmp_path))
     beats = [{
         "beat_id": "beat_01", "start": 1.0, "end": 4.0,
@@ -132,6 +199,91 @@ def test_savage_stock_search_uses_editable_keyword(tmp_path, monkeypatch):
     assert not segments
 
 
+def test_savage_stock_never_substitutes_selected_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(tmp_path))
+    monkeypatch.setattr(animated_explainer, "_cached_stock_candidates", lambda *_args: [])
+    searched = []
+    pexels_candidate = {
+        "provider": "pexels", "asset_id": "pexels-1",
+        "source_page": "https://www.pexels.com/video/pexels-1/",
+        "license": "Pexels License", "license_url": "https://www.pexels.com/license/",
+        "url": "https://cdn.pexels.com/pexels-1.mp4", "path": str(tmp_path / "pexels-1.mp4"),
+        "sha256": "a" * 64, "duration": 6, "width": 1920, "height": 1080,
+        "codec": "h264", "tags": ["school", "teacher"], "relevance_score": 2,
+        "human_approval": {"reviewer": "test", "reason": "Relevant school footage approved."},
+        "prepared_path": str(tmp_path / "prepared-pexels-1.mp4"),
+    }
+
+    def search(_query, provider, _task, **_kwargs):
+        searched.append(provider)
+        return [pexels_candidate] if provider == "pexels" else []
+
+    monkeypatch.setattr(animated_explainer, "_search_and_cache_stock_candidate", search)
+    beats, segments = animated_explainer.resolve_storyboard_media(
+        "test-task", [{
+            "beat_id": "beat_01", "start": 0.0, "end": 4.0,
+            "visual_mode": "illustration", "top_visual": "topic_diagram",
+        }], provider="pixabay", stock_terms=["school teacher"],
+    )
+
+    assert searched == ["pixabay"]
+    assert segments == []
+    assert beats[0]["effective_media_type"] == "illustration"
+
+
+def test_explicit_stock_sources_are_exclusive_and_auto_uses_configured_order(monkeypatch):
+    monkeypatch.setitem(material.config.app, "stock_video_provider_order",
+                        ["coverr", "pexels", "pixabay"])
+    monkeypatch.setattr(material, "stock_video_provider_configured", lambda provider: provider != "pixabay")
+    assert material.stock_video_provider_order("pexels") == ["pexels"]
+    assert material.stock_video_provider_order("pixabay") == ["pixabay"]
+    assert material.stock_video_provider_order("coverr") == ["coverr"]
+    assert material.stock_video_provider_order("auto") == ["coverr", "pexels"]
+
+
+def test_transformation_storyboard_uses_few_stock_queries_and_generic_primitive(tmp_path, monkeypatch):
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(tmp_path))
+    monkeypatch.setattr(animated_explainer, "_cached_stock_candidates", lambda *_args: [])
+    searched = []
+    monkeypatch.setattr(animated_explainer, "_search_and_cache_stock_candidate",
+                        lambda query, provider, _task, **_kwargs: searched.append((query, provider)) or [])
+    narration = ("अबे ये साली जेलीफ़िश है या ज़िंदगी का रीस्टार्ट बटन?! "
+                 "इंसान बूढ़ा होता है। नाम है इम्मॉर्टल जेलीफ़िश! "
+                 "जब इसे चोट लगती है तो ये वापस अपनी शुरुआती अवस्था में पहुंच सकती है! "
+                 "और फिर उसी अवस्था से नई जेलीफ़िश विकसित हो सकती हैं! "
+                 "लेकिन रुक भाई, इसे मछली खा जाए तो गेम ओवर!")
+    beats = emotion_storyboard.schedule_visuals_from_duration(
+        emotion_storyboard.build(narration), 20)
+    resolved, segments = animated_explainer.resolve_storyboard_media(
+        "jellyfish", beats, provider="pexels",
+        stock_terms=["irrelevant"] * len(beats),
+    )
+    assert not segments
+    assert all(provider == "pexels" for _, provider in searched)
+    assert len(set(query for query, _ in searched)) <= 3
+    assert sum(beat["scene_spec"]["primitive"] == "transformation" for beat in resolved) >= 2
+    assert all(beat["top_visual"] == "scene_spec_v1" for beat in resolved)
+    assert all(beat["scene_spec"]["illustrative"] for beat in resolved)
+
+
+def test_sentence_captions_preserve_phrase_timing_and_render_inside_panel():
+    from PIL import Image, ImageChops
+    script = "जेलीफ़िश फिर शुरू होती है।"
+    groups = animated_explainer._sentence_groups(
+        [(0.2, 1.4, script)], script, 1.6, 2.0)
+    assert groups == [{"start": 2.2, "end": 3.4, "sentence": script}]
+    beat = {**emotion_storyboard.build("नाम है इम्मॉर्टल जेलीफ़िश!")[0],
+            "start": 2.0, "end": 3.6}
+    with_caption = Image.fromarray(animated_explainer._draw_frame(
+        "जेलीफ़िश", 4.0, 2.5, groups, [beat]))
+    without_caption = Image.fromarray(animated_explainer._draw_frame(
+        "जेलीफ़िश", 4.0, 2.5, [], [beat]))
+    assert ImageChops.difference(
+        with_caption.crop((60, 850, 1020, 1050)),
+        without_caption.crop((60, 850, 1020, 1050)),
+    ).getbbox() is not None
+
+
 def test_savage_applies_keywords_to_multiple_story_beats(tmp_path, monkeypatch):
     task_dir = tmp_path / "task"
     task_dir.mkdir()
@@ -161,6 +313,159 @@ def test_savage_applies_keywords_to_multiple_story_beats(tmp_path, monkeypatch):
     assert all(item["visual_mode"] == "stock_video" for item in resolved)
 
 
+def test_saved_keyword_can_select_stock_for_transformation_beat(tmp_path, monkeypatch):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
+    attempts = _patch_real_stock_selection(
+        monkeypatch, tmp_path,
+        {"cloud formation": _stock_candidates("cloud formation", ["cloud-clip"])},
+    )
+    beat = {
+        "beat_id": "beat_01", "start": 0.0, "end": 4.0,
+        "scene_spec": scene_spec.plan_scene(
+            "Cloud formation then rain", index=0, total=1,
+        ).model_dump(),
+        "visual_mode": "illustration", "stock_query": None,
+        "short_visual_title": "Cloud formation", "visual_rationale": "Saved keyword match.",
+    }
+
+    resolved, segments = animated_explainer.resolve_storyboard_media(
+        "test-task", [beat], provider="pexels", stock_terms=["cloud formation"],
+        stock_media_policy="manual_review",
+    )
+
+    assert attempts == ["https://cdn.pexels.com/cloud-clip.mp4"]
+    assert resolved[0]["scene_spec"]["stock_query"] == "cloud formation"
+    assert resolved[0]["effective_media_type"] == "stock_video"
+    assert len(segments) == 1
+    assert segments[0]["provider"] == "pexels"
+    assert segments[0]["approved"] is True
+
+
+def test_stock_eligibility_requires_visual_review_and_landscape_format(monkeypatch):
+    candidate = {
+        "provider": "pexels", "asset_id": "clip", "source_page": "https://pexels.com/video/clip/",
+        "license": "Pexels License", "path": "/tmp/clip.mp4", "sha256": "digest",
+    }
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 4, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "digest")
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval", lambda *_args: None)
+    monkeypatch.setattr(animated_explainer.visual_review, "cached_auto_relevance", lambda *_args: None)
+    monkeypatch.setattr(animated_explainer.visual_review, "record_auto_relevance",
+                        lambda *_args, **_kwargs: None)
+
+    eligible, reason, _approval = animated_explainer._stock_eligibility(
+        candidate, required_seconds=3, policy="auto_eligible",
+    )
+    assert (eligible, reason) == (False, "automatic_relevance_unverified")
+
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 4, "width": 1080, "height": 1920, "codec": "h264",
+    })
+    eligible, reason, _approval = animated_explainer._stock_eligibility(
+        candidate, required_seconds=3, policy="manual_review",
+    )
+    assert (eligible, reason) == (False, "not_sufficient_resolution_landscape")
+
+
+def test_automatic_stock_uses_cached_hash_and_query_decision_without_human_approval(
+    tmp_path, monkeypatch,
+):
+    digest = "a" * 64
+    candidate = {
+        "provider": "pexels", "asset_id": "clip", "source_page": "https://pexels.com/video/clip/",
+        "license": "Pexels License", "path": "/tmp/clip.mp4", "sha256": digest,
+    }
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 4, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: digest)
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
+                        lambda *_args: pytest.fail("automatic mode must not use human approval"))
+    registry = tmp_path / "auto-relevance.json"
+    monkeypatch.setattr(animated_explainer.visual_review, "_auto_relevance_path",
+                        lambda: registry)
+    animated_explainer.visual_review.record_auto_relevance(
+        digest, "jellyfish drifting", "relevant", verifier="local_vision",
+        model="test-local-vision", score=.93,
+        reason="Frames visibly contain jellyfish moving underwater.",
+    )
+
+    eligible, reason, evidence = animated_explainer._stock_eligibility(
+        candidate, required_seconds=3, policy="auto_eligible", query="jellyfish drifting",
+    )
+    assert eligible is True
+    assert reason == "local_vision_relevance_passed"
+    assert evidence["score"] == .93
+    assert animated_explainer.visual_review.cached_auto_relevance(
+        digest, "different query"
+    ) is None
+
+
+def test_automatic_candidate_download_path_never_checks_human_approval(tmp_path, monkeypatch):
+    item = MaterialInfo(
+        provider="pexels", url="https://videos.pexels.com/automatic.mp4", duration=8,
+        source_info={
+            "provider": "pexels", "asset_id": "auto-clip",
+            "source_page": "https://www.pexels.com/video/auto-clip/",
+            "license": "Pexels License", "title": "jellyfish underwater",
+            "tags": ["jellyfish"],
+        },
+    )
+    monkeypatch.setattr(animated_explainer.utils, "storage_dir",
+                        lambda name="": str(tmp_path / name))
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured",
+                        lambda _provider: True)
+    monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache",
+                        lambda **_kwargs: [item])
+    monkeypatch.setattr(animated_explainer.material, "_save_material_item",
+                        lambda *_args: str(tmp_path / "automatic.mp4"))
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 8, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest",
+                        lambda _path: "c" * 64)
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
+                        lambda *_args: pytest.fail("automatic search path must not call human approval"))
+    monkeypatch.setattr(animated_explainer.visual_review,
+                        "local_vision_verifier_available", lambda: True)
+
+    found = animated_explainer._search_and_cache_stock_candidate(
+        "jellyfish", "pexels", "auto-clip-test", stock_media_policy="auto_eligible",
+    )
+
+    assert len(found) == 1
+    assert "human_approval" not in found[0]
+
+
+def test_automatic_without_local_vision_does_not_download_uncertain_results(monkeypatch):
+    item = MaterialInfo(
+        provider="pexels", url="https://videos.pexels.com/uncertain.mp4", duration=8,
+        source_info={
+            "provider": "pexels", "asset_id": "uncertain",
+            "source_page": "https://www.pexels.com/video/uncertain/",
+            "license": "Pexels License", "title": "jellyfish",
+        },
+    )
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured",
+                        lambda _provider: True)
+    monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache",
+                        lambda **_kwargs: [item])
+    monkeypatch.setattr(animated_explainer.visual_review,
+                        "local_vision_verifier_available", lambda: False)
+    monkeypatch.setattr(animated_explainer.material, "_save_material_item",
+                        lambda *_args: pytest.fail("uncertain search result must not be downloaded"))
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
+                        lambda *_args: pytest.fail("automatic mode must not call human approval"))
+
+    assert animated_explainer._search_and_cache_stock_candidate(
+        "jellyfish", "pexels", "auto-no-vision", stock_media_policy="auto_eligible",
+    ) == []
+
+
 def test_stock_candidate_search_downloads_only_the_required_clip_count(tmp_path, monkeypatch):
     task_dir = tmp_path / "task"
     task_dir.mkdir()
@@ -176,11 +481,17 @@ def test_stock_candidate_search_downloads_only_the_required_clip_count(tmp_path,
         for index in range(5)
     ]
     saved = []
+    save_directories = []
+    monkeypatch.setattr(animated_explainer.utils, "storage_dir",
+                        lambda name="": str(tmp_path / "persistent-storage" / name))
     monkeypatch.setattr(animated_explainer.material, "get_api_key", lambda _name: "test")
     monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache", lambda **_kwargs: candidates)
     monkeypatch.setattr(
         animated_explainer.material, "_save_material_item",
-        lambda item, _directory: saved.append(item) or str(tmp_path / f"{item.source_info['asset_id']}.mp4"),
+        lambda item, directory: (
+            saved.append(item), save_directories.append(directory),
+            str(tmp_path / f"{item.source_info['asset_id']}.mp4"),
+        )[-1],
     )
     monkeypatch.setattr(
         animated_explainer, "_probe_video",
@@ -196,6 +507,70 @@ def test_stock_candidate_search_downloads_only_the_required_clip_count(tmp_path,
     )
     assert len(saved) == 3
     assert len(results) == 3
+    assert save_directories == [str(tmp_path / "persistent-storage" / "cache_videos")] * 3
+
+
+def test_portrait_search_rendition_is_rejected_before_download(monkeypatch):
+    item = MaterialInfo(
+        provider="pexels", url="https://videos.pexels.com/portrait.mp4", duration=8,
+        source_info={
+            "provider": "pexels", "asset_id": "portrait", "license": "Pexels License",
+            "source_page": "https://www.pexels.com/video/portrait/",
+            "title": "jellyfish", "rendition": {"width": 1080, "height": 1920},
+        },
+    )
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured",
+                        lambda _provider: True)
+    monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache",
+                        lambda **_kwargs: [item])
+    downloads = []
+    monkeypatch.setattr(animated_explainer.material, "_save_material_item",
+                        lambda *args: downloads.append(args) or "/tmp/should-not-download.mp4")
+
+    assert animated_explainer._search_and_cache_stock_candidate(
+        "jellyfish", "pexels", "portrait-check",
+    ) == []
+    assert downloads == []
+
+
+def test_pexels_provider_ranked_result_survives_sparse_metadata(tmp_path, monkeypatch):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
+    candidate = MaterialInfo(
+        provider="pexels", url="https://cdn.pexels.com/clip.mp4", duration=8,
+        source_info={"provider": "pexels", "asset_id": "clip-1", "license": "Pexels License"},
+    )
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured", lambda _provider: True)
+    monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache", lambda **_kwargs: [candidate])
+    monkeypatch.setattr(animated_explainer.material, "_save_material_item", lambda *_args: str(tmp_path / "clip.mp4"))
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 8, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "digest")
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval", lambda *_args: None)
+    monkeypatch.setattr(animated_explainer.visual_review, "sample_clip", lambda *_a, **_k: {})
+
+    results = animated_explainer._search_and_cache_stock_candidate(
+        "underwater waterfall", "pexels", "test-task",
+    )
+
+    assert len(results) == 1
+    assert results[0]["relevance_score"] == 1
+
+
+def test_unconfigured_stock_fallback_is_skipped_without_provider_search(monkeypatch):
+    searched = []
+    monkeypatch.setattr(
+        animated_explainer.material, "_search_videos_with_cache",
+        lambda **kwargs: searched.append(kwargs) or [],
+    )
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured", lambda _provider: False)
+
+    assert animated_explainer._search_and_cache_stock_candidate(
+        "underwater waterfall", "pixabay", "test-task",
+    ) == []
+    assert not searched
 
 
 def test_stock_download_failure_tries_a_replacement_for_the_same_keyword(tmp_path, monkeypatch):
@@ -468,29 +843,31 @@ def test_short_stock_keyword_list_is_rejected_not_spread_across_beats(tmp_path, 
 def test_single_word_cached_keyword_reuses_relevant_asset_and_ignores_unrelated(tmp_path, monkeypatch):
     import hashlib
 
-    cache_dir = tmp_path / "search-cache"
     video_dir = tmp_path / "video-cache"
-    cache_dir.mkdir()
     video_dir.mkdir()
     url = "https://cdn.pexels.com/cached-eggs.mp4"
     cached_video = video_dir / f"vid-{hashlib.md5(url.encode()).hexdigest()}.mp4"
     cached_video.write_bytes(b"offline fixture")
-    (cache_dir / "results.json").write_text(json.dumps({"items": [
-        {"url": url, "duration": 8, "source_info": {
-            "provider": "pexels", "asset_id": "cached-eggs", "title": "eggs cooking",
-            "description": "fresh eggs in a pan", "source_page": "https://pexels.com/video/eggs/",
-            "license": "Pexels License", "tags": [],
-        }},
-        {"url": "https://cdn.pexels.com/legs.mp4", "duration": 8, "source_info": {
-            "provider": "pexels", "asset_id": "legs", "title": "legs running",
-            "description": "runner training", "source_page": "https://pexels.com/video/legs/",
-            "license": "Pexels License", "tags": [],
-        }},
-    ]}), encoding="utf-8")
+    unrelated_url = "https://cdn.pexels.com/legs.mp4"
+    unrelated_video = video_dir / f"vid-{hashlib.md5(unrelated_url.encode()).hexdigest()}.mp4"
+    unrelated_video.write_bytes(b"offline fixture")
+    cache_items = [
+        MaterialInfo(provider="pexels", url=url, duration=8, source_info={
+            "provider": "pexels", "asset_id": "cached-eggs", "search_term": "eggs",
+            "source_page": "https://pexels.com/video/eggs/", "license": "Pexels License",
+        }),
+        MaterialInfo(provider="pexels", url=unrelated_url, duration=8, source_info={
+            "provider": "pexels", "asset_id": "legs", "search_term": "eggs",
+            "source_page": "https://pexels.com/video/legs/", "license": "Pexels License",
+        }),
+    ]
     monkeypatch.setattr(
         animated_explainer.utils, "storage_dir",
-        lambda name="": str(cache_dir if name == "cache_material_search" else video_dir),
+        lambda name="": str(video_dir),
     )
+    monkeypatch.setattr(animated_explainer.material.material_cache,
+                        "load_material_search_cache",
+                        lambda **kwargs: cache_items if kwargs["search_term"] == "eggs" else None)
     task_dir = tmp_path / "task"
     task_dir.mkdir()
     monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
@@ -498,10 +875,11 @@ def test_single_word_cached_keyword_reuses_relevant_asset_and_ignores_unrelated(
         "duration": 8, "width": 1920, "height": 1080, "codec": "h264",
     })
     monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "cached-digest")
-    monkeypatch.setattr(
-        animated_explainer.visual_review, "human_approval",
-        lambda *_args: {"reviewer": "offline-test", "reason": "approved"},
-    )
+    monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
+                        lambda asset_id, *_args: (
+                            {"reviewer": "offline-test", "reason": "Approved visible egg footage."}
+                            if asset_id == "cached-eggs" else None
+                        ))
     monkeypatch.setattr(animated_explainer, "_prepare_stock_candidate", lambda *_args: str(cached_video))
     searched = []
     monkeypatch.setattr(
@@ -515,7 +893,7 @@ def test_single_word_cached_keyword_reuses_relevant_asset_and_ignores_unrelated(
         "test-task", [beat], provider="pexels", stock_terms=["eggs"],
     )
 
-    assert [item["asset_id"] for item in cached] == ["cached-eggs"]
+    assert [item["asset_id"] for item in cached] == ["cached-eggs", "legs"]
     assert not searched
     assert [segment["asset_id"] for segment in segments] == ["cached-eggs"]
 
@@ -544,7 +922,13 @@ def test_success_cleanup_removes_task_stock_files_but_keeps_source_metadata(tmp_
     stock_file.write_bytes(b"video")
     report = [{"asset_id": "pexels-1", "local_path": str(stock_file), "license": "Pexels License"}]
     (task_dir / "top-panel-storyboard.json").write_text(json.dumps(report), encoding="utf-8")
+    shared_cache = tmp_path / "shared-cache"
+    shared_cache.mkdir()
+    cached_source = shared_cache / "vid-shared.mp4"
+    cached_source.write_bytes(b"persistent video cache")
     monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
+    monkeypatch.setattr(animated_explainer.utils, "storage_dir",
+                        lambda _name="": str(shared_cache))
 
     removed = animated_explainer.cleanup_stock_media("test-task")
 
@@ -555,3 +939,24 @@ def test_success_cleanup_removes_task_stock_files_but_keeps_source_metadata(tmp_
     assert saved[0]["license"] == "Pexels License"
     assert saved[0]["local_path"] is None
     assert saved[0]["local_media_removed"] is True
+    assert cached_source.is_file()
+
+
+def test_success_cleanup_preserves_shared_stock_source_path(tmp_path, monkeypatch):
+    task_dir = tmp_path / "task"
+    media_dir = task_dir / "top-panel-media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "prepared-panel.mp4").write_bytes(b"prepared")
+    shared = tmp_path / "cache_videos" / "shared-source.mp4"
+    shared.parent.mkdir()
+    shared.write_bytes(b"shared source")
+    report_path = task_dir / "top-panel-storyboard.json"
+    report_path.write_text(json.dumps([{"asset_id": "pexels-1", "local_path": str(shared)}]))
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
+
+    animated_explainer.cleanup_stock_media("task")
+
+    saved = json.loads(report_path.read_text())
+    assert saved[0]["local_path"] == str(shared)
+    assert saved[0]["shared_cache_retained"] is True
+    assert shared.is_file()

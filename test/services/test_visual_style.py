@@ -13,7 +13,7 @@ class TestVisualStyle(unittest.TestCase):
         self.assertEqual(mode, visual_style.SAVAGE_ANIMATED_EXPLAINER)
         self.assertIn("local no-stock fallback", reason)
 
-    def test_auto_prefers_contextual_butterfly_stock(self):
+    def test_auto_prefers_stock_for_a_presented_subject_without_fixed_queries(self):
         mode, reason = visual_style.initial_selection(
             visual_style.AUTO,
             "तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।",
@@ -21,12 +21,8 @@ class TestVisualStyle(unittest.TestCase):
         )
         self.assertEqual(mode, visual_style.RELEVANT_STOCK)
         self.assertIn("directly illustrative real-world footage", reason)
-        self.assertEqual(
-            visual_style.relevant_search_terms(
-                "तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।", "Butterfly thermoregulation"
-            )[0],
-            "butterfly basking in sunlight",
-        )
+        self.assertTrue(visual_style.has_direct_visual_opportunity(
+            "तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।", "Butterfly thermoregulation"))
 
     def test_auto_rejects_low_quality_jelly_and_reports_asmr_fallback(self):
         # Ordinary jelly metadata is not an approved ASMR review; no coverage means

@@ -1,4 +1,5 @@
 import unittest
+import json
 import os
 import shutil
 import sys
@@ -30,10 +31,119 @@ class TestTaskService(unittest.TestCase):
         # 影响后续恢复测试，同时不会触碰真正线程池中的生产任务。
         with tm._cross_post_registry_lock:
             tm._cross_post_futures.clear()
+        self.social_metadata_patcher = patch.object(
+            tm.llm, "generate_social_metadata",
+            return_value={
+                "title": "A Curious Coffee Fact",
+                "caption": "Why does coffee smell amazing? ☕🤔\nIt releases fragrant oils! ✨🔬",
+                "hashtags": ["#Coffee", "#Science", "#Aroma", "#Facts", "#Shorts"],
+            },
+        )
+        self.social_metadata_patcher.start()
+        self.addCleanup(self.social_metadata_patcher.stop)
 
     def tearDown(self):
         with tm._cross_post_registry_lock:
             tm._cross_post_futures.clear()
+
+    def test_saved_savage_task_persists_effective_stock_media_policy(self):
+        params = VideoParams(
+            video_subject="Test stock policy",
+            visual_style="savage_animated_explainer",
+            effective_visual_style="savage_animated_explainer",
+            stock_media_policy="auto_eligible",
+        )
+        with patch.object(tm.task_artifacts, "write_script_data") as save:
+            tm.save_script_data("stock-policy-task", "एक छोटा परीक्षण।", ["test scene"], params)
+
+        saved = save.call_args.args[1]
+        self.assertEqual(saved["stock_media_policy"], "auto_eligible")
+        self.assertEqual(saved["params"].stock_media_policy, "auto_eligible")
+
+    def test_saved_savage_task_uses_manual_review_when_config_is_unset(self):
+        params = VideoParams(
+            video_subject="Test stock policy default",
+            visual_style="savage_animated_explainer",
+            effective_visual_style="savage_animated_explainer",
+        )
+        with patch.dict(tm.config.app, {"stock_media_policy": "manual_review"}), \
+                patch.object(tm.task_artifacts, "write_script_data") as save:
+            tm.save_script_data("stock-policy-default", "एक छोटा परीक्षण।", ["test scene"], params)
+
+        self.assertEqual(save.call_args.args[1]["stock_media_policy"], "manual_review")
+
+    def test_branding_subtitles_survive_unavailable_narration_captions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "subtitle-with-branding.srt"
+            intro = "1\n00:00:00,000 --> 00:00:01,000\nWelcome!\n"
+            outro = "1\n00:00:09,000 --> 00:00:10,000\nFollow for more!\n"
+
+            self.assertTrue(tm._write_merged_subtitles([intro, outro], str(output)))
+
+            saved = output.read_text(encoding="utf-8")
+            self.assertIn("1\n00:00:00,000 --> 00:00:01,000\nWelcome!", saved)
+            self.assertIn("2\n00:00:09,000 --> 00:00:10,000\nFollow for more!", saved)
+
+    def test_completed_video_metadata_is_generated_per_output_with_voice_branding_context(self):
+        import json
+
+        params = VideoParams(
+            video_subject="Coffee aroma",
+            voice_name="gemini:Puck-Upbeat",
+            narrator_preset="standard",
+            profanity_level="mild",
+            channel_branding={
+                "intro": {"enabled": True, "text": "Welcome to Coffee Facts.",
+                          "audio": {"asset_key": "private-intro-key"}},
+                "outro": {"enabled": True, "text": "Follow for more.", "audio": {}},
+            },
+        )
+        with patch.object(tm.llm, "generate_social_metadata", return_value={
+            "title": "Why Coffee Smells Good",
+            "caption": "Why does coffee smell amazing? ☕🤔\nIt releases fragrant oils! ✨🔬",
+            "hashtags": ["#Coffee", "#Science", "#Aroma", "#Facts", "#Shorts"],
+        }) as generate:
+            records = tm._generate_completed_video_youtube_metadata(
+                "caption-per-video", params, "Final spoken narration.",
+                ["final-1.mp4", "final-2.mp4"],
+            )
+
+        self.assertEqual([item["video_index"] for item in records], [1, 2])
+        self.assertEqual([item["video_name"] for item in records], ["final-1.mp4", "final-2.mp4"])
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args.kwargs["language"], "English")
+        context = json.loads(generate.call_args.kwargs["channel_context"])
+        self.assertEqual(context["voice_name"], "gemini:Puck-Upbeat")
+        self.assertEqual(context["intro"]["text"], "Welcome to Coffee Facts.")
+        self.assertTrue(context["intro"]["audio_present"])
+        self.assertNotIn("private-intro-key", generate.call_args.kwargs["channel_context"])
+        self.assertIn("Channel intro: Welcome to Coffee Facts.", generate.call_args.kwargs["video_script"])
+        self.assertIn("Final narration: Final spoken narration.", generate.call_args.kwargs["video_script"])
+        self.assertIn("Channel outro: Follow for more.", generate.call_args.kwargs["video_script"])
+
+    def test_hindi_narration_uses_hindi_for_completed_video_metadata(self):
+        params = VideoParams(video_subject="जेलीफ़िश", video_language="hi")
+        with patch.object(tm.llm, "generate_social_metadata", return_value={
+            "title": "जेलीफ़िश", "caption": "जेलीफ़िश", "hashtags": []
+        }) as generate:
+            tm._generate_completed_video_youtube_metadata(
+                "hindi-metadata", params, "जेलीफ़िश फिर शुरू होती है।", ["final.mp4"])
+        self.assertEqual(generate.call_args.kwargs["language"], "Hindi")
+        self.assertEqual(json.loads(generate.call_args.kwargs["channel_context"])["caption_language"], "Hindi")
+
+    def test_caption_source_keeps_optional_branding_out_of_canonical_narration(self):
+        params = VideoParams(
+            video_subject="Optional branding",
+            channel_branding={
+                "intro": {"enabled": False, "text": "Disabled intro"},
+                "outro": {"enabled": False, "text": "Disabled outro"},
+            },
+        )
+        self.assertEqual(
+            tm._youtube_caption_source_for_params(params, "Final narration."),
+            "Final narration: Final narration.",
+        )
+        self.assertEqual(params.spoken_script, "")
 
     def test_is_task_busy_covers_generation_and_cross_posting(self):
         """删除入口必须同时识别视频生成和跨平台发布的活跃状态。"""
@@ -1694,12 +1804,13 @@ class TestTaskService(unittest.TestCase):
         ):
             result = tm.start("youtube-cross-post", params)
 
-        generate_metadata.assert_called_once_with(
-            video_subject="Coffee",
-            video_script="generated script",
-            language="en",
-            platform="youtube_shorts",
-        )
+        self.assertEqual(generate_metadata.call_count, 2)
+        for metadata_call in generate_metadata.call_args_list:
+            self.assertEqual(metadata_call.kwargs["video_subject"], "Coffee")
+            self.assertEqual(metadata_call.kwargs["video_script"], "generated script")
+            self.assertEqual(metadata_call.kwargs["language"], "English")
+            self.assertEqual(metadata_call.kwargs["platform"], "youtube_shorts")
+            self.assertIn("voice_name", metadata_call.kwargs["channel_context"])
         expected_extra = {
             "youtube_title": "Morning Coffee",
             "youtube_description": "A better morning.",

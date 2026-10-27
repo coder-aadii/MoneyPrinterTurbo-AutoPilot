@@ -34,6 +34,27 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
 
 
 class TestScriptPromptOptions(unittest.TestCase):
+    def test_generate_topic_preserves_sanitized_provider_error(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Error: gemini: API key rejected"
+        ):
+            result = llm.generate_topic(
+                niche="science", preferences=["space"], language="Hindi",
+            )
+
+        self.assertEqual(
+            result,
+            "Error: topic provider failed: gemini: API key rejected",
+        )
+
+    def test_generate_topic_reports_empty_provider_response(self):
+        with patch.object(llm, "_generate_response", return_value=""):
+            result = llm.generate_topic(
+                niche="science", preferences=["space"], language="Hindi",
+            )
+
+        self.assertEqual(result, "Error: configured provider returned empty topic text")
+
     def test_normalize_text_response_preserves_internal_newlines(self):
         """
         归一化只清理首尾空白，不能删除正文内部的换行。双换行用于区分脚本
@@ -2613,16 +2634,21 @@ class TestSocialMetadata(unittest.TestCase):
         self.assertIn("上海一日游", prompt)
         self.assertIn("array of exactly 5 strings", prompt)
 
-    def test_build_prompt_accepts_explicit_language(self):
+    def test_youtube_prompt_uses_english_even_when_narration_is_hindi(self):
         prompt = llm.build_social_metadata_prompt(
             video_subject="Coffee tips",
-            language="en-US",
+            language="hi",
             platform="youtube_shorts",
         )
 
         self.assertIn("YouTube Shorts", prompt)
-        self.assertIn('Write "title" and "caption" in this language: en-US', prompt)
-        self.assertIn("array of exactly 3 strings", prompt)
+        self.assertIn("Write the title and caption in clear, natural English, regardless of narration language.", prompt)
+        self.assertNotIn('Write "title" and "caption" in this language: hi', prompt)
+        self.assertIn("array of exactly 5 strings", prompt)
+        self.assertIn("clear, natural English", prompt)
+        self.assertIn("exactly two complete prose sentences", prompt)
+        self.assertIn("exactly three lines", prompt)
+        self.assertIn("Encode the two line breaks as `\\n` in JSON", prompt)
 
     def test_unknown_platform_falls_back_to_tiktok(self):
         prompt = llm.build_social_metadata_prompt(

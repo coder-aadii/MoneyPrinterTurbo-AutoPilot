@@ -229,12 +229,14 @@ def canonical_media_url(url: str) -> str:
 
 def rank_asmr_candidates(
     search_results: Iterable[tuple[str, Iterable[MaterialInfo]]],
+    *,
+    include_unreviewed: bool = False,
 ) -> list[tuple[str, MaterialInfo]]:
-    """Rank metadata-confirmed candidates and deduplicate IDs and canonical URLs."""
+    """Rank explicit material/action matches, optionally retaining clips for review."""
     scored = []
     for search_term, items in search_results:
         for item in items:
-            if not has_human_asmr_quality_approval(item):
+            if not include_unreviewed and not has_human_asmr_quality_approval(item):
                 continue
             score = score_asmr_candidate(item, search_term)
             if score > 0:

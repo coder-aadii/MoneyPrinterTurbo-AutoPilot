@@ -57,17 +57,18 @@ def _hindi_alignment_environment() -> dict[str, str]:
 
 
 def preflight_hindi_alignment_script(script: str, *, source_text: str | None = None) -> list[dict]:
-    """Check the exact canonical transcript against the configured CTC vocab."""
+    """Check Hindi alignment characters while allowing mixed-script Hinglish.
+
+    The Hindi CTC model cannot align Latin words. Those are left intact for TTS
+    and handled by the existing local Whisper subtitle fallback after alignment;
+    they must not prevent an otherwise valid Hindi/Hinglish video from rendering.
+    """
     normalized = unicodedata.normalize(
         "NFC", utils.normalize_script_for_subtitle_matching(script)
     )
     alignment_text = " ".join(
         token for token in normalized.split()
         if any(unicodedata.category(char)[0] in {"L", "N"} for char in token)
-    )
-    latin_tokens = re.findall(
-        r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*(?![A-Za-z0-9_])",
-        alignment_text,
     )
     errors = []
     if source_text is not None:
@@ -78,19 +79,6 @@ def preflight_hindi_alignment_script(script: str, *, source_text: str | None = N
             errors.append({
                 "code": "unsupported_alignment_symbol", "character": char,
                 "message": f"Unsupported alignment symbol {char!r}; spell out the intended speech.",
-            })
-    if latin_tokens:
-        for token in dict.fromkeys(latin_tokens):
-            if token.casefold() == "bc":
-                suggestion = (
-                    "replace it with the exact, unambiguous words you intend the narrator to say; "
-                    "the abbreviation is ambiguous and will not be expanded automatically"
-                )
-            else:
-                suggestion = "add a curated Devanagari pronunciation or spell the intended pronunciation"
-            errors.append({
-                "code": "unresolved_latin_token", "token": token,
-                "message": f"Unsupported Hindi alignment token {token!r}; {suggestion}.",
             })
     environment = _hindi_alignment_environment()
     model_path = Path(environment.get("MPT_HINDI_ALIGNMENT_MODEL", "")).expanduser()
@@ -111,7 +99,13 @@ def preflight_hindi_alignment_script(script: str, *, source_text: str | None = N
             ),
         })
     else:
-        missing = hindi_alignment_charset.missing_alignment_characters(alignment_text, dictionary)
+        latin_token_pattern = (
+            r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*(?![A-Za-z0-9_])"
+        )
+        hindi_alignment_text = re.sub(latin_token_pattern, " ", alignment_text)
+        missing = hindi_alignment_charset.missing_alignment_characters(
+            hindi_alignment_text, dictionary,
+        )
         if missing:
             errors.append({
                 "code": "unsupported_alignment_characters", "characters": missing,
@@ -143,6 +137,9 @@ def _ensure_model_loaded(*, local_only: bool = False) -> bool:
                 **({"local_files_only": True} if local_only else {}),
             )
         except Exception as e:
+            if local_only:
+                logger.warning("local Whisper subtitle fallback is unavailable: {}", e)
+                return False
             logger.error(
                 f"failed to load model: {e} \n\n"
                 f"********************************************\n"

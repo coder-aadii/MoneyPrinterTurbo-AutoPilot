@@ -11,6 +11,8 @@ import sys
 import tempfile
 import time
 import webbrowser
+import zipfile
+from io import BytesIO
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1576,6 +1578,13 @@ def _apply_restored_params(params):
     _set_stable_widget_value(
         "stock_video_style_select", params.get("stock_video_style") or "default"
     )
+    restored_stock_policy = (
+        params.get("stock_media_policy")
+        or config.app.get("stock_media_policy", "manual_review")
+    )
+    if restored_stock_policy not in {"manual_review", "auto_eligible"}:
+        restored_stock_policy = "manual_review"
+    _set_stable_widget_value("stock_media_policy_select", restored_stock_policy)
     _set_stable_widget_value(
         "visual_style_select",
         VISUAL_STYLE_LABELS.get(
@@ -2082,6 +2091,91 @@ def _render_generation_logs(task_id):
     st.code("\n".join(log_records))
 
 
+def _render_savage_stock_review(task_id):
+    """Show cached Savage clips and collect explicit, hash-bound human review."""
+    task_root = Path(utils.task_dir(task_id)).resolve()
+    report_path = task_root / "top-panel-storyboard.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    if not isinstance(report, list):
+        return
+    candidates = {}
+    for entry in report:
+        if (not isinstance(entry, dict)
+                or entry.get("provider") != "pexels"
+                or entry.get("approval_status") != "human_review_required"):
+            continue
+        asset_id, digest = str(entry.get("asset_id") or ""), str(entry.get("sha256") or "")
+        if asset_id and re.fullmatch(r"[0-9a-f]{64}", digest):
+            candidates.setdefault((asset_id, digest), entry)
+    if not candidates:
+        return
+    with st.expander("Pexels footage review", expanded=False):
+        st.caption(
+            "Review the actual cached clip, source, license, and sampled frames. "
+            "Approval is bound to this file's SHA-256 and does not change the already rendered video."
+        )
+        cache_root = Path(utils.storage_dir("cache_videos")).resolve()
+        for index, ((asset_id, digest), candidate) in enumerate(candidates.items()):
+            candidate_path = Path(str(candidate.get("local_path") or "")).resolve()
+            try:
+                path_is_cached = os.path.commonpath([str(cache_root), str(candidate_path)]) == str(cache_root)
+            except ValueError:
+                path_is_cached = False
+            if not path_is_cached or not candidate_path.is_file():
+                continue
+            try:
+                if visual_review.sha256(candidate_path) != digest:
+                    continue
+            except OSError:
+                continue
+            approval = visual_review.human_approval(asset_id, digest)
+            with st.container(border=True):
+                st.write(f"Pexels asset {asset_id} · {candidate.get('query') or 'saved keyword'}")
+                st.caption(
+                    f"License: {candidate.get('license') or 'unverified'} · "
+                    f"SHA-256: {digest} · "
+                    f"Status: {'approved' if approval else 'review required'}"
+                )
+                source_url = str(candidate.get("source_page") or "")
+                if source_url.startswith("https://www.pexels.com/"):
+                    st.link_button("Open Pexels source", source_url, key=f"stock_source_{task_id}_{asset_id}")
+                st.video(str(candidate_path))
+                frames = (candidate.get("visual_review") or {}).get("sampled_frames", [])
+                columns = st.columns(min(3, max(1, len(frames))))
+                for frame_index, frame in enumerate(frames):
+                    relative = str(frame.get("path") or "")
+                    frame_path = (task_root / relative).resolve()
+                    try:
+                        safe_frame = os.path.commonpath([str(task_root), str(frame_path)]) == str(task_root)
+                    except ValueError:
+                        safe_frame = False
+                    if safe_frame and frame_path.is_file():
+                        with columns[frame_index % len(columns)]:
+                            st.image(str(frame_path), caption=f"Sample {frame_index + 1} · {frame.get('timestamp_seconds')}s")
+                if approval:
+                    st.caption(f"Approved by {approval['reviewer']}: {approval['reason']}")
+                    continue
+                reviewer = st.text_input("Reviewer", key=f"stock_reviewer_{task_id}_{asset_id}")
+                reason = st.text_area(
+                    "Visible content and crop assessment",
+                    key=f"stock_reason_{task_id}_{asset_id}",
+                )
+                approve_col, reject_col = st.columns(2)
+                for column, status, label in (
+                    (approve_col, "approved", "Approve this clip"),
+                    (reject_col, "rejected", "Reject this clip"),
+                ):
+                    if column.button(label, key=f"stock_{status}_{task_id}_{asset_id}"):
+                        try:
+                            visual_review.record_human_review(asset_id, digest, status, reviewer, reason)
+                            st.success(f"Saved hash-bound review: {status}. Existing render is unchanged.")
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+
 def _render_generation_task_snapshot(task_id, task):
     """根据状态存储中的快照渲染进度、失败原因或最终成片。"""
     if not task:
@@ -2111,6 +2205,15 @@ def _render_generation_task_snapshot(task_id, task):
     elif policy == "off":
         st.info("Fact checking was turned off; claims in this narration are unverified.")
     quality = task.get("alignment_quality") or {}
+    subtitle_fallback = task.get("subtitle_alignment_fallback") or {}
+    if subtitle_fallback.get("effective_mode") == "none":
+        st.warning(
+            "This saved video has no subtitles: word alignment could not handle the narration, "
+            "and local transcription was unavailable. Saved intro/outro captions may still appear. "
+            "Configure a local Whisper model or add pronunciation overrides, then retry from saved audio."
+        )
+    elif subtitle_fallback.get("effective_mode") == "sentence":
+        st.info("Word timing was unavailable; this video uses sentence subtitles.")
     if quality:
         st.caption(f"Hindi alignment: {quality.get('policy', 'balanced')} · "
                    f"{'accepted' if quality.get('accepted') else 'needs review'}")
@@ -2147,6 +2250,8 @@ def _render_generation_task_snapshot(task_id, task):
         return
 
     video_files = task.get("videos") or []
+    if state != const.TASK_STATE_PROCESSING:
+        _render_savage_stock_review(task_id)
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
         message = tr("Video Generation Failed")
@@ -2157,7 +2262,7 @@ def _render_generation_task_snapshot(task_id, task):
         except (OSError, ValueError, TypeError):
             audit = []
         if audit:
-            with st.expander("Relevant Stock visual review evidence"):
+            with st.expander("Stock/ASMR visual review evidence"):
                 st.caption("Review sampled frames from the actual usable clip range. Approval is saved locally by asset hash and applies to future tasks using the same source bytes.")
                 for index, candidate in enumerate(audit):
                     with st.container(border=True):
@@ -2193,7 +2298,7 @@ def _render_generation_task_snapshot(task_id, task):
                             ((review_cols[1], "rejected", "Reject footage"),)
                             if candidate.get("status") == "rejected"
                             else (
-                                (review_cols[0], "approved", "Approve relevant footage"),
+                                (review_cols[0], "approved", "Approve footage"),
                                 (review_cols[1], "rejected", "Reject footage"),
                             )
                         )
@@ -5727,6 +5832,7 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_source_labels = {
+                "auto": tr("Auto stock providers"),
                 "pexels": tr("Pexels"),
                 "pixabay": tr("Pixabay"),
                 "coverr": tr("Coverr"),
@@ -5780,6 +5886,30 @@ def _render_video_settings(panel, params):
                 },
                 topic=params.video_subject,
             )
+            if resolved_style_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+                configured_stock_policy = str(
+                    params.stock_media_policy
+                    or config.app.get("stock_media_policy", "manual_review")
+                ).strip().casefold()
+                if configured_stock_policy not in {"manual_review", "auto_eligible"}:
+                    configured_stock_policy = "manual_review"
+                policy_labels = {
+                    "manual_review": "Manual review (hash-bound approval required)",
+                    "auto_eligible": "Automatic (local visual verification required)",
+                }
+                params.stock_media_policy = stable_selectbox(
+                    "Stock footage eligibility",
+                    options=("manual_review", "auto_eligible"),
+                    default_value=configured_stock_policy,
+                    key="stock_media_policy_select",
+                    format_func=policy_labels.get,
+                    help=(
+                        "Manual review requires an explicit approval bound to the clip's SHA-256. "
+                        "Automatic requires a cached local vision decision; metadata and search "
+                        "keywords alone never establish visual relevance. If no verifier is "
+                        "available, uncertain clips are rejected and the original illustration is used."
+                    ),
+                )
             style_labels = {
                 "savage_animated_explainer": "Savage Animated Explainer",
                 "relevant_stock": "Relevant Stock",
@@ -8727,6 +8857,7 @@ def _render_generation_controls(
             voxcpm_prompt_text = _get_voxcpm_prompt_text()
 
         if params.video_source not in [
+            "auto",
             "pexels",
             "pixabay",
             "coverr",
@@ -9208,7 +9339,7 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         "subtitle_display_mode", "subtitle_animation", "voice_rate", "voice_volume",
         "allow_unverified_publication", "duration_enforcement", "hindi_alignment_policy",
         "bgm_type", "bgm_file", "bgm_volume", "stock_video_style", "video_source",
-        "asmr_categories", "tts_provider",
+        "asmr_categories", "tts_provider", "stock_media_policy",
     }
     manual_overrides.update({
         key: value for key, value in (source_settings or {}).items()
@@ -9261,6 +9392,10 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         video_terms=video_terms,
     )
     st.session_state["autopilot_last_job"] = job.job_id
+    # Persist the job handle before submitting it. The worker can fail quickly
+    # (for example, on a TTS 429); if start_job then raises while returning its
+    # refreshed row, the UI must still render that job's recorded failure stage.
+    st.session_state["autopilot_active_job"] = job.job_id
     service.start_job(job.job_id)
     st.session_state.pop("autopilot_pending_plan", None)
     return job
@@ -9414,24 +9549,45 @@ def _render_autopilot_videos_fragment(channel_id):
 
     service = autopilot_service.get_service()
     jobs = service.store.list_jobs(channel_id, 500)
+    all_groups = group_video_attempts(jobs)
+    available_gallery_ids = {attempts[0].job_id for attempts in all_groups}
+    selected_key = f"gallery_selected_jobs_{channel_id}"
+    st.session_state[selected_key] = [
+        job_id for job_id in st.session_state.get(selected_key, [])
+        if job_id in available_gallery_ids
+    ]
     drafts = service.list_manual_drafts(channel_id)
     if not jobs and not drafts:
         st.info("No videos yet. Create your first video in Create Video.")
         return
-    receipts = {item["job_id"]: item
-                for item in service.store.list_publications(channel_id, 1000)}
-    st.subheader("My Videos")
-    filter_col, sort_col = st.columns([3, 1], vertical_alignment="bottom")
-    with filter_col:
-        query = st.text_input(
-            "Search videos", key=f"gallery_search_{channel_id}",
-            placeholder="Search titles", label_visibility="collapsed",
-        ).strip().casefold()
-    with sort_col:
-        sort_order = st.selectbox(
-            "Sort videos", ["Newest first", "Oldest first"],
-            key=f"gallery_sort_{channel_id}", label_visibility="collapsed",
-        )
+    receipts = {}
+    for item in service.store.list_publications(channel_id, 1000):
+        receipts.setdefault(item["job_id"], {}).setdefault(
+            item.get("platform", "youtube"), []
+        ).append(item)
+    selection_mode_key = f"gallery_selection_mode_{channel_id}"
+    selected_key = f"gallery_selected_jobs_{channel_id}"
+    selection_mode = bool(st.session_state.get(selection_mode_key, False))
+    header_cols = st.columns([1.5, 2.5, 1.2, 0.9], vertical_alignment="center")
+    header_cols[0].markdown(f"### My Videos · {len(all_groups)}")
+    query = header_cols[1].text_input(
+        "Search videos", key=f"gallery_search_{channel_id}",
+        placeholder="Search videos", label_visibility="collapsed",
+    ).strip().casefold()
+    sort_order = header_cols[2].selectbox(
+        "Sort videos", ["Newest first", "Oldest first"],
+        key=f"gallery_sort_{channel_id}", label_visibility="collapsed",
+    )
+    if header_cols[3].button(
+        "Done" if selection_mode else "Select",
+        key=f"{selection_mode_key}_toggle",
+        help="Finish selecting videos" if selection_mode else "Select videos for bulk actions",
+        width="stretch",
+    ):
+        st.session_state[selection_mode_key] = not selection_mode
+        if selection_mode:
+            st.session_state[selected_key] = []
+        st.rerun(scope="app")
     if query:
         jobs = [job for job in jobs if query in (job.topic or "").casefold()]
     groups = group_video_attempts(jobs)
@@ -9441,10 +9597,11 @@ def _render_autopilot_videos_fragment(channel_id):
     )
     if not groups and not drafts:
         st.info("No matching videos. Try another title or create your first video.")
-    page_size = 24
-    page_count = max(1, math.ceil(len(groups) / page_size))
     page_key = f"gallery_page_{channel_id}"
-    page = min(max(int(st.session_state.get(page_key, 1)), 1), page_count)
+    visible_groups, page, page_count = _autopilot_gallery_page(
+        groups, st.session_state.get(page_key, 1)
+    )
+    st.session_state[page_key] = page
     if page_count > 1:
         prev_col, page_col, next_col = st.columns([1, 3, 1])
         if prev_col.button("Previous", key=f"{page_key}_prev", disabled=page <= 1):
@@ -9454,7 +9611,43 @@ def _render_autopilot_videos_fragment(channel_id):
         if next_col.button("Next", key=f"{page_key}_next", disabled=page >= page_count):
             st.session_state[page_key] = page + 1
             st.rerun(scope="app")
-    visible_groups = groups[(page - 1) * page_size:page * page_size]
+    selected_ids = set(st.session_state.get(selected_key, []))
+    if selection_mode:
+        action_cols = st.columns([1, 1.25, 2, 5])
+        if action_cols[0].button(
+            f"Select all {len(groups)} filtered videos",
+            key=f"{selection_mode_key}_all",
+            help="Select every video matching the current search, across all gallery pages.",
+        ):
+            st.session_state[selected_key] = [attempts[0].job_id for attempts in groups]
+            st.rerun(scope="app")
+        if action_cols[1].button("Deselect all", key=f"{selection_mode_key}_clear"):
+            st.session_state[selected_key] = []
+            st.rerun(scope="app")
+        action_cols[2].markdown(f"**{len(selected_ids)} selected**")
+        if selected_ids:
+            result_cols = st.columns([1, 3, 5])
+            if result_cols[0].button("Delete Permanently", key=f"{selection_mode_key}_delete"):
+                st.session_state["gallery_bulk_delete_confirmed"] = False
+                st.session_state[f"gallery_bulk_delete_{channel_id}"] = sorted(selected_ids)
+                st.rerun(scope="app")
+            selected_jobs = [attempts[0] for attempts in all_groups
+                             if attempts[0].job_id in selected_ids]
+            selected_outputs = [(job, _autopilot_video_output(job)) for job in selected_jobs]
+            selected_outputs = [(job, path) for job, path in selected_outputs if path]
+            if selected_outputs:
+                try:
+                    archive = _build_autopilot_gallery_zip(selected_outputs)
+                    result_cols[1].download_button(
+                        "Download selected (ZIP)", archive,
+                        file_name="my-videos.zip", mime="application/zip",
+                            key=f"{selection_mode_key}_download",
+                    )
+                except ValueError as exc:
+                    result_cols[1].caption(str(exc))
+            result_cols[2].caption(
+                f"{len(selected_outputs)} completed video(s) available to download."
+            )
     playable = [
         (attempts[0], output)
         for attempts in visible_groups
@@ -9470,13 +9663,20 @@ def _render_autopilot_videos_fragment(channel_id):
                         _render_autopilot_video_attempt(
                             latest, channel_id, receipts.get(latest.job_id), gallery=True,
                             playable_jobs=playable,
+                            selection_mode=st.session_state.get(selection_mode_key, False),
                         )
                         if len(attempts) > 1:
                             with st.expander(f"Earlier attempts · {len(attempts) - 1}", expanded=False):
                                 for attempt in attempts[1:]:
+                                    attempt_receipts = receipts.get(attempt.job_id, {})
+                                    attempt_receipt = next(iter(
+                                        attempt_receipts.get("youtube", [])
+                                    ), None)
                                     _render_autopilot_video_attempt(
-                                        attempt, channel_id, receipts.get(attempt.job_id)
+                                        attempt, channel_id, attempt_receipt
                                     )
+    if st.session_state.get(selection_mode_key):
+        st.session_state[selected_key] = sorted(selected_ids)
     if drafts:
         with st.expander(f"Saved drafts · {len(drafts)}", expanded=not jobs):
             for draft in drafts:
@@ -9489,11 +9689,34 @@ def _render_autopilot_videos_fragment(channel_id):
                     st.caption("Loads the topic and script into Create Video for review.")
 
 
+def _autopilot_gallery_page(groups, page, page_size=18):
+    page_size = max(1, int(page_size))
+    page_count = max(1, math.ceil(len(groups) / page_size))
+    page = min(max(int(page), 1), page_count)
+    start = (page - 1) * page_size
+    return groups[start:start + page_size], page, page_count
+
+
 def _render_autopilot_videos(channel_id):
     """Keep the live-updating grid isolated so playback dialogs stay mounted."""
     from webui.autopilot_view import group_video_attempts
 
     _render_autopilot_videos_fragment(channel_id)
+    bulk_result = st.session_state.get("gallery_bulk_delete_result")
+    if bulk_result:
+        removed, failures = bulk_result
+        if removed:
+            st.success(
+                f"Permanently deleted {len(removed)} local video record(s) and available files. "
+                "YouTube and Instagram posts were not changed."
+            )
+        else:
+            st.info("No gallery records were removed. Review the per-video results below.")
+        for topic, failure in failures:
+            st.warning(f"{topic}: {failure}")
+        if st.button("Dismiss bulk result", key="gallery_bulk_result_dismiss"):
+            st.session_state.pop("gallery_bulk_delete_result", None)
+            st.rerun(scope="app")
     service = autopilot_service.get_service()
     jobs = service.store.list_jobs(channel_id, 500)
     query = str(st.session_state.get(f"gallery_search_{channel_id}", "")).strip().casefold()
@@ -9544,12 +9767,33 @@ def _render_autopilot_videos(channel_id):
             _render_autopilot_gallery_download_dialog(*selected_download)
         else:
             st.session_state.pop("gallery_download_job_id", None)
+    bulk_delete_key = f"gallery_bulk_delete_{channel_id}"
+    bulk_delete_ids = st.session_state.get(bulk_delete_key)
+    if bulk_delete_ids:
+        bulk_groups = [attempts for attempts in group_video_attempts(
+            service.store.list_jobs(channel_id, 500)
+        ) if attempts[0].job_id in set(bulk_delete_ids)]
+        if bulk_groups:
+            _render_autopilot_gallery_bulk_delete_dialog(bulk_groups, channel_id)
+        else:
+            st.session_state.pop(bulk_delete_key, None)
+    publish_confirmation = st.session_state.get("gallery_publish_confirm")
+    if publish_confirmation:
+        try:
+            publish_job = service.store.get_job(publish_confirmation[0])
+        except LookupError:
+            st.session_state.pop("gallery_publish_confirm", None)
+        else:
+            if publish_job.channel_id == channel_id:
+                _render_autopilot_gallery_publish_dialog(publish_job, *publish_confirmation[1:])
 
 
 def _render_autopilot_video_attempt(job, channel_id, receipt, gallery=False,
-                                    playable_jobs=None):
+                                    playable_jobs=None, selection_mode=False):
     if gallery:
-        _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs or [])
+        _render_autopilot_gallery_card(
+            job, channel_id, receipt, playable_jobs or [], selection_mode=selection_mode,
+        )
         return
 
     service = autopilot_service.get_service()
@@ -9699,19 +9943,21 @@ def _render_autopilot_video_attempt(job, channel_id, receipt, gallery=False,
                 elif job.intended_publication_slot:
                     st.caption("Scheduled jobs are retained in channel history.")
                 else:
-                    st.caption("Removes this job from the list. Rendered video files and channel duplicate history are kept.")
+                    st.caption("Permanently deletes this video's local job history and generated files. Remote social posts remain online.")
                     confirm_delete = st.checkbox(
-                        "I understand this job record will be removed",
+                        "I understand local publication tracking will also be deleted",
                         key=f"simple_delete_confirm_{job.job_id}",
                     )
                     if st.button(
-                        "Delete job record",
+                        "Delete permanently",
                         key=f"simple_delete_{job.job_id}",
                         disabled=not confirm_delete,
                     ):
                         try:
-                            service.store.delete_job(job.job_id, channel_id)
-                            st.success("Job removed from My Videos. Rendered files were kept.")
+                            result = service.store.delete_job(job.job_id, channel_id)
+                            st.success("Video permanently deleted from MPT. Remote social posts remain online.")
+                            for detail in result.get("cleanup_errors", []):
+                                st.warning(f"Some local files could not be removed: {detail}")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Job could not be deleted: {exc}")
@@ -9724,20 +9970,34 @@ def _render_autopilot_video_attempt(job, channel_id, receipt, gallery=False,
         if job.state == "generated":
             with service.store._connection() as conn:
                 qa = conn.execute("SELECT state FROM job_qa WHERE job_id=?", (job.job_id,)).fetchone()
-            if qa and qa["state"] == "qa_passed":
+            manual_policy = job.profile_snapshot.get("publishing_policy") == "manual"
+            manual_publish_ready = bool(
+                manual_policy and qa and qa["state"] in {"qa_passed", "approved"}
+            )
+            if qa and qa["state"] == "qa_passed" and not manual_policy:
                 if st.button("Approve video", key=f"simple_approve_{job.job_id}"):
                     try:
                         service.review_job(job.job_id, "approve")
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Approval failed: {exc}")
-            if qa and qa["state"] == "approved" and job.profile_snapshot.get("publishing_policy") == "manual":
-                if st.button("Upload privately to YouTube", key=f"simple_publish_{job.job_id}"):
-                    try:
-                        service.publish_job(job.job_id)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Private upload failed: {exc}")
+                        st.toast(str(exc), icon=":material/error:")
+            if qa and (qa["state"] == "approved" or manual_publish_ready) and manual_policy:
+                receipt_state = (receipt or {}).get("state")
+                if receipt_state in {"uploading", "unknown"}:
+                    st.info("YouTube upload is being reconciled. Duplicate submissions are blocked.")
+                elif receipt_state == "scheduled":
+                    st.info("Scheduled on YouTube")
+                elif receipt_state == "published":
+                    st.success("Uploaded to YouTube")
+                elif receipt_state == "failed":
+                    st.error("YouTube upload failed. Retry is available after the previous attempt is confirmed safe.")
+                elif _gallery_youtube_connected(job, service):
+                    if st.button("Upload privately to YouTube", key=f"simple_publish_{job.job_id}"):
+                        try:
+                            service.publish_job(job.job_id)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Private upload failed: {exc}")
             elif not qa or qa["state"] not in {"qa_passed", "approved"}:
                 st.warning("Rendering completed, but quality checks need attention. See Advanced / Diagnostics.")
         if receipt and receipt.get("provider_url"):
@@ -9886,21 +10146,222 @@ def _render_autopilot_gallery_video_modal(playable_jobs):
     )
 
 
-@st.dialog("Remove video?", width="small", dismissible=False)
+@st.dialog("Delete video permanently?", width="small", dismissible=False)
 def _render_autopilot_gallery_delete_dialog(job, channel_id):
-    st.write(f"Remove **{job.topic}** from My Videos? The rendered video files will be kept.")
+    st.write(
+        f"Permanently delete **{job.topic}** from MPT, including its local job history "
+        "and generated files? Any YouTube or Instagram post stays online."
+    )
+    st.caption("Local publication tracking is removed. An upload still being reconciled must finish first.")
     cancel_col, confirm_col = st.columns(2)
     if cancel_col.button("Cancel", key="gallery_delete_cancel"):
         st.session_state.pop("gallery_delete_job_id", None)
         st.rerun(scope="app")
-    if confirm_col.button("Remove video", key="gallery_delete_confirm", type="primary"):
+    if confirm_col.button("Delete permanently", key="gallery_delete_confirm", type="primary"):
         try:
-            autopilot_service.get_service().store.delete_job(job.job_id, channel_id)
+            result = autopilot_service.get_service().store.delete_job(job.job_id, channel_id)
             st.session_state.pop("gallery_delete_job_id", None)
-            st.toast("Video removed. Rendered files were kept.")
+            if result.get("cleanup_errors"):
+                st.warning("The local job was deleted, but some files could not be removed: "
+                           + "; ".join(result["cleanup_errors"]))
+            else:
+                st.toast("Video permanently deleted from MPT. Remote posts remain online.")
             st.rerun(scope="app")
         except Exception as exc:
             st.error(f"Video could not be removed: {exc}")
+
+
+def _gallery_youtube_connected(job, service):
+    profile = job.profile_snapshot or {}
+    connection_id = profile.get("youtube_connection_id")
+    destination_id = profile.get("youtube_channel_id")
+    if (profile.get("publishing_backend", "youtube_direct") != "youtube_direct"
+            or not connection_id or not destination_id):
+        return False
+    try:
+        connection = service.youtube_connections.get_connection(connection_id)
+    except Exception:
+        return False
+    return bool(connection.get("local_channel_id") == job.channel_id
+                and connection.get("youtube_channel_id") == destination_id)
+
+
+def _gallery_upload_post_destination(job, service, platform, refresh=False):
+    profile_username = (job.profile_snapshot.get("upload_post_username")
+                        or config.app.get("upload_post_username", ""))
+    api_key = config.app.get("upload_post_api_key", "")
+    if not profile_username or not api_key or not config.app.get("upload_post_enabled", False):
+        return None
+    cache_key = hashlib.sha256(f"{api_key}:{profile_username}:{platform}".encode()).hexdigest()
+    cache = st.session_state.setdefault("gallery_upload_post_status_cache", {})
+    cached = cache.get(cache_key)
+    if (not refresh and isinstance(cached, tuple) and time.time() - cached[0] < 60):
+        return cached[1]
+    result = service.upload_post_destination(job, platform)
+    cache[cache_key] = (time.time(), result)
+    return result
+
+
+def _gallery_instagram_destination(job, service, refresh=False):
+    return _gallery_upload_post_destination(job, service, "instagram", refresh)
+
+
+def _gallery_youtube_destination(job, service):
+    if job.profile_snapshot.get("publishing_backend") == "youtube_direct":
+        if not _gallery_youtube_connected(job, service):
+            return None
+        return {"username": job.profile_snapshot.get("youtube_channel_id"),
+                "handle": job.profile_snapshot.get("youtube_channel_id")}
+    return _gallery_upload_post_destination(job, service, "youtube")
+
+
+def _toggle_autopilot_gallery_selection(channel_id, job_id):
+    key = f"gallery_selected_jobs_{channel_id}"
+    selected = set(st.session_state.get(key, []))
+    if job_id in selected:
+        selected.remove(job_id)
+    else:
+        selected.add(job_id)
+    st.session_state[key] = sorted(selected)
+
+
+@st.dialog("Delete selected videos permanently?", width="small", dismissible=False)
+def _render_autopilot_gallery_bulk_delete_dialog(groups, channel_id):
+    attempt_count = sum(len(attempts) for attempts in groups)
+    st.write(
+        f"Permanently delete {len(groups)} selected video(s) and their {attempt_count} "
+        "generation record(s), local publication tracking, and generated files? "
+        "Remote YouTube and Instagram posts stay online."
+    )
+    st.caption("Uploads with uncertain outcomes must be reconciled before their local tracking can be deleted.")
+    confirmed = st.checkbox("I understand this permanently deletes local video data", key="gallery_bulk_delete_confirmed")
+    cancel_col, delete_col = st.columns(2)
+    if cancel_col.button("Cancel", key="gallery_bulk_delete_cancel"):
+        st.session_state.pop(f"gallery_bulk_delete_{channel_id}", None)
+        st.rerun(scope="app")
+    if delete_col.button("Delete permanently", key="gallery_bulk_delete_submit", type="primary", disabled=not confirmed):
+        service = autopilot_service.get_service()
+        removed, failures = [], []
+        for attempts in groups:
+            for job in attempts:
+                try:
+                    result = service.store.delete_job(job.job_id, channel_id)
+                    removed.append(job.job_id)
+                    if result.get("cleanup_errors"):
+                        failures.append((job.topic, "Some generated files could not be removed: "
+                                         + "; ".join(result["cleanup_errors"])))
+                except Exception as exc:
+                    failures.append((job.topic, str(exc)))
+        selected_key = f"gallery_selected_jobs_{channel_id}"
+        st.session_state[selected_key] = []
+        st.session_state[f"gallery_selection_mode_{channel_id}"] = False
+        st.session_state.pop(f"gallery_bulk_delete_{channel_id}", None)
+        st.session_state["gallery_bulk_delete_result"] = (removed, failures)
+        st.rerun(scope="app")
+
+
+def _build_autopilot_gallery_zip(job_paths, max_total_bytes=256 * 1024 * 1024):
+    """Build a bounded archive from completed gallery artifacts."""
+    total = 0
+    for _job, path in job_paths:
+        if not os.path.isfile(path):
+            continue
+        total += os.path.getsize(path)
+        if total > max_total_bytes:
+            raise ValueError("Selected videos exceed the 256 MB ZIP download limit.")
+    buffer = BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+        for job, path in job_paths:
+            if not os.path.isfile(path):
+                continue
+            filename = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(path).name).strip("._") or "video.mp4"
+            arcname = f"{job.job_id[:8]}-{filename}"
+            if arcname in used_names:
+                arcname = f"{job.job_id}-{filename}"
+            used_names.add(arcname)
+            archive.write(path, arcname)
+    return buffer.getvalue()
+
+
+@st.dialog("Confirm upload", width="medium", dismissible=False)
+def _render_autopilot_gallery_publish_dialog(job, platform, destination_account_id):
+    service = autopilot_service.get_service()
+    destination = (_gallery_instagram_destination(job, service)
+                   if platform == "instagram" else _gallery_youtube_destination(job, service))
+    if not destination or destination.get("username") != destination_account_id:
+        st.error("This destination is no longer connected. Refresh its status in Channel settings before uploading.")
+        if st.button("Close", key="gallery_publish_destination_close"):
+            st.session_state.pop("gallery_publish_confirm", None)
+            st.rerun(scope="app")
+        return
+    handle = destination.get("handle") or destination.get("display_name") or destination_account_id
+    caption_key = None
+    if platform == "youtube":
+        st.write(f"YouTube destination: **{handle}**")
+        st.info("Manual YouTube publication uses Private visibility. This action does not enable Autopilot or public posting.")
+        try:
+            with st.spinner("Preparing the YouTube caption…"):
+                metadata = service.ensure_youtube_metadata(job.job_id)
+        except Exception as exc:
+            st.error(f"Caption could not be prepared: {exc}")
+            if st.button("Close", key="gallery_publish_caption_close"):
+                st.session_state.pop("gallery_publish_confirm", None)
+                st.rerun(scope="app")
+            return
+        st.write(f"YouTube title: **{metadata.get('title', '')}**")
+        caption_key = (
+            f"gallery_youtube_caption_{job.job_id}_"
+            f"{metadata.get('narration_fingerprint', '')[:8]}_"
+            f"{metadata.get('context_fingerprint', '')[:8]}"
+        )
+        if caption_key not in st.session_state:
+            st.session_state[caption_key] = metadata["caption"]
+        st.markdown("**AI-generated YouTube caption**")
+        st.text_area(
+            "Caption · up to 50 words including five hashtags",
+            key=caption_key, height=120,
+            help="Generated from the narration and this video's saved channel settings. Edit before posting if needed.",
+        )
+        caption_words = len(str(st.session_state[caption_key]).split())
+        caption_hashtags = re.findall(
+            r"(?<!\w)#[\w]+", str(st.session_state[caption_key]), flags=re.UNICODE
+        )
+        st.caption(f"{caption_words}/50 words · {len(caption_hashtags)}/5 hashtags")
+        caption_validation_errors = service.youtube_caption_validation_errors(
+            job.job_id, str(st.session_state[caption_key]),
+        )
+        if caption_validation_errors:
+            st.caption("Caption needs: " + "; ".join(caption_validation_errors))
+    else:
+        st.write(f"**{job.topic}**")
+        st.write(f"Instagram destination: **@{handle.lstrip('@')}**")
+        st.info("This publishes a Reel now. Visibility follows the connected Instagram account's audience settings; MPT will not change them.")
+    cancel_col, upload_col = st.columns(2)
+    if cancel_col.button("Cancel", key="gallery_publish_cancel"):
+        st.session_state.pop("gallery_publish_confirm", None)
+        st.rerun(scope="app")
+    caption_invalid = bool(
+        platform == "youtube"
+        and caption_validation_errors
+    )
+    if upload_col.button(
+        "Post to YouTube" if platform == "youtube" else "Upload now",
+        key="gallery_publish_confirm_submit", type="primary", disabled=caption_invalid,
+    ):
+        try:
+            if platform == "youtube":
+                service.save_youtube_caption(job.job_id, st.session_state[caption_key])
+            result = service.publish_job(job.job_id, platform=platform,
+                                         destination_account_id=destination_account_id)
+            st.session_state["gallery_publish_result"] = result
+        except Exception as exc:
+            st.session_state["gallery_publish_result"] = {
+                "job_id": job.job_id, "platform": platform, "state": "failed",
+                "error": str(exc),
+            }
+        st.session_state.pop("gallery_publish_confirm", None)
+        st.rerun(scope="app")
 
 
 @st.dialog("Video details", width="medium", dismissible=False)
@@ -9942,12 +10403,25 @@ def _render_autopilot_gallery_download_dialog(job, video_path):
         st.rerun(scope="app")
 
 
-def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
+def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs,
+                                   selection_mode=False):
     service = autopilot_service.get_service()
     task_state = sm.state.get_task(job.mpt_task_id) if job.mpt_task_id else None
     output = _autopilot_video_output(job)
-    status = ("Published" if receipt and receipt["state"] == "published" else
-              "Failed" if job.state == "failed" else
+    publication_rows = receipt if isinstance(receipt, dict) else {}
+    youtube_receipts = publication_rows.get("youtube", [])
+    instagram_receipts = publication_rows.get("instagram", [])
+    if isinstance(youtube_receipts, dict):
+        youtube_receipts = [youtube_receipts]
+    if isinstance(instagram_receipts, dict):
+        instagram_receipts = [instagram_receipts]
+    youtube_destination = _gallery_youtube_destination(job, service)
+    youtube_receipt = next((row for row in youtube_receipts
+                            if youtube_destination and row.get("destination_account_id") == youtube_destination.get("username")), None)
+    instagram_destination = _gallery_instagram_destination(job, service)
+    instagram_receipt = next((row for row in instagram_receipts
+                              if instagram_destination and row.get("destination_account_id") == instagram_destination.get("username")), None)
+    status = ("Failed" if job.state == "failed" else
               "Ready" if job.state == "generated" else
               "Rendering" if job.state in {"queued", "generating"} else
               "Draft")
@@ -9959,30 +10433,32 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
     with st.container(key=f"gallery_card_{job.job_id}", border=True):
         status_col, menu_col = st.columns([5, 1], vertical_alignment="center")
         status_col.caption(status)
+        for platform_label, publication in (("YouTube", youtube_receipt),
+                                             ("Instagram", instagram_receipt)):
+            if publication:
+                platform_status = {"published": "Uploaded", "scheduled": "Scheduled",
+                                   "uploading": "Uploading", "unknown": "Checking", "failed": "Failed"}.get(
+                                       publication.get("state"), publication.get("state", "Status")
+                                   )
+                status_col.caption(f"{platform_label} · {platform_status}")
         with menu_col:
             with st.popover(
                 "", icon=":material/more_vert:", type="tertiary", help="Video actions",
                 key=f"gallery_actions_{job.job_id}", width=190, on_change="rerun",
             ):
-                if output and st.button("Play", key=f"gallery_menu_play_{job.job_id}",
+                if output and not selection_mode and st.button("Play", key=f"gallery_menu_play_{job.job_id}",
                                          width="stretch", type="tertiary",
-                                         icon=":material/play_arrow:",
-                                         on_click=_close_autopilot_gallery_action_menu,
-                                         args=(job.job_id,)):
+                                         icon=":material/play_arrow:"):
                     st.session_state["gallery_play_job_id"] = job.job_id
                     st.rerun(scope="app")
                 if output:
                     if st.button("Download", key=f"gallery_download_{job.job_id}",
                                  width="stretch", type="tertiary",
-                                 icon=":material/download:",
-                                 on_click=_close_autopilot_gallery_action_menu,
-                                 args=(job.job_id,)):
+                                 icon=":material/download:"):
                         st.session_state["gallery_download_job_id"] = job.job_id
                         st.rerun(scope="app")
                 if st.button("View details", key=f"gallery_details_{job.job_id}",
-                             width="stretch", type="tertiary", icon=":material/info:",
-                             on_click=_close_autopilot_gallery_action_menu,
-                             args=(job.job_id,)):
+                             width="stretch", type="tertiary", icon=":material/info:"):
                     st.session_state["gallery_details_job_id"] = job.job_id
                     st.rerun(scope="app")
                 if job.state == "failed":
@@ -9991,9 +10467,7 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                             and not job.output_artifacts):
                         if st.button("Use general stock footage", key=f"gallery_stock_fallback_{job.job_id}",
                                      width="stretch", type="tertiary",
-                                     icon=":material/refresh:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
+                                     icon=":material/refresh:"):
                             try:
                                 replacement = service.retry_with_stock_footage(job.job_id)
                                 st.session_state["autopilot_active_job"] = replacement.job_id
@@ -10003,9 +10477,7 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                     else:
                         if st.button("Retry video", key=f"gallery_retry_{job.job_id}",
                                      width="stretch", type="tertiary",
-                                     icon=":material/refresh:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
+                                     icon=":material/refresh:"):
                             try:
                                 service.retry_job(job.job_id)
                                 st.session_state["autopilot_active_job"] = job.job_id
@@ -10016,9 +10488,7 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                         if st.button("Retry with current channel settings",
                                      key=f"gallery_retry_settings_{job.job_id}",
                                      width="stretch", type="tertiary",
-                                     icon=":material/settings_backup_restore:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
+                                     icon=":material/settings_backup_restore:"):
                             try:
                                 replacement = service.retry_with_current_channel_settings(job.job_id)
                                 st.session_state["autopilot_active_job"] = replacement.job_id
@@ -10028,7 +10498,6 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                 if job.state == "ready" and st.button(
                     "Start generation", key=f"gallery_start_{job.job_id}", width="stretch",
                     type="tertiary", icon=":material/play_arrow:",
-                    on_click=_close_autopilot_gallery_action_menu, args=(job.job_id,),
                 ):
                     try:
                         service.start_job(job.job_id)
@@ -10043,31 +10512,48 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                 if job.state == "generated":
                     with service.store._connection() as conn:
                         qa = conn.execute("SELECT state FROM job_qa WHERE job_id=?", (job.job_id,)).fetchone()
-                    if qa and qa["state"] == "qa_passed":
+                    manual_policy = job.profile_snapshot.get("publishing_policy") == "manual"
+                    manual_publish_ready = bool(
+                        manual_policy and qa and qa["state"] in {"qa_passed", "approved"}
+                    )
+                    if qa and qa["state"] == "qa_passed" and not manual_policy:
                         if st.button("Approve video", key=f"gallery_approve_{job.job_id}",
                                      width="stretch", type="tertiary",
-                                     icon=":material/check_circle:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
+                                     icon=":material/check_circle:"):
                             try:
                                 service.review_job(job.job_id, "approve")
                                 st.rerun()
                             except Exception as exc:
-                                st.error(f"Approval failed: {exc}")
-                    if qa and qa["state"] == "approved" and job.profile_snapshot.get("publishing_policy") == "manual":
-                        if st.button("Upload privately to YouTube", key=f"gallery_publish_{job.job_id}",
-                                     width="stretch", type="tertiary",
-                                     icon=":material/upload:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
-                            try:
-                                service.publish_job(job.job_id)
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Private upload failed: {exc}")
-                if receipt and receipt.get("provider_url"):
+                                st.toast(str(exc), icon=":material/error:")
+                    if qa and (qa["state"] == "approved" or manual_publish_ready):
+                        if (youtube_destination and job.profile_snapshot.get("publishing_policy") == "manual"
+                                and (not youtube_receipt or youtube_receipt.get("state") == "failed")):
+                            if st.button("Retry YouTube upload" if youtube_receipt else "Upload to YouTube",
+                                         key=f"gallery_publish_youtube_{job.job_id}", width="stretch",
+                                         type="tertiary", icon=":material/upload:",
+                                         help="Manual YouTube uploads use Private visibility."):
+                                st.session_state["gallery_publish_confirm"] = (
+                                    job.job_id, "youtube", youtube_destination["username"]
+                                )
+                                st.rerun(scope="app")
+                        if (instagram_destination
+                                and (not instagram_receipt or instagram_receipt.get("state") == "failed")):
+                            if st.button("Retry Instagram upload" if instagram_receipt else "Upload to Instagram",
+                                         key=f"gallery_publish_instagram_{job.job_id}", width="stretch",
+                                         type="tertiary", icon=":material/upload:",
+                                         help="Publishes a Reel using this connected Instagram account's current audience settings."):
+                                st.session_state["gallery_publish_confirm"] = (
+                                    job.job_id, "instagram", instagram_destination["username"]
+                                )
+                                st.rerun(scope="app")
+                if youtube_receipt and youtube_receipt.get("provider_url"):
                     st.link_button(
-                        "Open on YouTube", receipt["provider_url"], width="stretch",
+                        "View on YouTube", youtube_receipt["provider_url"], width="stretch",
+                        type="tertiary", icon=":material/open_in_new:",
+                    )
+                if instagram_receipt and instagram_receipt.get("provider_url"):
+                    st.link_button(
+                        "View on Instagram", instagram_receipt["provider_url"], width="stretch",
                         type="tertiary", icon=":material/open_in_new:",
                     )
                 if job.state in {"failed", "generated", "cancelled"}:
@@ -10076,9 +10562,7 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                     else:
                         if st.button("Remove from My Videos", key=f"gallery_delete_{job.job_id}",
                                      width="stretch", type="tertiary",
-                                     icon=":material/delete:",
-                                     on_click=_close_autopilot_gallery_action_menu,
-                                     args=(job.job_id,)):
+                                     icon=":material/delete:"):
                             st.session_state["gallery_delete_job_id"] = job.job_id
                             st.rerun(scope="app")
 
@@ -10095,19 +10579,33 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs):
                 f'<div class="mpt-gallery-duration">{html.escape(duration_label)}</div>',
                 unsafe_allow_html=True,
             )
-            if st.button(
-                "Play video", key=f"gallery_play_{job.job_id}",
-            ):
-                if output:
-                    st.session_state["gallery_play_job_id"] = job.job_id
-                    st.rerun(scope="app")
-                elif job.state == "failed":
-                    st.toast(
-                        "This failed attempt has no playable video. Use the menu to retry or view details.",
-                        icon=":material/info:",
-                    )
-                else:
-                    st.toast("This video is not ready to play yet.", icon=":material/info:")
+            if selection_mode:
+                selected = job.job_id in set(
+                    st.session_state.get(f"gallery_selected_jobs_{channel_id}", [])
+                )
+                st.button(
+                    "Deselect video" if selected else "Select video",
+                    key=f"gallery_select_{job.job_id}",
+                    on_click=_toggle_autopilot_gallery_selection,
+                    args=(channel_id, job.job_id),
+                )
+                st.markdown(
+                    '<div class="mpt-gallery-select-indicator is-selected">✓</div>'
+                    if selected else '<div class="mpt-gallery-select-indicator"> </div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                if st.button("Play video", key=f"gallery_play_{job.job_id}"):
+                    if output:
+                        st.session_state["gallery_play_job_id"] = job.job_id
+                        st.rerun(scope="app")
+                    elif job.state == "failed":
+                        st.toast(
+                            "This failed attempt has no playable video. Use the menu to retry or view details.",
+                            icon=":material/info:",
+                        )
+                    else:
+                        st.toast("This video is not ready to play yet.", icon=":material/info:")
 
         with st.container(key=f"gallery_title_{job.job_id}"):
             st.text(job.topic)
@@ -10657,7 +11155,13 @@ def _render_channel_autopilot():
                         except Exception as exc:
                             st.error(f"An existing draft was found, but generation could not start: {exc}")
                 except Exception as exc:
-                    st.error(f"Video could not be created: {exc}")
+                    error_text = str(exc).strip()
+                    if not error_text or error_text.casefold() == "none":
+                        error_text = (
+                            f"{type(exc).__name__} (no error detail returned). "
+                            "Check the active job status below or in My Videos."
+                        )
+                    st.error(f"Video could not be created: {error_text}")
         active_job_id = st.session_state.get("autopilot_active_job")
         if active_job_id:
             _render_autopilot_active_job(active_job_id, channel_id)
@@ -10801,12 +11305,17 @@ def _render_channel_autopilot():
                             index=0 if item.language.lower().startswith("hi") else 1)
                         channel_style = st.selectbox("Default visuals", list(styles),
                             index=list(styles.values()).index(item.visual_style))
+                        channel_hashtag = st.text_input(
+                            "YouTube channel hashtag", item.channel_hashtag,
+                            help="Optional brand hashtag included with the five caption hashtags. Enter it with or without #.",
+                        )
                         preferences = st.text_area("Topic preferences (one per line)", "\n".join(item.topic_preferences))
                         if st.form_submit_button("Save channel defaults"):
                             try:
                                 _autopilot_save_profile(item, voice_name=voice_name,
                                     language="hi" if channel_language == "Hindi" else "en",
                                     visual_style=styles[channel_style],
+                                    channel_hashtag=channel_hashtag.strip(),
                                     topic_preferences=[line.strip() for line in preferences.splitlines() if line.strip()])
                                 st.success("Channel defaults saved.")
                                 st.rerun()
@@ -11009,6 +11518,11 @@ def _render_channel_autopilot_advanced():
     with st.form("autopilot_profile_form"):
         display_name = st.text_input("Display name", value=current.display_name if current else "")
         niche = st.text_input("Content niche", value=current.niche if current else "")
+        channel_hashtag = st.text_input(
+            "YouTube channel hashtag (optional)",
+            value=current.channel_hashtag if current else "",
+            help="This brand hashtag is included in generated YouTube Shorts captions.",
+        )
         # These defaults are edited in the Channels section; don't show a second
         # independent widget for the same profile fields here.
         topics = "\n".join(current.topic_preferences) if current else ""
@@ -11173,7 +11687,7 @@ def _render_channel_autopilot_advanced():
                     elif current.visual_style == "savage_animated_explainer":
                         voice_name = config.ui.get("voice_name", "")
             values = dict(
-                display_name=display_name, niche=niche,
+                display_name=display_name, channel_hashtag=channel_hashtag.strip(), niche=niche,
                 topic_preferences=[line.strip() for line in topics.splitlines() if line.strip()],
                 language=language, script_style=script_style,
                 target_duration_seconds=int(duration), video_aspect=aspect,
