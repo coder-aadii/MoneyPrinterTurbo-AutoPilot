@@ -2049,11 +2049,14 @@ class AutopilotService:
     def _youtube_caption_context(job: ProductionJob) -> tuple[str, str, str]:
         profile = job.profile_snapshot or {}
         params = job.params_snapshot or {}
-        language = "English"
+        language_value = str(
+            params.get("video_language") or profile.get("language") or "en"
+        ).casefold()
+        language = "Hindi" if language_value.startswith(("hi", "hindi")) else "English"
         context = {
             "channel": profile.get("display_name", ""),
             "channel_hashtag": AutopilotService._youtube_channel_hashtag(job),
-            "caption_language": "English",
+            "caption_language": language,
             "niche": profile.get("niche", ""),
             "topic_preferences": profile.get("topic_preferences", []),
             "storytelling_style": profile.get("script_style", ""),
@@ -2099,13 +2102,13 @@ class AutopilotService:
         return next(iter(llm._normalize_hashtags([str(value)], 1)), "")
 
     @staticmethod
-    def _youtube_caption_body_errors(body: str) -> list[str]:
+    def _youtube_caption_body_errors(body: str, language: str = "English") -> list[str]:
         errors = []
         body = " ".join(str(body or "").split())
         if not body:
             return ["caption body is empty"]
-        if not AutopilotService._youtube_text_looks_english(body):
-            errors.append("caption must be written in English")
+        if not AutopilotService._youtube_text_matches_language(body, language):
+            errors.append(f"caption must be written in {language}")
         if len(body.split()) > 10:
             errors.append("each caption sentence must contain at most 10 words")
         if "#" in body:
@@ -2148,7 +2151,7 @@ class AutopilotService:
 
     @classmethod
     def _youtube_caption_validation_errors(
-        cls, caption: str, required_hashtag: str = "",
+        cls, caption: str, required_hashtag: str = "", language: str = "English",
     ) -> list[str]:
         lines = [" ".join(line.split()) for line in str(caption or "").splitlines()]
         lines = [line for line in lines if line]
@@ -2175,7 +2178,7 @@ class AutopilotService:
         if len(body_lines) != 2:
             errors.append("caption must contain exactly two complete sentences on separate lines")
         for line in body_lines:
-            errors.extend(cls._youtube_caption_body_errors(line))
+            errors.extend(cls._youtube_caption_body_errors(line, language))
         emoji_count = cls._youtube_emoji_count(" ".join(body_lines))
         if emoji_count not in {3, 4}:
             errors.append("caption must contain three or four emojis")
@@ -2193,12 +2196,25 @@ class AutopilotService:
         )
 
     @staticmethod
-    def _youtube_title_is_english(title: str) -> bool:
-        return AutopilotService._youtube_text_looks_english(title)
+    def _youtube_text_matches_language(text: str, language: str) -> bool:
+        value = str(text or "")
+        normalized = str(language or "").casefold()
+        if normalized.startswith(("hi", "hindi")):
+            return bool(re.search(r"[\u0900-\u097f]", value))
+        if normalized.startswith(("en", "english")):
+            return AutopilotService._youtube_text_looks_english(value)
+        return bool(value.strip())
 
     @staticmethod
-    def _deterministic_youtube_title() -> str:
-        """Return a readable English fallback title without translating or inventing claims."""
+    def _youtube_title_matches_language(title: str, language: str = "English") -> bool:
+        return AutopilotService._youtube_text_matches_language(title, language)
+
+    @staticmethod
+    def _deterministic_youtube_title(narration: str = "", language: str = "English") -> str:
+        """Use narration itself when a language-safe title cannot be generated."""
+        if str(language or "").casefold().startswith(("hi", "hindi")):
+            first = re.split(r"(?<=[.!?।॥])\s*", str(narration or ""), maxsplit=1)[0]
+            return first.strip()[:100]
         return "The Story Behind This Idea"
 
     @staticmethod
@@ -2279,6 +2295,7 @@ class AutopilotService:
     @classmethod
     def _deterministic_youtube_caption(
         cls, narration: str, job: ProductionJob, hashtags: list[str],
+        language: str = "English",
     ) -> str:
         script = re.sub(r"(?<!\w)#\S+", " ", str(narration or ""), flags=re.UNICODE)
         script = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", " ", script)
@@ -2289,14 +2306,24 @@ class AutopilotService:
             sentence = sentence.strip()
             if not sentence:
                 continue
-            if (sentence[-1] not in ".!?"
-                    or re.search(r"[\u0900-\u097f]", sentence)
-                    or cls._youtube_caption_body_errors(sentence)):
+            if (sentence[-1] not in ".!?।॥"
+                    or cls._youtube_caption_body_errors(sentence, language)):
                 continue
             if len(sentence.split()) <= 8:
                 complete_sentences.append(sentence)
             if len(complete_sentences) == 2:
                 break
+
+        if str(language or "").casefold().startswith(("hi", "hindi")):
+            if len(complete_sentences) >= 2:
+                lines = [
+                    f"{complete_sentences[0]} 🔍🤔",
+                    f"{complete_sentences[1]} 💡✨",
+                ]
+                return cls._compose_youtube_caption("\n".join(lines), hashtags)
+            # Preserve the actual narration; do not invent translated copy if
+            # the script has fewer than two short, complete Hindi sentences.
+            return cls._compose_youtube_caption("\n".join(complete_sentences), hashtags)
 
         subject = "this idea"
         hook = f"What makes {subject} surprising? 🔍🤔"
@@ -2314,7 +2341,9 @@ class AutopilotService:
             explanation = complete_sentences[0]
         lines = [hook, f"{explanation} 💡✨"]
         caption = cls._compose_youtube_caption("\n".join(lines), hashtags)
-        if cls._youtube_caption_validation_errors(caption, cls._youtube_channel_hashtag(job)):
+        if cls._youtube_caption_validation_errors(
+            caption, cls._youtube_channel_hashtag(job), language
+        ):
             fallback_lines = ["What is the key idea? 🔍🤔", "The narration explains the process. 💡✨"]
             caption = cls._compose_youtube_caption("\n".join(fallback_lines), hashtags)
         return caption
@@ -2342,7 +2371,7 @@ class AutopilotService:
         if (metadata.get("narration_fingerprint") == narration_fingerprint
                 and metadata.get("context_fingerprint") == context_fingerprint
                 and not self._youtube_caption_validation_errors(
-                    metadata.get("caption", ""), channel_hashtag,
+                    metadata.get("caption", ""), channel_hashtag, language,
                 )):
             return metadata
 
@@ -2372,9 +2401,11 @@ class AutopilotService:
         )
         hashtags = self._youtube_caption_hashtags(raw_hashtags, job, narration)
         caption = self._compose_youtube_caption(body, hashtags)
-        validation_errors = self._youtube_caption_validation_errors(caption, channel_hashtag)
-        if not self._youtube_title_is_english(generated.get("title", "")):
-            validation_errors.append("title must be written in English")
+        validation_errors = self._youtube_caption_validation_errors(
+            caption, channel_hashtag, language
+        )
+        if not self._youtube_title_matches_language(generated.get("title", ""), language):
+            validation_errors.append(f"title must be written in {language}")
         if validation_errors:
             feedback = (
                 "Rewrite the caption to fix these local validation errors: "
@@ -2391,9 +2422,11 @@ class AutopilotService:
                 )
                 rewritten_tags = self._youtube_caption_hashtags(rewritten_raw_tags, job, narration)
                 rewritten_caption = self._compose_youtube_caption(rewritten_body, rewritten_tags)
-                rewritten_errors = self._youtube_caption_validation_errors(rewritten_caption, channel_hashtag)
-                if not self._youtube_title_is_english(rewritten.get("title", "")):
-                    rewritten_errors.append("title must be written in English")
+                rewritten_errors = self._youtube_caption_validation_errors(
+                    rewritten_caption, channel_hashtag, language
+                )
+                if not self._youtube_title_matches_language(rewritten.get("title", ""), language):
+                    rewritten_errors.append(f"title must be written in {language}")
                 if not rewritten_errors:
                     generated, caption, hashtags = rewritten, rewritten_caption, rewritten_tags
                     validation_errors = []
@@ -2407,16 +2440,17 @@ class AutopilotService:
 
         if validation_errors:
             caption = self._deterministic_youtube_caption(
-                narration, job, hashtags,
+                narration, job, hashtags, language,
             )
             hashtags = caption.split()[-5:]
         result = {
             "platform": "youtube",
             "title": (str(generated.get("title") or "")[:100]
-                      if self._youtube_title_is_english(generated.get("title", ""))
-                      else self._deterministic_youtube_title()),
+                      if self._youtube_title_matches_language(generated.get("title", ""), language)
+                      else self._deterministic_youtube_title(narration, language)),
             "caption": caption,
             "hashtags": hashtags,
+            "language": language,
             "channel_hashtag": channel_hashtag,
             "narration_fingerprint": narration_fingerprint,
             "caption_source_fingerprint": caption_source_fingerprint,
@@ -2429,7 +2463,7 @@ class AutopilotService:
     def youtube_caption_validation_errors(self, job_id: str, caption: str) -> list[str]:
         metadata = self.ensure_youtube_metadata(job_id)
         return self._youtube_caption_validation_errors(
-            caption, metadata.get("channel_hashtag", ""),
+            caption, metadata.get("channel_hashtag", ""), metadata.get("language", "English"),
         )
 
     def save_youtube_caption(self, job_id: str, caption: str) -> dict:
@@ -2439,7 +2473,7 @@ class AutopilotService:
             if line.strip()
         )
         errors = self._youtube_caption_validation_errors(
-            normalized, metadata.get("channel_hashtag", ""),
+            normalized, metadata.get("channel_hashtag", ""), metadata.get("language", "English"),
         )
         if errors:
             raise AutopilotError("Invalid YouTube caption: " + "; ".join(errors))
@@ -2836,7 +2870,7 @@ class AutopilotService:
                            "scheduled_public": "private", "automatic_public": "public"}.get(policy, "private")
                 youtube_extra = {
                     "privacyStatus": privacy,
-                    "selfDeclaredMadeForKids": bool(config.app.get("upload_post_youtube_made_for_kids", False)),
+                    "selfDeclaredMadeForKids": bool(profile.get("youtube_made_for_kids", False)),
                     "youtube_title": title[:100],
                     "youtube_description": description,
                     "tags": (youtube_metadata or {}).get("hashtags", []),
@@ -3130,6 +3164,7 @@ class AutopilotService:
     def _manual_profile(self, channel_id: str, overrides: dict) -> ChannelProfile:
         allowed = {
             "target_duration_seconds", "video_aspect", "stock_video_style", "visual_style",
+            "stock_media_policy",
             "language", "font_name", "narrator_preset", "profanity_level", "video_source",
             "asmr_categories", "tts_provider",
             "savage_quality_policy",
@@ -3159,6 +3194,9 @@ class AutopilotService:
             settings = dict(profile_values.get("generation_settings") or {})
             settings["tts_provider"] = overrides["tts_provider"]
             profile_values["generation_settings"] = settings
+            # The public task override is flattened for the caller; the saved
+            # channel schema stores provider choice in generation_settings.
+            profile_values.pop("tts_provider", None)
         return ChannelProfile.model_validate({
             **profile_values,
             "publishing_policy": "manual", "auto_public_enabled": False,

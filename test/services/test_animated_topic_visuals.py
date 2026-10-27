@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -343,24 +344,22 @@ def test_saved_keyword_can_select_stock_for_transformation_beat(tmp_path, monkey
     assert segments[0]["approved"] is True
 
 
-def test_stock_eligibility_requires_visual_review_and_landscape_format(monkeypatch):
+def test_auto_stock_eligibility_uses_positive_search_match_and_checks_format(monkeypatch):
     candidate = {
         "provider": "pexels", "asset_id": "clip", "source_page": "https://pexels.com/video/clip/",
         "license": "Pexels License", "path": "/tmp/clip.mp4", "sha256": "digest",
+        "relevance_score": 1,
     }
     monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
         "duration": 4, "width": 1920, "height": 1080, "codec": "h264",
     })
     monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "digest")
     monkeypatch.setattr(animated_explainer.visual_review, "human_approval", lambda *_args: None)
-    monkeypatch.setattr(animated_explainer.visual_review, "cached_auto_relevance", lambda *_args: None)
-    monkeypatch.setattr(animated_explainer.visual_review, "record_auto_relevance",
-                        lambda *_args, **_kwargs: None)
-
-    eligible, reason, _approval = animated_explainer._stock_eligibility(
+    eligible, reason, evidence = animated_explainer._stock_eligibility(
         candidate, required_seconds=3, policy="auto_eligible",
     )
-    assert (eligible, reason) == (False, "automatic_relevance_unverified")
+    assert (eligible, reason) == (True, "pexels_search_match")
+    assert evidence["verifier"] == "provider_search"
 
     monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
         "duration": 4, "width": 1080, "height": 1920, "codec": "h264",
@@ -371,13 +370,12 @@ def test_stock_eligibility_requires_visual_review_and_landscape_format(monkeypat
     assert (eligible, reason) == (False, "not_sufficient_resolution_landscape")
 
 
-def test_automatic_stock_uses_cached_hash_and_query_decision_without_human_approval(
-    tmp_path, monkeypatch,
-):
+def test_automatic_stock_does_not_require_gemini_or_human_approval(monkeypatch):
     digest = "a" * 64
     candidate = {
         "provider": "pexels", "asset_id": "clip", "source_page": "https://pexels.com/video/clip/",
         "license": "Pexels License", "path": "/tmp/clip.mp4", "sha256": digest,
+        "relevance_score": 1,
     }
     monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
         "duration": 4, "width": 1920, "height": 1080, "codec": "h264",
@@ -385,24 +383,13 @@ def test_automatic_stock_uses_cached_hash_and_query_decision_without_human_appro
     monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: digest)
     monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
                         lambda *_args: pytest.fail("automatic mode must not use human approval"))
-    registry = tmp_path / "auto-relevance.json"
-    monkeypatch.setattr(animated_explainer.visual_review, "_auto_relevance_path",
-                        lambda: registry)
-    animated_explainer.visual_review.record_auto_relevance(
-        digest, "jellyfish drifting", "relevant", verifier="local_vision",
-        model="test-local-vision", score=.93,
-        reason="Frames visibly contain jellyfish moving underwater.",
-    )
 
     eligible, reason, evidence = animated_explainer._stock_eligibility(
         candidate, required_seconds=3, policy="auto_eligible", query="jellyfish drifting",
     )
     assert eligible is True
-    assert reason == "local_vision_relevance_passed"
-    assert evidence["score"] == .93
-    assert animated_explainer.visual_review.cached_auto_relevance(
-        digest, "different query"
-    ) is None
+    assert reason == "pexels_search_match"
+    assert evidence["score"] == 1
 
 
 def test_automatic_candidate_download_path_never_checks_human_approval(tmp_path, monkeypatch):
@@ -430,8 +417,6 @@ def test_automatic_candidate_download_path_never_checks_human_approval(tmp_path,
                         lambda _path: "c" * 64)
     monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
                         lambda *_args: pytest.fail("automatic search path must not call human approval"))
-    monkeypatch.setattr(animated_explainer.visual_review,
-                        "local_vision_verifier_available", lambda: True)
 
     found = animated_explainer._search_and_cache_stock_candidate(
         "jellyfish", "pexels", "auto-clip-test", stock_media_policy="auto_eligible",
@@ -441,7 +426,7 @@ def test_automatic_candidate_download_path_never_checks_human_approval(tmp_path,
     assert "human_approval" not in found[0]
 
 
-def test_automatic_without_local_vision_does_not_download_uncertain_results(monkeypatch):
+def test_automatic_search_match_does_not_sample_for_human_review(monkeypatch):
     item = MaterialInfo(
         provider="pexels", url="https://videos.pexels.com/uncertain.mp4", duration=8,
         source_info={
@@ -454,16 +439,25 @@ def test_automatic_without_local_vision_does_not_download_uncertain_results(monk
                         lambda _provider: True)
     monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache",
                         lambda **_kwargs: [item])
-    monkeypatch.setattr(animated_explainer.visual_review,
-                        "local_vision_verifier_available", lambda: False)
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 8, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest", lambda _path: "digest")
+    downloaded = []
     monkeypatch.setattr(animated_explainer.material, "_save_material_item",
-                        lambda *_args: pytest.fail("uncertain search result must not be downloaded"))
+                        lambda *_args: downloaded.append(True) or "/tmp/pexels.mp4")
     monkeypatch.setattr(animated_explainer.visual_review, "human_approval",
                         lambda *_args: pytest.fail("automatic mode must not call human approval"))
+    monkeypatch.setattr(animated_explainer.visual_review, "sample_clip",
+                        lambda *_args, **_kwargs: pytest.fail("automatic mode must not sample for review"))
 
-    assert animated_explainer._search_and_cache_stock_candidate(
+    found = animated_explainer._search_and_cache_stock_candidate(
         "jellyfish", "pexels", "auto-no-vision", stock_media_policy="auto_eligible",
-    ) == []
+    )
+    assert len(found) == 1
+    assert "human_approval" not in found[0]
+    assert downloaded == [True]
+    assert found[0]["relevance_score"] == 1
 
 
 def test_stock_candidate_search_downloads_only_the_required_clip_count(tmp_path, monkeypatch):
@@ -504,10 +498,44 @@ def test_stock_candidate_search_downloads_only_the_required_clip_count(tmp_path,
     )
     results = animated_explainer._search_and_cache_stock_candidate(
         "bird singing", "pexels", "test-task", required_count=3,
+        stock_media_policy="manual_review",
     )
     assert len(saved) == 3
     assert len(results) == 3
     assert save_directories == [str(tmp_path / "persistent-storage" / "cache_videos")] * 3
+
+
+def test_automatic_search_stops_after_required_validated_and_prepared_clips(tmp_path, monkeypatch):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task: str(task_dir))
+    candidates = [MaterialInfo(
+        provider="pexels", url=f"https://cdn.pexels.com/auto-{i}.mp4", duration=8,
+        source_info={
+            "provider": "pexels", "asset_id": f"auto-{i}",
+            "license": "Pexels License", "tags": ["bird", "singing"],
+        },
+    ) for i in range(5)]
+    downloads, preparations = [], []
+    monkeypatch.setattr(animated_explainer.material, "stock_video_provider_configured", lambda _p: True)
+    monkeypatch.setattr(animated_explainer.material, "_search_videos_with_cache", lambda **_kw: candidates)
+    monkeypatch.setattr(animated_explainer.material, "_save_material_item",
+                        lambda item, _directory: downloads.append(item) or str(tmp_path / f"{item.source_info['asset_id']}.mp4"))
+    monkeypatch.setattr(animated_explainer, "_probe_video", lambda _path: {
+        "duration": 8, "width": 1920, "height": 1080, "codec": "h264",
+    })
+    monkeypatch.setattr(animated_explainer.task_artifacts, "file_digest",
+                        lambda path: Path(path).name)
+    monkeypatch.setattr(animated_explainer, "_prepare_stock_candidate",
+                        lambda candidate, _task, _seconds: preparations.append(candidate["asset_id"]) or candidate["path"])
+
+    found = animated_explainer._search_and_cache_stock_candidate(
+        "bird singing", "pexels", "auto-budget", required_count=2,
+        clip_seconds=4, stock_media_policy="auto_eligible",
+    )
+
+    assert len(found) == 2
+    assert len(downloads) == len(preparations) == 2
 
 
 def test_portrait_search_rendition_is_rejected_before_download(monkeypatch):
@@ -608,6 +636,7 @@ def test_stock_download_failure_tries_a_replacement_for_the_same_keyword(tmp_pat
 
     results = animated_explainer._search_and_cache_stock_candidate(
         "bird singing", "pexels", "test-task", required_count=1,
+        stock_media_policy="manual_review",
     )
 
     assert attempted == [candidates[0].url, candidates[1].url]
@@ -649,6 +678,7 @@ def test_unapproved_candidate_is_replaced_by_same_keyword_candidate(tmp_path, mo
 
     results = animated_explainer._search_and_cache_stock_candidate(
         "bird singing", "pexels", "test-task", required_count=1,
+        stock_media_policy="manual_review",
     )
 
     assert len(saved) == 2

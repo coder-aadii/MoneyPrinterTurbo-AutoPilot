@@ -13,16 +13,17 @@ class TestVisualStyle(unittest.TestCase):
         self.assertEqual(mode, visual_style.SAVAGE_ANIMATED_EXPLAINER)
         self.assertIn("local no-stock fallback", reason)
 
-    def test_auto_prefers_stock_for_a_presented_subject_without_fixed_queries(self):
-        mode, reason = visual_style.initial_selection(
-            visual_style.AUTO,
-            "तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।",
-            "Butterfly thermoregulation",
+    def test_auto_keeps_unknown_and_abstract_topics_on_local_explainer(self):
+        examples = (
+            ("अज्ञात सिद्धांत का असर बाद में समझ आता है।", "क्वांटम प्रभाव"),
+            ("तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।", "Butterfly thermoregulation"),
+            ("चार्ट में अर्थव्यवस्था की दिशा दिखती है।", "Economic direction"),
         )
-        self.assertEqual(mode, visual_style.RELEVANT_STOCK)
-        self.assertIn("directly illustrative real-world footage", reason)
-        self.assertTrue(visual_style.has_direct_visual_opportunity(
-            "तितलियाँ धूप में पंख फैलाकर ताप लेती हैं।", "Butterfly thermoregulation"))
+        for script, topic in examples:
+            with self.subTest(topic=topic):
+                mode, reason = visual_style.initial_selection(visual_style.AUTO, script, topic)
+                self.assertEqual(mode, visual_style.SAVAGE_ANIMATED_EXPLAINER)
+                self.assertIn("no semantic stock-fit evidence", reason)
 
     def test_auto_rejects_low_quality_jelly_and_reports_asmr_fallback(self):
         # Ordinary jelly metadata is not an approved ASMR review; no coverage means

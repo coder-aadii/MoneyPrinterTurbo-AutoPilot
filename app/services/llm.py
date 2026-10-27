@@ -1545,11 +1545,7 @@ def build_social_metadata_prompt(
     platform = _resolve_social_platform(platform)
     spec = SOCIAL_PLATFORMS[platform]
     label = SOCIAL_PLATFORM_LABELS.get(platform, platform)
-    language_instruction = (
-        "Write the title and caption in clear, natural English, regardless of narration language."
-        if platform == "youtube_shorts"
-        else _social_language_instruction(language)
-    )
+    language_instruction = _social_language_instruction(language)
     if platform == "youtube_shorts":
         platform_caption_rules = """
 8. Write exactly two complete prose sentences, each on its own line, followed by one separate hashtag line. Each sentence has at most 10 whitespace-separated words, counting emojis as words. Do not add a third prose sentence.

@@ -84,39 +84,15 @@ class TestVisualReview(unittest.TestCase):
                 self.assertIsNone(visual_review.human_approval("asset", "hash"))
                 self.assertEqual(json.loads(registry.read_text())[0]["status"], "rejected")
 
-    def test_automatic_relevance_cache_is_bound_to_file_hash_and_query(self):
+    def test_one_click_review_keeps_hash_bound_approval_without_text_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            registry = Path(temp_dir) / "auto-relevance.json"
-            content_hash = "a" * 64
-            with patch.object(visual_review, "_auto_relevance_path", return_value=registry):
-                visual_review.record_auto_relevance(
-                    content_hash, "jellyfish underwater", "relevant",
-                    verifier="local_vision", model="local-test-model", score=.93,
-                    reason="Sampled frames visibly contain jellyfish underwater.",
-                )
-                accepted = visual_review.cached_auto_relevance(
-                    content_hash, "jellyfish underwater"
-                )
-                self.assertEqual(accepted["decision"], "relevant")
-                self.assertIsNone(visual_review.cached_auto_relevance(
-                    "b" * 64, "jellyfish underwater"
-                ))
-                self.assertIsNone(visual_review.cached_auto_relevance(
-                    content_hash, "different visual query"
-                ))
-                self.assertEqual(json.loads(registry.read_text())[0]["sha256"], content_hash)
-
-    def test_conservative_policy_cannot_auto_approve_from_uncertainty(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(visual_review, "_auto_relevance_path",
-                              return_value=Path(temp_dir) / "auto-relevance.json"):
-                with self.assertRaises(ValueError):
-                    visual_review.record_auto_relevance(
-                        "a" * 64, "clip query", "relevant",
-                        verifier="conservative_policy", model="unavailable", score=.99,
-                        reason="No semantic visual evidence is available.",
-                    )
-
+            registry = Path(temp_dir) / "reviews.json"
+            with patch.object(visual_review, "_registry_path", return_value=registry):
+                visual_review.record_human_review("pexels-1", "a" * 64, "approved")
+                approval = visual_review.human_approval("pexels-1", "a" * 64)
+                self.assertEqual(approval["reviewer"], "WebUI user")
+                self.assertIn("WebUI stock review button", approval["reason"])
+                self.assertIsNone(visual_review.human_approval("pexels-1", "b" * 64))
 
 if __name__ == "__main__":
     unittest.main()

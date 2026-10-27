@@ -43,6 +43,13 @@ def test_pure_hindi_english_terms_abbreviations_and_unknown_identifiers():
     assert build_representations("Hello API", "en").spoken_script == "Hello API"
 
 
+def test_unseen_uppercase_initialisms_use_letter_names_without_dictionary_entries():
+    result = build_representations("QZX और R2D")
+    assert result.spoken_script == "क्यू ज़ेड एक्स और आर दो डी"
+    assert result.display_words[0].spoken_end == 3
+    assert result.display_words[1].spoken_start == 3
+
+
 def test_hyphenated_technical_words_preserve_display_and_align_as_pronunciation():
     result = build_representations("वाई-फाई Wi-Fi")
     assert result.spoken_script == "वाई-फाई वाई-फाई"
@@ -61,7 +68,7 @@ def test_chatgpt_and_ai_map_to_devanagari_before_hindi_alignment(tmp_path, monke
     assert task._alignment_preflight_errors(params, spoken, editable) == []
 
 
-def test_hinglish_proper_nouns_do_not_block_hindi_tts_or_alignment_preflight(tmp_path, monkeypatch):
+def test_ambiguous_hinglish_proper_nouns_require_resolution_before_tts(tmp_path, monkeypatch):
     editable = (
         "Greenland और Iceland के बीच ठंडा पानी बहता है। "
         "इसे Denmark Strait Cataract कहते हैं।"
@@ -71,7 +78,15 @@ def test_hinglish_proper_nouns_do_not_block_hindi_tts_or_alignment_preflight(tmp
         voice_name="gemini:Puck", subtitle_display_mode="word_by_word",
     )
     spoken = task._represent_script(params, editable).spoken_script
-    assert "Greenland" in spoken and "Iceland" in spoken
+    _set_test_vocab(tmp_path, monkeypatch, spoken)
+    errors = task._alignment_preflight_errors(params, spoken, editable)
+    assert any(item["code"] == "unresolved_latin_pronunciation" for item in errors)
+
+    params.pronunciation_overrides = {
+        "Greenland": "ग्रीनलैंड", "Iceland": "आइसलैंड",
+        "Denmark": "डेनमार्क", "Strait": "स्ट्रेट", "Cataract": "कैटरैक्ट",
+    }
+    spoken = task._represent_script(params, editable).spoken_script
     _set_test_vocab(tmp_path, monkeypatch, spoken)
     assert task._alignment_preflight_errors(params, spoken, editable) == []
 
@@ -83,6 +98,25 @@ def test_hinglish_proper_nouns_do_not_block_hindi_tts_or_alignment_preflight(tmp
         task.generate_audio("mixed-language-audio", params, editable)
 
     assert synthesize.call_args.kwargs["text"] == spoken
+
+
+def test_unresolved_latin_term_is_reported_before_tts(tmp_path, monkeypatch):
+    script = "यह QZX वैज्ञानिक शब्द Cloudberry के बारे में है।"
+    params = VideoParams(
+        video_subject="unseen terminology", video_language="hi",
+        voice_name="gemini:Puck", subtitle_display_mode="word_by_word",
+    )
+    spoken = task._represent_script(params, script).spoken_script
+    _set_test_vocab(tmp_path, monkeypatch, spoken)
+    with patch.object(task, "_mark_task_failed") as fail, \
+         patch.object(task.voice, "tts") as synthesize:
+        result = task.generate_audio("unresolved-term", params, script)
+
+    assert result == (None, None, None)
+    fail.assert_called_once()
+    assert fail.call_args.args[1] == "preflight"
+    assert "Cloudberry" in fail.call_args.kwargs["details"]["preflight_errors"][0]["tokens"]
+    synthesize.assert_not_called()
 
 
 def test_english_script_does_not_use_hindi_alignment_preflight():
@@ -111,8 +145,11 @@ def test_explicit_hinglish_slang_override_preserves_display_to_alignment_span():
 def _set_test_vocab(tmp_path, monkeypatch, text):
     vocab = {char: index for index, char in enumerate(set(text))}
     (tmp_path / "vocab.json").write_text(json.dumps(vocab, ensure_ascii=False), encoding="utf-8")
+    worker_python = tmp_path / "alignment-python"
+    worker_python.write_text("", encoding="utf-8")
     monkeypatch.setattr(subtitle, "_hindi_alignment_environment", lambda: {
         "MPT_HINDI_ALIGNMENT_MODEL": str(tmp_path),
+        "MPT_HINDI_ALIGNMENT_PYTHON": str(worker_python),
     })
 
 
@@ -120,7 +157,7 @@ def test_alignment_preflight_accepts_hinglish_abbreviations_and_explicit_overrid
     plain = build_representations("सच यह है कि bc काम करता है").spoken_script
     _set_test_vocab(tmp_path, monkeypatch, plain)
     errors = subtitle.preflight_hindi_alignment_script(plain, source_text="सच यह है कि bc काम करता है")
-    assert errors == []
+    assert any(error["code"] == "unresolved_latin_pronunciation" for error in errors)
 
     resolved = build_representations(
         "सच यह है कि bc काम करता है", pronunciation_overrides={"bc": "बी सी"}
@@ -141,11 +178,11 @@ def test_preflight_detects_unknown_alignment_characters_and_dropped_symbols(tmp_
 
 
 def test_hinglish_tts_runs_and_cached_audio_avoids_repeating_tts(tmp_path, monkeypatch):
-    spoken = "सच यह है कि क्लाइंट काम करता है"
+    spoken = "सच यह है कि बी सी काम करता है क्लाइंट"
     _set_test_vocab(tmp_path, monkeypatch, spoken)
     params = VideoParams(
         video_subject="client behavior", video_language="Hindi", voice_name="gemini:Puck",
-        subtitle_display_mode="word_by_word",
+        subtitle_display_mode="word_by_word", pronunciation_overrides={"bc": "बी सी"},
     )
     with patch.object(task, "resolve_custom_audio_file", return_value=None), \
          patch.object(task.utils, "task_dir", return_value=str(tmp_path)), \
@@ -154,7 +191,7 @@ def test_hinglish_tts_runs_and_cached_audio_avoids_repeating_tts(tmp_path, monke
          patch.object(task.sm.state, "update_task"):
         result = task.generate_audio("preflight-task", params, "यह bc काम करता है")
     assert result[:2] == (str(tmp_path / "audio.mp3"), 2)
-    assert tts.call_args.kwargs["text"] == "यह bc काम करता है"
+    assert tts.call_args.kwargs["text"] == "यह बी सी काम करता है"
 
     audio = tmp_path / "cached.mp3"
     audio.write_bytes(b"cached audio")

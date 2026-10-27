@@ -22,6 +22,7 @@ class ChannelProfile(BaseModel):
     duration_enforcement: Literal["flexible", "warn_only", "strict"] = "flexible"
     video_aspect: VideoAspect = VideoAspect.portrait
     stock_video_style: StockVideoStyle = "default"
+    stock_media_policy: Literal["manual_review", "auto_eligible"] = "auto_eligible"
     visual_style: VisualStyle = "savage_animated_explainer"
     visual_style_rotation: list[VisualStyle] = Field(default_factory=list, max_length=3)
     fact_verification_policy: Literal["off", "advisory", "strict"] = "advisory"
@@ -135,9 +136,20 @@ class ChannelProfile(BaseModel):
     @field_validator("generation_settings")
     @classmethod
     def reject_credential_fields(cls, value: dict[str, str | int | float | bool]):
-        allowed = {"model", "quality", "resolution", "duration", "seed", "style", "temperature"}
+        # TTS provider is a non-secret generation preference consumed by the
+        # shared generation-settings resolver and copied into task snapshots.
+        allowed = {
+            "model", "quality", "resolution", "duration", "seed", "style",
+            "temperature", "tts_provider",
+        }
         if any(key not in allowed for key in value):
             raise ValueError("generation_settings only accepts non-secret generation options")
+        if "tts_provider" in value and (
+            not isinstance(value["tts_provider"], str)
+            or not value["tts_provider"].strip()
+            or len(value["tts_provider"]) > 100
+        ):
+            raise ValueError("generation_settings tts_provider must be a non-empty provider id")
         return value
 
 

@@ -13,7 +13,7 @@ from app.models import const
 from app.models.autopilot import ContentPlanCreate
 from app.models.channel_profile import ChannelProfile
 from app.controllers.v1 import autopilot as autopilot_controller
-from app.services import autopilot
+from app.services import autopilot, channel_profiles
 from app.services.state import MemoryState
 
 
@@ -48,6 +48,26 @@ class TestAutopilot(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_manual_job_saves_selected_stock_policy_in_snapshot(self):
+        profile = self.profiles[1]
+        for policy, topic, script in (
+            ("manual_review", "Jellyfish in moonlit water", "Glowing jellyfish swim beneath a moonlit sea."),
+            ("auto_eligible", "Ancient stars and planets", "Distant planets orbit ancient stars across the galaxy."),
+        ):
+            plan = self.service.plan(
+                profile.channel_id,
+                ContentPlanCreate(
+                    topic=topic, script=script,
+                    min_duration_seconds=5, max_duration_seconds=60,
+                    visual_style_override="savage_animated_explainer",
+                ),
+                manual_overrides={"stock_media_policy": policy},
+            )
+            self.service.ready(profile.channel_id, plan.plan_id)
+            job = self.service.create_job(profile.channel_id, plan.plan_id)
+            self.assertEqual(job.profile_snapshot["stock_media_policy"], policy)
+            self.assertEqual(job.params_snapshot["stock_media_policy"], policy)
+
     @staticmethod
     def hindi_script(words=66, topic="fact"):
         token = autopilot.normalize_content(topic).replace(" ", "_")
@@ -62,8 +82,8 @@ class TestAutopilot(unittest.TestCase):
             max_duration_seconds=30,
         ))
 
-    def ready_job(self, topic="Why the Moon looks larger", script=None):
-        plan = self.plan(topic=topic, script=script)
+    def ready_job(self, topic="Why the Moon looks larger", script=None, profile=None):
+        plan = self.plan(profile=profile, topic=topic, script=script)
         reviewed = self.service.ready(plan.channel_id, plan.plan_id)
         return self.service.create_job(plan.channel_id, reviewed.plan_id)
 
@@ -101,7 +121,7 @@ class TestAutopilot(unittest.TestCase):
         )
 
     def test_task_visual_style_override_is_persisted_through_job_snapshot(self):
-        profile = self.profiles[0]
+        profile = self.profiles[1]
         plan = self.service.plan(
             profile.channel_id,
             ContentPlanCreate(
@@ -121,12 +141,15 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(job.params_snapshot["visual_style"], "relevant_stock")
 
     def test_youtube_metadata_is_generated_once_persisted_and_limited_to_50_words(self):
-        profile = self.profiles[0]
+        profile = self.profiles[1]
         profile = self.service.profile_store.update(
             profile.channel_id, profile.model_copy(update={"channel_hashtag": "#FactsSunLeBhai"}),
             profile.version,
         )
-        job = self.ready_job(topic="What makes a star", script="A star is a sphere of plasma.")
+        job = self.ready_job(
+            topic="What makes a star", script="A star is a sphere of plasma.",
+            profile=profile,
+        )
         self.service.store.transition(job.job_id, "queued")
         self.service.store.transition(job.job_id, "generating")
         self.service.store.transition(job.job_id, "generated")
@@ -155,10 +178,13 @@ class TestAutopilot(unittest.TestCase):
         self.assertIn("Rewrite the caption", call.call_args.kwargs["caption_feedback"])
         self.assertEqual(call.call_args.kwargs["platform"], "youtube_shorts")
         self.assertEqual(call.call_args.kwargs["language"], "English")
-        self.assertIn("Hindi ASMR Facts", call.call_args.kwargs["channel_context"])
+        self.assertIn("Science Facts", call.call_args.kwargs["channel_context"])
 
     def test_upload_metadata_reuses_caption_saved_with_completed_task(self):
-        job = self.ready_job(topic="What makes a star", script="A star is a sphere of plasma.")
+        job = self.ready_job(
+            topic="What makes a star", script="A star is a sphere of plasma.",
+            profile=self.profiles[1],
+        )
         self.service.store.transition(job.job_id, "queued")
         self.service.store.transition(job.job_id, "generating")
         self.service.store.transition(job.job_id, "generated")
@@ -232,6 +258,8 @@ class TestAutopilot(unittest.TestCase):
             self.service.ensure_youtube_metadata(job.job_id)
 
         context = json.loads(call.call_args.kwargs["channel_context"])
+        self.assertEqual(call.call_args.kwargs["language"], "English")
+        self.assertEqual(context["caption_language"], "English")
         self.assertEqual(context["voice_name"], "gemini:Puck-Upbeat")
         self.assertEqual(context["narrator_preset"], profile.narrator_preset)
         self.assertEqual(context["intro"]["text"], "Welcome to Science Facts.")
@@ -250,8 +278,8 @@ class TestAutopilot(unittest.TestCase):
         invalid = {"title": "Paisa", "caption": "Aakhir paisa kahan jata hai?" * 4,
                    "hashtags": ["#Money", "#Economy", "#Flow", "#Facts", "#Shorts"]}
         valid = {
-            "title": "Where Does Money Go?",
-            "caption": "Where does money go? 💸🤔\nIt moves from shops to banks! 🔄✨",
+            "title": "पैसा कहाँ जाता है?",
+            "caption": "आखिर पैसा कहाँ जाता है? 💸🤔\nयह दुकानों से बैंकों तक घूमता है! 🔄✨",
             "hashtags": ["#MoneyFlow", "#Economy", "#CircularFlow", "#HindiFacts", "#HindiASMRFacts"],
         }
         with patch.object(autopilot.llm, "generate_social_metadata", side_effect=[invalid, valid]) as call:
@@ -270,7 +298,7 @@ class TestAutopilot(unittest.TestCase):
             "#MoneyFlow #Economy #CircularFlow #HindiFacts #HindiASMRFacts"
         )
         errors = autopilot.AutopilotService._youtube_caption_validation_errors(
-            caption, "#HindiASMRFacts",
+            caption, "#HindiASMRFacts", "English",
         )
         self.assertIn("incomplete phrase or question", "; ".join(errors))
         self.assertIn("caption must be written in English", "; ".join(errors))
@@ -292,14 +320,14 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(len(lines), 3)
         self.assertEqual(
             autopilot.AutopilotService._youtube_caption_validation_errors(
-                metadata["caption"], metadata["channel_hashtag"],
+                metadata["caption"], metadata["channel_hashtag"], metadata["language"],
             ), [],
         )
-        self.assertEqual(lines[0], "What makes this idea surprising? 🔍🤔")
-        self.assertEqual(lines[1], "The video explains the main process. 💡✨")
-        self.assertFalse(any("\u0900" <= char <= "\u097f" for line in lines[:2] for char in line))
+        self.assertEqual(lines[0], "पैसा आखिर कहाँ जाता है? 🔍🤔")
+        self.assertEqual(lines[1], "दुकान से सप्लायर तक घूमता है। 💡✨")
+        self.assertTrue(any("\u0900" <= char <= "\u097f" for line in lines[:2] for char in line))
         self.assertLessEqual(len(metadata["caption"].split()), 50)
-        self.assertEqual(metadata["title"], "The Story Behind This Idea")
+        self.assertEqual(metadata["title"], "पैसा कहाँ जाता है?")
         self.assertEqual(call.call_count, 2)
 
     def test_youtube_caption_edit_requires_two_sentences_emojis_and_channel_hashtag(self):
@@ -322,7 +350,7 @@ class TestAutopilot(unittest.TestCase):
                 )
             edited = self.service.save_youtube_caption(
                 job.job_id,
-                "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #HindiASMRFacts",
+                "तारे चमकते हैं? 🔭🤔\nवे रोशनी देते हैं। 🌟💡\n#Stars #Space #Science #Astronomy #HindiASMRFacts",
             )
         self.assertEqual(edited["caption"].splitlines()[-1].split(), edited["hashtags"])
 
@@ -644,6 +672,18 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(resolved["narrator_preset"], "desi_savage_aggressive")
         self.assertEqual(resolved["profanity_level"], "mild")
         self.assertEqual(resolved["tts_model"], profile.tts_model)
+
+    def test_manual_tts_provider_override_reaches_saved_profile_and_task_preview(self):
+        profile = self.profiles[0]
+        selected = self.service._manual_profile(
+            profile.channel_id, {"tts_provider": "gemini-tts"}
+        )
+        self.assertEqual(selected.generation_settings["tts_provider"], "gemini-tts")
+        preview = channel_profiles.build_preview(selected)
+        self.assertEqual(preview.params.tts_provider, "gemini-tts")
+        self.assertEqual(
+            preview.params.resolved_generation_settings.tts_provider, "gemini-tts"
+        )
 
     def test_failure_details_redact_configured_provider_credentials(self):
         with patch.object(autopilot.config, "app", {"provider_api_key": "test-secret-123"}):
@@ -1623,6 +1663,61 @@ class TestAutopilot(unittest.TestCase):
             receipt = conn.execute("SELECT * FROM publications WHERE job_id=?", (job.job_id,)).fetchone()
         self.assertEqual(receipt["provider_video_id"], "yt123")
         self.assertEqual(receipt["provider_url"], "https://youtube.test/yt123")
+
+    def test_upload_post_uses_each_pinned_channels_audience_setting(self):
+        from unittest.mock import MagicMock
+
+        jobs = []
+        for index, (profile, made_for_kids) in enumerate(zip(self.profiles, (True, False))):
+            updated = self.service.profile_store.update(
+                profile.channel_id,
+                profile.model_copy(update={"youtube_made_for_kids": made_for_kids}),
+                profile.version,
+            )
+            plan = self.service.plan(updated.channel_id, ContentPlanCreate(
+                topic=f"Audience profile {index}",
+                script=self.hindi_script(topic=f"audience-{index}"),
+                min_duration_seconds=25, max_duration_seconds=30,
+            ))
+            ready = self.service.ready(updated.channel_id, plan.plan_id)
+            job = self.service.create_job(updated.channel_id, ready.plan_id)
+            self.service.store.queue(job.job_id)
+            self.service.store.claim(
+                job.job_id, f"task-{index}",
+                f"{autopilot.socket.gethostname()}:{os.getpid()}",
+            )
+            self.service.store.transition(
+                job.job_id, "generated", output_artifacts_json='["/tmp/video.mp4"]',
+                actual_duration_seconds=28,
+            )
+            with self.service.store._connection() as conn:
+                conn.execute(
+                    "INSERT INTO job_qa VALUES (?, 'qa_passed', '{}', NULL, NULL, ?)",
+                    (job.job_id, autopilot._now()),
+                )
+            jobs.append(job)
+
+        uploader = MagicMock()
+        uploader.connected_platform.side_effect = lambda _platform, username, *_args: {
+            "username": username, "handle": username,
+        }
+        uploader.upload_video.side_effect = [
+            {"success": True, "request_id": f"request-{index}",
+             "results": {"youtube": {"success": True, "video_id": f"video-{index}"}}}
+            for index in range(2)
+        ]
+        with patch.object(self.service, "qa_report", return_value={"passed": True, "checks": {}}), \
+             patch.object(autopilot, "UploadPostService", return_value=uploader), \
+             patch.object(autopilot.config, "app", {
+                 "upload_post_api_key": "local-secret", "upload_post_enabled": True,
+                 "upload_post_youtube_made_for_kids": True,
+             }):
+            for job in jobs:
+                self.service.publish_job(job.job_id, platform="youtube")
+
+        declarations = [call.kwargs["youtube_extra"]["selfDeclaredMadeForKids"]
+                        for call in uploader.upload_video.call_args_list]
+        self.assertEqual(declarations, [True, False])
 
     def test_youtube_and_instagram_publications_are_independent_destinations(self):
         from unittest.mock import MagicMock

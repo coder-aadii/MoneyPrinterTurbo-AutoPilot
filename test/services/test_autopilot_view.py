@@ -174,6 +174,7 @@ def test_edit_form_prepopulation_is_applied_once_across_reruns():
             "visual_style": "relevant_stock", "video_language": "en",
             "narrator_preset": "standard", "profanity_level": "mild",
             "fact_verification_policy": "strict", "subtitle_enabled": False,
+            "stock_media_policy": "auto_eligible",
         },
     }
     state = {}
@@ -185,6 +186,7 @@ def test_edit_form_prepopulation_is_applied_once_across_reruns():
     assert state["simple_style_channel-a"] == "Relevant Stock"
     assert state["simple_language_channel-a"] == "English"
     assert state["simple_fact_policy_channel-a"] == "strict"
+    assert state["simple_stock_policy_channel-a"] == "auto_eligible"
     sync_manual_style_state(
         state, "channel-a", 1, "savage_animated_explainer",
         namespace["VISUAL_STYLE_VALUES"], 30, "9:16",
@@ -363,6 +365,45 @@ job = SimpleNamespace(job_id="gallery-test", topic="A long title", state="failed
                 if keyword.arg == "width") == 190
     assert next(keyword.value.value for keyword in popover.keywords
                 if keyword.arg == "on_change") == "rerun"
+
+
+def test_my_videos_details_exposes_saved_stock_review():
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    dialog = _main_function("_render_autopilot_gallery_details_dialog")
+    code = '''
+import streamlit as st
+from datetime import datetime
+from types import SimpleNamespace
+sm = SimpleNamespace(state=SimpleNamespace(get_task=lambda _: {}))
+_autopilot_failure_help = lambda message: message
+_render_savage_stock_review = lambda task_id: st.caption("Stock review for " + task_id)
+job = SimpleNamespace(job_id="job-1", mpt_task_id="saved-task", created_at=datetime(2026, 10, 27),
+    params_snapshot={}, profile_snapshot={}, fact_verification_state="unverified",
+    failure_details="", script="Saved narration", parent_job_id=None)
+'''
+    code += ast.get_source_segment(source, dialog)
+    code += '\n_render_autopilot_gallery_details_dialog(job)\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    assert any("Stock review for saved-task" in item.value for item in app.get("caption"))
+
+
+def test_gallery_details_action_closes_popover():
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    helper = _main_function("_close_autopilot_gallery_action_menu")
+    code = 'import streamlit as st\n'
+    code += ast.get_source_segment(source, helper)
+    code += '''
+st.session_state.setdefault("gallery_actions_job-1", True)
+with st.popover("Actions", key="gallery_actions_job-1", on_change="rerun"):
+    st.button("View details", key="details", on_click=_close_autopilot_gallery_action_menu,
+              args=("job-1",))
+'''
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    app.button(key="details").click().run()
+    assert not app.exception
+    assert app.session_state["gallery_actions_job-1"] is False
 
 
 def test_gallery_selection_uses_stable_native_thumbnail_button_and_toggles_on_rerun():
@@ -747,3 +788,18 @@ def test_gallery_multi_download_zip_has_safe_names_and_a_size_limit(tmp_path):
 
     with pytest.raises(ValueError, match="256 MB"):
         namespace["_build_autopilot_gallery_zip"]([(jobs[0], str(first))], max_total_bytes=2)
+
+
+def test_gallery_zip_is_built_only_when_download_is_requested():
+    node = _main_function("_render_autopilot_videos_fragment")
+    download = next(
+        call for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "result_cols[1].download_button"
+        and call.args and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == "Download selected (ZIP)"
+    )
+    data = download.args[1]
+    assert isinstance(data, ast.Lambda)
+    assert isinstance(data.body, ast.Call)
+    assert ast.unparse(data.body.func) == "_build_autopilot_gallery_zip"

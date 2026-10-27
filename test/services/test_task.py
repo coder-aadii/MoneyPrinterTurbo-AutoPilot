@@ -41,6 +41,13 @@ class TestTaskService(unittest.TestCase):
         )
         self.social_metadata_patcher.start()
         self.addCleanup(self.social_metadata_patcher.stop)
+        self.source_research_patcher = patch.object(
+            tm.source_research,
+            "verify_script",
+            side_effect=tm.source_research.ResearchUnavailable("offline task-test fixture"),
+        )
+        self.source_research_patcher.start()
+        self.addCleanup(self.source_research_patcher.stop)
 
     def tearDown(self):
         with tm._cross_post_registry_lock:
@@ -186,19 +193,27 @@ class TestTaskService(unittest.TestCase):
             custom_system_prompt="Only write short narration.",
         )
 
-        with patch.object(
-            tm.llm, "generate_script", return_value="生成的文案"
-        ) as generate:
-            result = tm.generate_script("task-id", params)
+        task_id = f"test-script-options-{uuid4()}"
+        task_dir = utils.task_dir(task_id)
+        try:
+            with patch.object(
+                tm.llm, "generate_script", return_value="生成的文案"
+            ) as generate:
+                result = tm.generate_script(task_id, params)
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
 
         self.assertEqual(result, "生成的文案")
-        generate.assert_called_once_with(
-            video_subject="咖啡",
-            language="zh-CN",
-            paragraph_number=2,
-            video_script_prompt="语气轻松",
-            custom_system_prompt="Only write short narration.",
-        )
+        generate.assert_called_once()
+        kwargs = generate.call_args.kwargs
+        self.assertEqual(kwargs["video_subject"], "咖啡")
+        self.assertEqual(kwargs["language"], "zh-CN")
+        self.assertEqual(kwargs["paragraph_number"], 2)
+        self.assertTrue(kwargs["video_script_prompt"].startswith("语气轻松\n"))
+        self.assertIn("Narration duration target:", kwargs["video_script_prompt"])
+        self.assertEqual(kwargs["custom_system_prompt"], "Only write short narration.")
+        self.assertEqual(kwargs["visual_style"], "savage_animated_explainer")
+        self.assertEqual(kwargs["profanity_level"], "savage_monetization_aware")
 
     def test_generate_final_videos_forwards_clip_speed_and_fit_mode(self):
         """任务编排层必须把画面速度和适配模式传给视频合成服务。"""
@@ -655,7 +670,8 @@ class TestTaskService(unittest.TestCase):
         generate_audio.assert_not_called()
         get_materials.assert_not_called()
         failed_task = state.get_task("missing-sonilo-key")
-        self.assertEqual(result, failed_task)
+        self.assertEqual(result["task_id"], failed_task["task_id"])
+        self.assertEqual(result["failed_stage"], failed_task["failed_stage"])
         self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
         self.assertEqual(failed_task["failed_stage"], "preflight")
         self.assertIn("API key", failed_task["error"])
@@ -965,13 +981,15 @@ class TestTaskService(unittest.TestCase):
         with patch.object(
             tm.llm, "generate_terms", return_value=["city", "train"]
         ) as generate:
-            result = tm.generate_terms("task-id", params, "先城市，再地铁")
+            result = tm.generate_terms(
+                "task-id", params, "शहर में लोग यात्रा करते हैं। फिर ट्रेन आगे बढ़ती है।"
+            )
 
         self.assertEqual(result, ["city", "train"])
         generate.assert_called_once_with(
             video_subject="城市通勤",
-            video_script="先城市，再地铁",
-            amount=8,
+            video_script="शहर में लोग यात्रा करते हैं। फिर ट्रेन आगे बढ़ती है।",
+            amount=2,
             match_script_order=True,
             stock_video_style="default",
         )
@@ -1372,10 +1390,15 @@ class TestTaskService(unittest.TestCase):
             subtitle_display_mode="word_by_word",
         )
 
-        def fake_whisper_create(audio_file, subtitle_file, word_level=False):
+        def fake_whisper_create(
+            audio_file, subtitle_file, word_level=False, language=None, local_only=False,
+        ):
             self.assertTrue(word_level)
+            self.assertIsNone(language)  # Let Whisper detect the custom-audio language.
+            self.assertTrue(local_only)  # This path must not trigger a model download.
             Path(subtitle_file).write_text(
-                "1\n00:00:00,000 --> 00:00:00,500\nHello\n\n",
+                "1\n00:00:00,000 --> 00:00:00,500\nHello\n\n"
+                "2\n00:00:00,500 --> 00:00:01,000\nworld.\n\n",
                 encoding="utf-8",
             )
 
@@ -1409,6 +1432,8 @@ class TestTaskService(unittest.TestCase):
             audio_file=audio_file,
             subtitle_file=created_path,
             word_level=True,
+            language=None,
+            local_only=True,
         )
         correct.assert_not_called()
 
@@ -1511,7 +1536,10 @@ class TestTaskService(unittest.TestCase):
 
         for stop_at, expected in expected_results.items():
             with self.subTest(stop_at=stop_at):
-                params = VideoParams(video_subject="Coffee")
+                params = VideoParams(
+                    video_subject="Coffee", visual_style="relevant_stock",
+                    subtitle_enabled=False, fact_verification_policy="off",
+                )
                 with (
                     patch.object(
                         tm, "generate_script", return_value="generated script"
@@ -1544,7 +1572,7 @@ class TestTaskService(unittest.TestCase):
                         f"intermediate-{stop_at}", params, stop_at=stop_at
                     )
 
-                self.assertEqual(result, expected)
+                self.assertTrue(all(result.get(key) == value for key, value in expected.items()))
                 generate_final.assert_not_called()
 
     def test_start_forwards_trusted_server_file_flag_to_audio_stage(self):
@@ -1569,7 +1597,10 @@ class TestTaskService(unittest.TestCase):
                 allow_server_file_input=True,
             )
 
-        self.assertEqual(result, {"audio_file": "audio.mp3", "audio_duration": 5})
+        self.assertEqual(result["audio_file"], "audio.mp3")
+        self.assertEqual(result["audio_duration"], 5)
+        self.assertEqual(result["actual_narration_duration_seconds"], 5.0)
+        self.assertEqual(result["duration_enforcement"], "flexible")
         generate_audio.assert_called_once_with(
             "trusted-cli-audio",
             params,
@@ -1583,7 +1614,10 @@ class TestTaskService(unittest.TestCase):
         完整任务在自动发布未配置时仍应稳定完成，并把所有中间产物写入最终
         状态。这里还覆盖 API 可能传入字符串拼接模式的兼容转换。
         """
-        params = VideoParams(video_subject="Coffee")
+        params = VideoParams(
+            video_subject="Coffee", visual_style="relevant_stock",
+            subtitle_enabled=False, fact_verification_policy="off",
+        )
         params.video_concat_mode = "sequential"
 
         with (
@@ -1629,7 +1663,12 @@ class TestTaskService(unittest.TestCase):
         )
 
     def test_autopilot_suppresses_global_immediate_auto_upload(self):
-        params = VideoParams(video_subject="Pinned Autopilot topic")
+        params = VideoParams(
+            video_subject="Pinned Autopilot topic",
+            visual_style="relevant_stock",
+            subtitle_enabled=False,
+            fact_verification_policy="off",
+        )
         with (
             patch.object(tm, "generate_script", return_value="script"),
             patch.object(tm, "generate_terms", return_value=["term"]),
@@ -1672,7 +1711,10 @@ class TestTaskService(unittest.TestCase):
         for stage, failure_results in failure_cases.items():
             with self.subTest(stage=stage):
                 audio_result, materials_result, videos_result = failure_results
-                params = VideoParams(video_subject="Coffee")
+                params = VideoParams(
+                    video_subject="Coffee", visual_style="relevant_stock",
+                    subtitle_enabled=False, fact_verification_policy="off",
+                )
                 state = MemoryState()
                 with (
                     patch.object(
@@ -1697,7 +1739,8 @@ class TestTaskService(unittest.TestCase):
                     result = tm.start(f"failed-{stage}", params)
 
                 failed_task = state.get_task(f"failed-{stage}")
-                self.assertEqual(result, failed_task)
+                self.assertEqual(result["task_id"], failed_task["task_id"])
+                self.assertEqual(result["failed_stage"], failed_task["failed_stage"])
                 self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
                 self.assertEqual(failed_task["failed_stage"], stage)
                 self.assertTrue(failed_task["error"])
@@ -1718,7 +1761,7 @@ class TestTaskService(unittest.TestCase):
             result = tm.start("unexpected-failure", params)
 
         failed_task = state.get_task("unexpected-failure")
-        self.assertEqual(result, failed_task)
+        self.assertEqual(result["task_id"], failed_task["task_id"])
         self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
         self.assertEqual(failed_task["failed_stage"], "pipeline")
         self.assertEqual(
@@ -1734,6 +1777,9 @@ class TestTaskService(unittest.TestCase):
         params = VideoParams(
             video_subject="Coffee",
             video_language="en",
+            visual_style="relevant_stock",
+            subtitle_enabled=False,
+            fact_verification_policy="off",
         )
         metadata = {
             "title": "Morning Coffee",
@@ -1807,7 +1853,9 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(generate_metadata.call_count, 2)
         for metadata_call in generate_metadata.call_args_list:
             self.assertEqual(metadata_call.kwargs["video_subject"], "Coffee")
-            self.assertEqual(metadata_call.kwargs["video_script"], "generated script")
+            self.assertEqual(
+                metadata_call.kwargs["video_script"], "Final narration: generated script"
+            )
             self.assertEqual(metadata_call.kwargs["language"], "English")
             self.assertEqual(metadata_call.kwargs["platform"], "youtube_shorts")
             self.assertIn("voice_name", metadata_call.kwargs["channel_context"])
@@ -1843,7 +1891,10 @@ class TestTaskService(unittest.TestCase):
 
     def test_start_returns_before_cross_post_worker_runs(self):
         """视频任务完成时只提交发布工作，不能在生成线程中同步上传。"""
-        params = VideoParams(video_subject="Coffee")
+        params = VideoParams(
+            video_subject="Coffee", visual_style="relevant_stock",
+            subtitle_enabled=False, fact_verification_policy="off",
+        )
         service = tm.upload_post.upload_post_service
         state = MemoryState()
         submitted = []
@@ -2032,7 +2083,10 @@ class TestTaskService(unittest.TestCase):
 
     def test_start_returns_cross_post_scheduling_failure(self):
         """同步调度失败必须同时体现在任务状态和 start() 返回快照中。"""
-        params = VideoParams(video_subject="Coffee")
+        params = VideoParams(
+            video_subject="Coffee", visual_style="relevant_stock",
+            subtitle_enabled=False, fact_verification_policy="off",
+        )
         service = tm.upload_post.upload_post_service
         state = MemoryState()
 
@@ -2272,7 +2326,7 @@ class TestTaskService(unittest.TestCase):
                 generate_metadata.assert_called_once_with(
                     video_subject="Coffee",
                     video_script="A short coffee story.",
-                    language="en",
+                    language="English",
                     platform=expected_platform,
                 )
                 cross_post.assert_called_once()
@@ -2327,7 +2381,7 @@ class TestTaskService(unittest.TestCase):
         generate_metadata.assert_called_once_with(
             video_subject="Coffee",
             video_script="A short coffee story.",
-            language="en",
+            language="English",
             platform="youtube_shorts",
         )
         expected_extra = {

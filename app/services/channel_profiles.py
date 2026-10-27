@@ -166,6 +166,7 @@ def build_preview(profile: ChannelProfile, job_values: dict[str, Any] | None = N
         },
         "video_aspect": profile.video_aspect.value,
         "stock_video_style": profile.stock_video_style,
+        "stock_media_policy": profile.stock_media_policy,
         "visual_style": profile.visual_style,
         "asmr_categories": profile.asmr_categories,
         "video_source": profile.video_source,

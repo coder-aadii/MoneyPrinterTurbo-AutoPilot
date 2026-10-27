@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
-
-from app.services import scene_spec
 
 AUTO = "auto"
 ASMR_CUTTING = "asmr_cutting"
@@ -120,16 +117,6 @@ def preset_for(style: str) -> StylePreset:
     except KeyError as exc:
         raise ValueError(f"unsupported visual style: {style}") from exc
 
-def has_direct_visual_opportunity(script: str, topic: str = "") -> bool:
-    """Prefer stock for narration beats that present a subject, not a relation."""
-    text = script or topic
-    sentences = [part.strip() for part in re.split(r"[।?!\n]+", text) if part.strip()]
-    if not sentences:
-        return False
-    plans = [scene_spec.plan_scene(sentence) for sentence in sentences]
-    return sum(plan.primitive == "label" for plan in plans) >= max(1, len(plans) // 2)
-
-
 def initial_selection(requested: str, script: str, topic: str = "") -> tuple[str, str]:
     """Resolve AUTO to one coherent style before script/TTS generation."""
     if requested == SAVAGE_ANIMATED_EXPLAINER:
@@ -146,14 +133,9 @@ def initial_selection(requested: str, script: str, topic: str = "") -> tuple[str
     text = f"{topic}\n{script}".casefold()
     if any(term in text for term in ("cutting", "satisfying", "slicing", "asmr", "काट")):
         return ASMR_CUTTING, "AUTO selected ASMR Cutting for an explicitly satisfying-cutting topic."
-    if has_direct_visual_opportunity(script, topic):
-        return RELEVANT_STOCK, (
-            "AUTO selected Relevant Stock before scripting because the topic names a subject "
-            "with directly illustrative real-world footage."
-        )
     return SAVAGE_ANIMATED_EXPLAINER, (
-        "AUTO selected Savage Animated Explainer for a conceptual or comparison topic; "
-        "the local character pack and original topic diagrams need no stock fallback."
+        "AUTO selected Savage Animated Explainer because the available scene planner provides "
+        "no semantic stock-fit evidence; local characters and diagrams remain the safe fallback."
     )
 
 

@@ -57,6 +57,31 @@ class TestChannelProfiles(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.profile(generation_settings={"provider_api_key": "must-not-persist"})
 
+    def test_tts_provider_is_validated_persisted_and_resolved_into_task_preview(self):
+        for provider, voice_name in (
+            ("gemini-tts", "gemini:Puck-Upbeat"),
+            ("azure-tts-v1", "en-US-AriaNeural"),
+        ):
+            with self.subTest(provider=provider):
+                profile = self.store.create(self.profile(
+                    language="hi", voice_name=voice_name,
+                    generation_settings={"tts_provider": provider},
+                ))
+                reopened = service.ChannelProfileStore(self.store.database_path)
+                saved = reopened.get(profile.channel_id)
+                self.assertEqual(saved.generation_settings["tts_provider"], provider)
+                params = service.build_preview(saved).params
+                self.assertEqual(params.tts_provider, provider)
+                self.assertEqual(params.resolved_generation_settings.tts_provider, provider)
+
+    def test_generation_settings_reject_unknown_and_secret_options(self):
+        for options in (
+            {"api_key": "secret"}, {"made_up_option": "value"},
+            {"tts_provider": ""}, {"tts_provider": 123},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValidationError):
+                self.profile(generation_settings=options)
+
     def test_stale_concurrent_update_cannot_overwrite_new_version(self):
         first = self.store.create(self.profile())
         barrier = threading.Barrier(2)
@@ -81,6 +106,7 @@ class TestChannelProfiles(unittest.TestCase):
         self.assertEqual(preview.params.video_script, "Exact script")
         self.assertEqual(preview.params.video_language, "hi")
         self.assertEqual(preview.params.asmr_categories, ["soap", "jelly"])
+        self.assertEqual(preview.params.stock_media_policy, "auto_eligible")
         self.assertIn("28 seconds", preview.params.video_script_prompt)
 
     def test_preview_pins_channel_branding_for_manual_and_scheduled_snapshots(self):

@@ -1580,7 +1580,7 @@ def _apply_restored_params(params):
     )
     restored_stock_policy = (
         params.get("stock_media_policy")
-        or config.app.get("stock_media_policy", "manual_review")
+        or config.app.get("stock_media_policy", "auto_eligible")
     )
     if restored_stock_policy not in {"manual_review", "auto_eligible"}:
         restored_stock_policy = "manual_review"
@@ -2104,21 +2104,22 @@ def _render_savage_stock_review(task_id):
     candidates = {}
     for entry in report:
         if (not isinstance(entry, dict)
-                or entry.get("provider") != "pexels"
+                or entry.get("provider") not in material.STOCK_VIDEO_PROVIDER_PRIORITY
                 or entry.get("approval_status") != "human_review_required"):
             continue
+        provider = str(entry.get("provider"))
         asset_id, digest = str(entry.get("asset_id") or ""), str(entry.get("sha256") or "")
         if asset_id and re.fullmatch(r"[0-9a-f]{64}", digest):
-            candidates.setdefault((asset_id, digest), entry)
+            candidates.setdefault((provider, asset_id, digest), entry)
     if not candidates:
         return
-    with st.expander("Pexels footage review", expanded=False):
+    with st.expander("Stock footage review", expanded=False):
         st.caption(
             "Review the actual cached clip, source, license, and sampled frames. "
             "Approval is bound to this file's SHA-256 and does not change the already rendered video."
         )
         cache_root = Path(utils.storage_dir("cache_videos")).resolve()
-        for index, ((asset_id, digest), candidate) in enumerate(candidates.items()):
+        for index, ((provider, asset_id, digest), candidate) in enumerate(candidates.items()):
             candidate_path = Path(str(candidate.get("local_path") or "")).resolve()
             try:
                 path_is_cached = os.path.commonpath([str(cache_root), str(candidate_path)]) == str(cache_root)
@@ -2133,15 +2134,23 @@ def _render_savage_stock_review(task_id):
                 continue
             approval = visual_review.human_approval(asset_id, digest)
             with st.container(border=True):
-                st.write(f"Pexels asset {asset_id} · {candidate.get('query') or 'saved keyword'}")
+                st.write(f"{provider.title()} asset {asset_id} · {candidate.get('query') or 'saved keyword'}")
                 st.caption(
                     f"License: {candidate.get('license') or 'unverified'} · "
                     f"SHA-256: {digest} · "
                     f"Status: {'approved' if approval else 'review required'}"
                 )
                 source_url = str(candidate.get("source_page") or "")
-                if source_url.startswith("https://www.pexels.com/"):
-                    st.link_button("Open Pexels source", source_url, key=f"stock_source_{task_id}_{asset_id}")
+                allowed_source_prefixes = {
+                    "pexels": ("https://www.pexels.com/",),
+                    "pixabay": ("https://pixabay.com/",),
+                    "coverr": ("https://coverr.co/", "https://www.coverr.co/"),
+                }
+                if source_url.startswith(allowed_source_prefixes.get(provider, ())):
+                    st.link_button(
+                        f"Open {provider.title()} source", source_url,
+                        key=f"stock_source_{task_id}_{provider}_{asset_id}",
+                    )
                 st.video(str(candidate_path))
                 frames = (candidate.get("visual_review") or {}).get("sampled_frames", [])
                 columns = st.columns(min(3, max(1, len(frames))))
@@ -2158,19 +2167,14 @@ def _render_savage_stock_review(task_id):
                 if approval:
                     st.caption(f"Approved by {approval['reviewer']}: {approval['reason']}")
                     continue
-                reviewer = st.text_input("Reviewer", key=f"stock_reviewer_{task_id}_{asset_id}")
-                reason = st.text_area(
-                    "Visible content and crop assessment",
-                    key=f"stock_reason_{task_id}_{asset_id}",
-                )
                 approve_col, reject_col = st.columns(2)
                 for column, status, label in (
                     (approve_col, "approved", "Approve this clip"),
                     (reject_col, "rejected", "Reject this clip"),
                 ):
-                    if column.button(label, key=f"stock_{status}_{task_id}_{asset_id}"):
+                    if column.button(label, key=f"stock_{status}_{task_id}_{provider}_{asset_id}"):
                         try:
-                            visual_review.record_human_review(asset_id, digest, status, reviewer, reason)
+                            visual_review.record_human_review(asset_id, digest, status)
                             st.success(f"Saved hash-bound review: {status}. Existing render is unchanged.")
                         except ValueError as exc:
                             st.error(str(exc))
@@ -2208,9 +2212,8 @@ def _render_generation_task_snapshot(task_id, task):
     subtitle_fallback = task.get("subtitle_alignment_fallback") or {}
     if subtitle_fallback.get("effective_mode") == "none":
         st.warning(
-            "This saved video has no subtitles: word alignment could not handle the narration, "
-            "and local transcription was unavailable. Saved intro/outro captions may still appear. "
-            "Configure a local Whisper model or add pronunciation overrides, then retry from saved audio."
+            "No narration subtitles were produced: alignment failed and local transcription was unavailable. "
+            "Configure a usable local Whisper model or resolve pronunciation before retrying from saved audio."
         )
     elif subtitle_fallback.get("effective_mode") == "sentence":
         st.info("Word timing was unavailable; this video uses sentence subtitles.")
@@ -2291,8 +2294,6 @@ def _render_generation_task_snapshot(task_id, task):
                                             f"edge score {frame.get('edge_contrast_score')}"
                                         ),
                                     )
-                        reviewer = st.text_input("Reviewer", key=f"visual_review_reviewer_{task_id}_{index}")
-                        reason = st.text_area("Visible scene and crop assessment", key=f"visual_review_reason_{task_id}_{index}")
                         review_cols = st.columns(2)
                         review_actions = (
                             ((review_cols[1], "rejected", "Reject footage"),)
@@ -2307,7 +2308,7 @@ def _render_generation_task_snapshot(task_id, task):
                                 try:
                                     visual_review.record_human_review(
                                         str(candidate.get("asset_id") or ""),
-                                        str(candidate.get("sha256") or ""), status, reviewer, reason,
+                                        str(candidate.get("sha256") or ""), status,
                                     )
                                     st.success(f"Saved local visual review: {status}. Submit a new generation task to retry preflight.")
                                 except ValueError as exc:
@@ -5821,6 +5822,27 @@ def _render_script_settings(panel, params):
             )
 
 
+def _select_stock_media_policy(params):
+    configured = str(
+        params.stock_media_policy or config.app.get("stock_media_policy", "auto_eligible")
+    ).strip().casefold()
+    if configured not in {"manual_review", "auto_eligible"}:
+        configured = "manual_review"
+    labels = {
+        "manual_review": "Manual review (hash-bound approval required)",
+        "auto_eligible": "Automatic (provider search match; no approval)",
+    }
+    params.stock_media_policy = stable_selectbox(
+        "Stock footage eligibility",
+        options=("manual_review", "auto_eligible"),
+        default_value=configured,
+        key="stock_media_policy_select",
+        format_func=labels.get,
+        help="Automatic accepts configured provider search matches without human approval. Manual requires hash-bound approval.",
+    )
+    _set_runtime_config("app", "stock_media_policy", params.stock_media_policy)
+
+
 def _render_video_settings(panel, params):
     """渲染视频设置并返回本次选择的本地素材。"""
     uploaded_files = []
@@ -5886,30 +5908,9 @@ def _render_video_settings(panel, params):
                 },
                 topic=params.video_subject,
             )
+            params.effective_visual_style = resolved_style_settings.effective_visual_style
             if resolved_style_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
-                configured_stock_policy = str(
-                    params.stock_media_policy
-                    or config.app.get("stock_media_policy", "manual_review")
-                ).strip().casefold()
-                if configured_stock_policy not in {"manual_review", "auto_eligible"}:
-                    configured_stock_policy = "manual_review"
-                policy_labels = {
-                    "manual_review": "Manual review (hash-bound approval required)",
-                    "auto_eligible": "Automatic (local visual verification required)",
-                }
-                params.stock_media_policy = stable_selectbox(
-                    "Stock footage eligibility",
-                    options=("manual_review", "auto_eligible"),
-                    default_value=configured_stock_policy,
-                    key="stock_media_policy_select",
-                    format_func=policy_labels.get,
-                    help=(
-                        "Manual review requires an explicit approval bound to the clip's SHA-256. "
-                        "Automatic requires a cached local vision decision; metadata and search "
-                        "keywords alone never establish visual relevance. If no verifier is "
-                        "available, uncertain clips are rejected and the original illustration is used."
-                    ),
-                )
+                _select_stock_media_policy(params)
             style_labels = {
                 "savage_animated_explainer": "Savage Animated Explainer",
                 "relevant_stock": "Relevant Stock",
@@ -8772,6 +8773,67 @@ def _stage_task_audio(audio_path, audio_bytes):
                 logger.warning(f"failed to remove staged task audio: {exc}")
 
 
+def _render_stock_policy_preflight(policy, video_terms, video_source="pexels"):
+    policy = tm.animated_explainer.resolve_stock_media_policy(policy)
+    provider_order = material.stock_video_provider_order(video_source)
+    scope = " → ".join(provider.title() for provider in provider_order) or "no configured stock provider"
+    if policy == "auto_eligible":
+        st.caption(
+            f"Effective stock policy: Automatic · provider order: {scope}. "
+            "Search relevance is not visual verification."
+        )
+        return
+    st.caption(f"Effective stock policy: Manual · provider order: {scope} · only hash-approved clips can render.")
+    if not provider_order:
+        st.info("Choose a configured stock-video provider before preparing review clips.")
+        return
+    terms = [term.strip() for term in re.split(r"[,，\n]", str(video_terms or "")) if term.strip()]
+    if st.button("Prepare stock clips for review", key="prepare_stock_review"):
+        if not terms:
+            st.warning("Enter stock keywords before preparing footage for review.")
+        else:
+            review_id = st.session_state.get("stock_preflight_task_id") or str(uuid4())
+            st.session_state["stock_preflight_task_id"] = review_id
+            report = []
+            unique_terms = list(dict.fromkeys(terms))
+            max_queries = tm.animated_explainer.MAX_STORYBOARD_QUERIES
+            if len(unique_terms) > max_queries:
+                st.warning(
+                    f"Only the first {max_queries} unique search terms can receive stock footage; "
+                    f"{len(unique_terms) - max_queries} scene(s) will use illustrations."
+                )
+            for query in unique_terms[:max_queries]:
+                for provider in provider_order:
+                    candidates = tm.animated_explainer._cached_stock_candidates(query, provider)
+                    if not candidates:
+                        candidates = tm.animated_explainer._search_and_cache_stock_candidate(
+                            query, provider, review_id, minimum_duration=3,
+                            stock_media_policy="manual_review",
+                        )
+                    for candidate in candidates:
+                        review = candidate.get("visual_review") or visual_review.sample_clip(
+                            candidate["path"], review_id, str(candidate["asset_id"]),
+                            usable_seconds=min(float(candidate["duration"]), 5.0),
+                            video_aspect="16:9",
+                        )
+                        report.append({
+                            "provider": provider, "asset_id": candidate["asset_id"],
+                            "query": query, "sha256": candidate["sha256"],
+                            "local_path": candidate["path"],
+                            "source_page": candidate["source_page"],
+                            "license": candidate["license"],
+                            "approval_status": "human_review_required",
+                            "visual_review": review,
+                        })
+            review_path = Path(utils.task_dir(review_id)) / "top-panel-storyboard.json"
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            review_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.session_state["stock_preflight_terms"] = terms
+    review_id = st.session_state.get("stock_preflight_task_id")
+    if review_id and st.session_state.get("stock_preflight_terms") == terms:
+        _render_savage_stock_review(review_id)
+
+
 def _render_generation_controls(
     params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
 ):
@@ -8807,6 +8869,11 @@ def _render_generation_controls(
         st.session_state.pop("task_restore_upload_requirements", None)
 
     _render_settings_transfer(params)
+
+    if params.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+        _render_stock_policy_preflight(
+            params.stock_media_policy, params.video_terms, params.video_source,
+        )
 
     start_button = st.button(
         tr("Generate Video"),
@@ -9316,7 +9383,8 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
                             profanity_level=None, fact_verification_policy=None,
                             savage_quality_policy=None, background_music_enabled=None,
                             source_settings=None, parent_job_id=None, video_terms=None,
-                            intro_enabled=None, outro_enabled=None):
+                            intro_enabled=None, outro_enabled=None,
+                            stock_media_policy=None):
     from app.models.autopilot import ContentPlanCreate
 
     service = autopilot_service.get_service()
@@ -9345,6 +9413,8 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
         key: value for key, value in (source_settings or {}).items()
         if key in inherited_keys and value is not None
     })
+    if stock_media_policy is not None:
+        manual_overrides["stock_media_policy"] = stock_media_policy
     # An explicitly edited duration uses the form's target and its normal range.
     if source_settings and int(source_settings.get("target_duration_seconds", target)) != target:
         manual_overrides.pop("duration_enforcement", None)
@@ -9405,7 +9475,8 @@ def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, lan
                             review_ai_draft=False, narrator_preset=None,
                             profanity_level=None, fact_verification_policy=None,
                             savage_quality_policy=None, background_music_enabled=None,
-                            video_terms=None, intro_enabled=None, outro_enabled=None):
+                            video_terms=None, intro_enabled=None, outro_enabled=None,
+                            stock_media_policy=None):
     """Continue an exact, unstarted channel draft without making a duplicate plan."""
     service = autopilot_service.get_service()
     normalized = autopilot_service.normalize_content(topic)
@@ -9418,6 +9489,8 @@ def _autopilot_resume_draft(profile, topic, script, duration, aspect, style, lan
         "visual_style": style, "language": language,
         "font_name": "NotoSansDevanagari-VF.ttf" if language == "hi" else profile.font_name,
     }
+    if stock_media_policy is not None:
+        overrides["stock_media_policy"] = stock_media_policy
     if intro_enabled is not None:
         overrides["intro_enabled"] = bool(intro_enabled)
     if outro_enabled is not None:
@@ -9637,12 +9710,19 @@ def _render_autopilot_videos_fragment(channel_id):
             selected_outputs = [(job, path) for job, path in selected_outputs if path]
             if selected_outputs:
                 try:
-                    archive = _build_autopilot_gallery_zip(selected_outputs)
-                    result_cols[1].download_button(
-                        "Download selected (ZIP)", archive,
-                        file_name="my-videos.zip", mime="application/zip",
-                            key=f"{selection_mode_key}_download",
+                    source_bytes = sum(
+                        os.path.getsize(path) for _job, path in selected_outputs
+                        if os.path.isfile(path)
                     )
+                    if source_bytes > 256 * 1024 * 1024:
+                        result_cols[1].caption("Selected videos exceed the 256 MB ZIP download limit.")
+                    else:
+                        result_cols[1].download_button(
+                            "Download selected (ZIP)",
+                            lambda outputs=tuple(selected_outputs): _build_autopilot_gallery_zip(outputs),
+                            file_name="my-videos.zip", mime="application/zip",
+                            key=f"{selection_mode_key}_download",
+                        )
                 except ValueError as exc:
                     result_cols[1].caption(str(exc))
             result_cols[2].caption(
@@ -10096,6 +10176,9 @@ def _apply_autopilot_edit_form_state(state, edited, profile):
     state[f"simple_fact_policy_{channel_id}"] = settings.get(
         "fact_verification_policy", "off"
     )
+    state[f"simple_stock_policy_{channel_id}"] = settings.get(
+        "stock_media_policy", getattr(profile, "stock_media_policy", "auto_eligible")
+    )
     state[f"simple_background_music_{channel_id}"] = bool(
         settings.get("bgm_type") or settings.get("bgm_file")
     )
@@ -10384,6 +10467,8 @@ def _render_autopilot_gallery_details_dialog(job):
         st.error(_autopilot_failure_help(job.failure_details))
     st.text_area("Narration script", job.script, disabled=True,
                  key=f"gallery_script_{job.job_id}", height=180)
+    if job.mpt_task_id:
+        _render_savage_stock_review(job.mpt_task_id)
     if st.button("Close details", key="gallery_details_close"):
         st.session_state.pop("gallery_details_job_id", None)
         st.rerun(scope="app")
@@ -10448,17 +10533,23 @@ def _render_autopilot_gallery_card(job, channel_id, receipt, playable_jobs,
             ):
                 if output and not selection_mode and st.button("Play", key=f"gallery_menu_play_{job.job_id}",
                                          width="stretch", type="tertiary",
-                                         icon=":material/play_arrow:"):
+                                         icon=":material/play_arrow:",
+                                         on_click=_close_autopilot_gallery_action_menu,
+                                         args=(job.job_id,)):
                     st.session_state["gallery_play_job_id"] = job.job_id
                     st.rerun(scope="app")
                 if output:
                     if st.button("Download", key=f"gallery_download_{job.job_id}",
                                  width="stretch", type="tertiary",
-                                 icon=":material/download:"):
+                                 icon=":material/download:",
+                                 on_click=_close_autopilot_gallery_action_menu,
+                                 args=(job.job_id,)):
                         st.session_state["gallery_download_job_id"] = job.job_id
                         st.rerun(scope="app")
                 if st.button("View details", key=f"gallery_details_{job.job_id}",
-                             width="stretch", type="tertiary", icon=":material/info:"):
+                             width="stretch", type="tertiary", icon=":material/info:",
+                             on_click=_close_autopilot_gallery_action_menu,
+                             args=(job.job_id,)):
                     st.session_state["gallery_details_job_id"] = job.job_id
                     st.rerun(scope="app")
                 if job.state == "failed":
@@ -10680,6 +10771,7 @@ def _render_channel_autopilot():
         draft_key = f"simple_draft_{channel_id}"
         generated_script_key = f"simple_ai_draft_{channel_id}"
         stock_terms_key = f"simple_stock_terms_{channel_id}"
+        stock_policy_key = f"simple_stock_policy_{channel_id}"
         stock_terms_error_key = f"simple_stock_terms_error_{channel_id}"
         language_key = f"simple_language_{channel_id}"
         fact_policy_key = f"simple_fact_policy_{channel_id}"
@@ -10729,6 +10821,10 @@ def _render_channel_autopilot():
         if isinstance(saved_terms, list):
             saved_terms = ", ".join(str(term) for term in saved_terms)
         st.session_state.setdefault(stock_terms_key, str(saved_terms or ""))
+        st.session_state.setdefault(
+            stock_policy_key,
+            source_params.get("stock_media_policy") or profile.stock_media_policy,
+        )
 
         def current_draft_profile():
             language_label = st.session_state.get(
@@ -11055,11 +11151,30 @@ def _render_channel_autopilot():
                               key=draft_key,
                               help="Review or edit the generated narration. Your edits are preserved and used as entered.")
         if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER:
+            stock_policy = st.selectbox(
+                "Stock footage eligibility", ("manual_review", "auto_eligible"),
+                key=stock_policy_key,
+                format_func={
+                    "manual_review": "Manual review",
+                    "auto_eligible": "Automatic provider search match (no approval)",
+                }.get,
+            )
+            if stock_policy == "auto_eligible":
+                provider_order = material.stock_video_provider_order(profile.video_source)
+                scope = " → ".join(item.title() for item in provider_order) or "no configured stock provider"
+                st.caption(f"Effective stock policy: Automatic · provider order: {scope}. Search relevance is not visual verification.")
+            else:
+                st.caption("Effective stock policy: Manual · only hash-approved clips can render.")
             st.text_area(
                 "Stock video keywords", key=stock_terms_key,
-                help=("One English Pexels search keyword per narration beat, in order. "
+                help=("One English stock search keyword per narration beat, in order. "
                       "Edit or repeat a keyword when consecutive beats cover the same topic."),
             )
+            if stock_policy == "manual_review":
+                _render_stock_policy_preflight(
+                    stock_policy, st.session_state.get(stock_terms_key, ""),
+                    profile.video_source,
+                )
             st.button(
                 "Generate stock keywords from narration",
                 key=f"simple_stock_terms_generate_{channel_id}",
@@ -11108,6 +11223,11 @@ def _render_channel_autopilot():
                             if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
                             else None
                         ),
+                        stock_media_policy=(
+                            st.session_state.get(stock_policy_key)
+                            if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                            else None
+                        ),
                         source_settings=(edited.get("params_snapshot", {}) if isinstance(edited, dict) else None),
                         parent_job_id=(edited.get("job_id") if isinstance(edited, dict) else None),
                         intro_enabled=include_intro, outro_enabled=include_outro)
@@ -11142,6 +11262,10 @@ def _render_channel_autopilot():
                                 review_ai_draft=False,
                                 video_terms=(
                                     st.session_state.get(stock_terms_key, "")
+                                    if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
+                                    else None
+                                ), stock_media_policy=(
+                                    st.session_state.get(stock_policy_key)
                                     if active_settings.effective_visual_style == visual_style_service.SAVAGE_ANIMATED_EXPLAINER
                                     else None
                                 ))

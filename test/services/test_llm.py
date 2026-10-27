@@ -2634,7 +2634,7 @@ class TestSocialMetadata(unittest.TestCase):
         self.assertIn("上海一日游", prompt)
         self.assertIn("array of exactly 5 strings", prompt)
 
-    def test_youtube_prompt_uses_english_even_when_narration_is_hindi(self):
+    def test_youtube_prompt_uses_selected_hindi_language(self):
         prompt = llm.build_social_metadata_prompt(
             video_subject="Coffee tips",
             language="hi",
@@ -2642,10 +2642,9 @@ class TestSocialMetadata(unittest.TestCase):
         )
 
         self.assertIn("YouTube Shorts", prompt)
-        self.assertIn("Write the title and caption in clear, natural English, regardless of narration language.", prompt)
-        self.assertNotIn('Write "title" and "caption" in this language: hi', prompt)
+        self.assertIn('Write "title" and "caption" in this language: hi.', prompt)
         self.assertIn("array of exactly 5 strings", prompt)
-        self.assertIn("clear, natural English", prompt)
+        self.assertNotIn("regardless of narration language", prompt)
         self.assertIn("exactly two complete prose sentences", prompt)
         self.assertIn("exactly three lines", prompt)
         self.assertIn("Encode the two line breaks as `\\n` in JSON", prompt)

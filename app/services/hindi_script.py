@@ -10,8 +10,9 @@ from app.services import hindi_numbers
 from app.utils import utils
 
 
-# Deliberately curated: unknown Latin words stay intact and are rejected by
-# the Hindi alignment worker with a useful unsupported-character diagnostic.
+# Common established transliterations. Unknown initialisms are spelled by the
+# generic letter-name rule below; ambiguous lexical words require an explicit
+# pronunciation override or a Devanagari spelling before synthesis.
 PRONUNCIATIONS = {
     "ai": "एआई", "api": "एपीआई", "browser": "ब्राउज़र",
     "chatgpt": "चैटजीपीटी", "client": "क्लाइंट",
@@ -20,6 +21,15 @@ PRONUNCIATIONS = {
     "process": "प्रोसेस", "request": "रिक्वेस्ट", "response": "रिस्पॉन्स",
     "server": "सर्वर", "url": "यूआरएल", "wifi": "वाई-फाई",
     "wi-fi": "वाई-फाई", "youtube": "यूट्यूब", "video": "वीडियो",
+}
+
+_LATIN_LETTER_NAMES = {
+    "A": "ए", "B": "बी", "C": "सी", "D": "डी", "E": "ई",
+    "F": "एफ", "G": "जी", "H": "एच", "I": "आई", "J": "जे",
+    "K": "के", "L": "एल", "M": "एम", "N": "एन", "O": "ओ",
+    "P": "पी", "Q": "क्यू", "R": "आर", "S": "एस", "T": "टी",
+    "U": "यू", "V": "वी", "W": "डब्ल्यू", "X": "एक्स",
+    "Y": "वाई", "Z": "ज़ेड",
 }
 
 _EDGE_PUNCTUATION = "\"'“”‘’([{<,.;:!?)]}>—–"
@@ -90,6 +100,17 @@ def _pronounce_token(token: str, pronunciation_overrides: dict[str, str] | None 
         if str(key).strip() and str(value).strip()
     }
     replacement = overrides.get(core.casefold()) or PRONUNCIATIONS.get(core.casefold())
+    if (replacement is None
+            and re.fullmatch(r"[A-Z0-9]+", core)
+            and any(char.isalpha() for char in core)):
+        # An unlisted uppercase token is spoken as its letters. This handles
+        # new initialisms without guessing expansions or adding topic-specific
+        # dictionary entries.
+        replacement = " ".join(
+            _LATIN_LETTER_NAMES[char] if char.isalpha()
+            else hindi_numbers.normalize_hindi_numbers(char, "hi")
+            for char in core
+        )
     if replacement:
         return token[:start] + replacement + token[end:]
     # Expand supported number/percent forms one display token at a time.

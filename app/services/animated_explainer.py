@@ -232,7 +232,7 @@ STOCK_MEDIA_POLICIES = {"manual_review", "auto_eligible"}
 def resolve_stock_media_policy(policy: str | None = None) -> str:
     """Resolve and validate the task's saved stock approval policy."""
     value = str(policy or material.config.app.get(
-        "stock_media_policy", "manual_review"
+        "stock_media_policy", "auto_eligible"
     )).strip().casefold()
     if value not in STOCK_MEDIA_POLICIES:
         logger.warning("stock_media_policy_invalid value={!r}; using manual_review", value)
@@ -242,11 +242,10 @@ def resolve_stock_media_policy(policy: str | None = None) -> str:
 
 def _stock_eligibility(candidate: dict, *, required_seconds: float,
                        policy: str, query: str = "") -> tuple[bool, str, dict | None]:
-    """Fail closed unless source, media integrity, format, duration and relevance pass.
+    """Require source, integrity, format, duration and policy-specific eligibility.
 
-    Manual Review uses the existing hash-bound human approval. Automatic uses
-    only a query- and content-hash-bound local-vision decision. No local vision
-    model is installed here, so unseen footage is rejected as uncertain.
+    Manual Review uses hash-bound human approval. Automatic trusts an exact
+    provider search result with a positive metadata relevance score.
     """
     if policy not in STOCK_MEDIA_POLICIES:
         return False, "invalid_stock_media_policy", None
@@ -279,21 +278,16 @@ def _stock_eligibility(candidate: dict, *, required_seconds: float,
             return False, "visual_relevance_unverified", None
         return True, "manual_review_approved", approval
 
-    decision = visual_review.cached_auto_relevance(current_hash, query)
-    if decision is None:
-        visual_review.record_auto_relevance(
-            current_hash, query, "uncertain", verifier="conservative_policy",
-            model="unavailable",
-            score=None,
-            reason="No supported local vision model is installed; metadata cannot establish visual relevance.",
-        )
-        decision = visual_review.cached_auto_relevance(current_hash, query)
-        return False, "automatic_relevance_unverified", decision
-    if decision.get("verifier") != "local_vision":
-        return False, "automatic_relevance_unverified", decision
-    if decision.get("decision") != "relevant" or float(decision.get("score") or 0) < .85:
-        return False, f"automatic_visual_check_{decision.get('decision', 'uncertain')}", decision
-    return True, "local_vision_relevance_passed", decision
+    score = float(candidate.get("relevance_score") or 0)
+    if score < 1:
+        return False, "pexels_search_match_missing", None
+    evidence = {
+        "decision": "relevant", "verifier": "provider_search",
+        "score": score,
+        "reason": "Returned by the exact stock search query with a positive metadata match.",
+        "query": query,
+    }
+    return True, "pexels_search_match", evidence
 
 
 def _cached_stock_candidates(query: str, provider: str) -> list[dict]:
@@ -407,7 +401,7 @@ def _search_and_cache_stock_candidate(
     minimum_duration: int = 3,
     clip_seconds: float | None = None,
     exclude_asset_ids: set[str] | None = None,
-    stock_media_policy: str = "manual_review",
+    stock_media_policy: str = "auto_eligible",
 ) -> list[dict]:
     """Fetch only needed, valid candidates and try same-query replacements on failure."""
     searchers = {
@@ -433,14 +427,6 @@ def _search_and_cache_stock_candidate(
                 provider, query, len(items),
                 [str(item.source_info.get("asset_id")) for item in items
                  if isinstance(item.source_info, dict)])
-    if (stock_media_policy == "auto_eligible"
-            and not visual_review.local_vision_verifier_available()):
-        logger.info(
-            "stock_search_rejected provider={} query={!r} reason=local_vision_unavailable "
-            "result_count={} downloaded=0",
-            provider, query, len(items),
-        )
-        return []
     ranked = []
     query_terms = {term for term in re.findall(r"[a-z0-9]+", query.casefold())
                    if term not in {"a", "the", "above", "and", "moving", "footage"}}
@@ -471,9 +457,9 @@ def _search_and_cache_stock_candidate(
                                      " ".join(map(str, tags))))
         words = set(re.findall(r"[a-z0-9]+", searchable_text.casefold()))
         score = len(query_terms & words)
-        # The provider search is itself relevance evidence. Pexels often returns
-        # sparse titles/tags, so one metadata match is enough; when metadata is
-        # absent, retain the provider-ranked result for the human review gate.
+        # The exact provider query is the relevance signal. If metadata exists,
+        # require at least one keyword match; sparse provider metadata retains
+        # the provider-ranked result with a minimal positive score.
         if words and score < 1:
             continue
         if not words:
@@ -500,7 +486,7 @@ def _search_and_cache_stock_candidate(
     target = max(1, int(required_count))
     attempt_limit = target + MAX_STOCK_REPLACEMENTS_PER_TERM
     attempts = 0
-    approved_count = 0
+    eligible_count = 0
     seen_content_hashes: set[str] = set()
     for score, _duration, item, info, tags in ranked:
         asset_id = str(info.get("asset_id") or item.url)
@@ -569,8 +555,7 @@ def _search_and_cache_stock_candidate(
                 )
                 if not candidate["prepared_path"]:
                     continue
-            approved_count += 1
-        else:
+        elif stock_media_policy == "manual_review":
             try:
                 candidate["visual_review"] = visual_review.sample_clip(
                     path, task_id, asset_id,
@@ -579,8 +564,17 @@ def _search_and_cache_stock_candidate(
                 )
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
+        else:
+            if clip_seconds is not None:
+                candidate["prepared_path"] = _prepare_stock_candidate(
+                    candidate, task_id, clip_seconds
+                )
+                if not candidate["prepared_path"]:
+                    continue
+        if candidate.get("human_approval") or stock_media_policy == "auto_eligible":
+            eligible_count += 1
         scored.append(candidate)
-        if approved_count >= target:
+        if eligible_count >= target:
             break
     return sorted(scored, key=lambda value: (-value["relevance_score"], value["asset_id"]))
 
@@ -701,6 +695,8 @@ def resolve_storyboard_media(
                 candidate["preparation_failed"] = not bool(candidate["prepared_path"])
                 if candidate["prepared_path"]:
                     approved_cached += 1
+                    if approved_cached >= needed_count:
+                        break
         for candidate_provider in provider_order:
             if approved_cached >= needed_count:
                 break
@@ -721,7 +717,11 @@ def resolve_storyboard_media(
             logger.info("stock_storyboard_results provider={} query={!r} result_count={} candidate_ids={}",
                         candidate_provider, query, len(found),
                         [item.get("asset_id") for item in found])
-            approved_cached += sum(bool(item.get("human_approval")) for item in found)
+            approved_cached += sum(
+                bool(item.get("prepared_path")) if policy == "auto_eligible"
+                else bool(item.get("human_approval"))
+                for item in found
+            )
 
         for window in windows:
             beat = beats[window["beat_index"]]
@@ -1514,7 +1514,7 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
         ],
         "preview_unapproved_stock": preview_unapproved_stock,
         "stock_media_policy": stock_media_policy or material.config.app.get(
-            "stock_media_policy", "manual_review"
+            "stock_media_policy", "auto_eligible"
         ),
         "display_word_map": display_word_map,
         "size": [WIDTH, HEIGHT], "fps": FPS, "output": str(Path(output).resolve()),

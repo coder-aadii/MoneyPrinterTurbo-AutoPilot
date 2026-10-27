@@ -87,20 +87,23 @@ def _represent_script(params, script):
     )
 
 
-def _alignment_preflight_errors(params, spoken_script, source_text=None):
+def _requires_hindi_word_alignment(params) -> bool:
     language = str(getattr(params, "video_language", "") or "").casefold()
     if (not language.startswith(("hi", "hindi"))
-            or not getattr(params, "subtitle_enabled", True)):
-        return []
-    is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
+            or not getattr(params, "subtitle_enabled", True)
+            or getattr(params, "subtitle_display_mode", "sentence") != "word_by_word"):
+        return False
     provider = generation_settings.resolve_task_settings(
         params, topic=getattr(params, "video_subject", "")
     ).tts_provider
-    needs_alignment = is_word_level and (
+    return (
         provider == "gemini-tts"
         or voice.is_gemini_voice(getattr(params, "voice_name", "") or "")
     )
-    if not needs_alignment:
+
+
+def _alignment_preflight_errors(params, spoken_script, source_text=None):
+    if not _requires_hindi_word_alignment(params):
         return []
     return subtitle.preflight_hindi_alignment_script(spoken_script, source_text=source_text)
 
@@ -1209,8 +1212,11 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return ""
 
     is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
-    needs_audio_alignment = is_word_level and voice.is_gemini_voice(
-        getattr(params, "voice_name", "") or ""
+    needs_audio_alignment = is_word_level and (
+        voice.is_gemini_voice(getattr(params, "voice_name", "") or "")
+        or generation_settings.resolve_task_settings(
+            params, topic=getattr(params, "video_subject", "")
+        ).tts_provider == "gemini-tts"
     )
 
     if sub_maker is None and subtitle_provider != "whisper" and not needs_audio_alignment:
@@ -1231,28 +1237,10 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             language = (getattr(params, "video_language", "") or "").lower()
             if language.startswith("hi"):
                 report_file = path.join(utils.task_dir(task_id), "alignment-quality.json")
-                if re.search(r"[A-Za-z]", video_script):
-                    # The installed Hindi CTC vocabulary cannot represent Latin
-                    # letters. Keep the actual TTS transcript and use the local
-                    # transcription fallback; do not send a guaranteed failure
-                    # to the worker or claim word alignment for mixed speech.
-                    aligned = False
-                    task_artifacts._write_json_atomic(Path(report_file), {
-                        "version": 1,
-                        "policy": getattr(params, "hindi_alignment_policy", "balanced"),
-                        "accepted": False,
-                        "structural_errors": [{
-                            "code": "mixed_script_hindi_ctc_unsupported",
-                            "message": "Hindi CTC word alignment cannot represent Latin words in this narration",
-                        }],
-                        "confidence_errors": [],
-                        "warnings": [],
-                    })
-                else:
-                    aligned = subtitle.align_hindi_words(
-                        audio_file, video_script, subtitle_path,
-                        policy=getattr(params, "hindi_alignment_policy", "balanced"),
-                    )
+                aligned = subtitle.align_hindi_words(
+                    audio_file, video_script, subtitle_path,
+                    policy=getattr(params, "hindi_alignment_policy", "balanced"),
+                )
                 quality = None
                 if path.isfile(report_file):
                     with open(report_file, encoding="utf-8") as source:
@@ -2061,18 +2049,21 @@ def _run_cross_post(
             first = (platforms[0] or "").strip().lower()
             social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
 
+        shared_generated_metadata = None
         for video_index, video_path in enumerate(video_paths, start=1):
             youtube_extra = None
             post_title = video_subject or "Check out this video! #shorts #viral"
             if platforms:
                 metadata = saved_metadata.get(video_index) if has_youtube else None
                 if metadata is None:
-                    metadata = llm.generate_social_metadata(
-                        video_subject=video_subject,
-                        video_script=video_script,
-                        language="Hindi" if str(video_language or "").casefold().startswith("hi") else "English",
-                        platform=social_platform,
-                    )
+                    if shared_generated_metadata is None:
+                        shared_generated_metadata = llm.generate_social_metadata(
+                            video_subject=video_subject,
+                            video_script=video_script,
+                            language="Hindi" if str(video_language or "").casefold().startswith("hi") else "English",
+                            platform=social_platform,
+                        )
+                    metadata = shared_generated_metadata
                 if has_youtube:
                     youtube_title = metadata.get("title", video_subject)
                     youtube_description = metadata.get("caption", "")
@@ -2799,8 +2790,9 @@ def _run_pipeline(
                         cue_blocks.append(branding_service.offset_srt(cue, elapsed))
                     elapsed += duration
                 # Branding cues are independently authored subtitle assets.
-                # Keep them when narration alignment failed and disabled only
-                # narration captions for this task.
+                # They are merged when narration subtitles are disabled; an
+                # enabled narration track must already have valid cues or the
+                # pipeline stops before this branding/render stage.
                 if cue_blocks:
                     merged_srt = path.join(utils.task_dir(task_id), "subtitle-with-branding.srt")
                     if _write_merged_subtitles(cue_blocks, merged_srt):

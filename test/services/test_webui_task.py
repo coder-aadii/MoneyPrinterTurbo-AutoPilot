@@ -145,13 +145,29 @@ def test_webui_exposes_stock_eligibility_policy_for_savage_tasks():
     tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_render_video_settings"
+        if isinstance(node, ast.FunctionDef) and node.name == "_select_stock_media_policy"
     )
     source = ast.get_source_segment(WEBUI_MAIN.read_text(encoding="utf-8"), function)
     assert '"Stock footage eligibility"' in source
     assert '"manual_review"' in source
     assert '"auto_eligible"' in source
     assert "params.stock_media_policy = stable_selectbox" in source
+    settings = {}
+    namespace = {
+        "config": SimpleNamespace(app={}),
+        "stable_selectbox": lambda *_args, **_kwargs: "auto_eligible",
+        "_set_runtime_config": lambda section, key, value: settings.update({(section, key): value}),
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
+    params = VideoParams(video_subject="Jellyfish", video_script="Jellyfish swim")
+    namespace["_select_stock_media_policy"](params)
+    assert params.stock_media_policy == "auto_eligible"
+    assert settings[("app", "stock_media_policy")] == "auto_eligible"
+    namespace["stable_selectbox"] = lambda *_args, **_kwargs: "manual_review"
+    namespace["_select_stock_media_policy"](params)
+    assert params.stock_media_policy == "manual_review"
+    assert settings[("app", "stock_media_policy")] == "manual_review"
 
     review_function = next(
         node for node in tree.body
@@ -162,6 +178,8 @@ def test_webui_exposes_stock_eligibility_policy_for_savage_tasks():
     assert "visual_review.human_approval" in review_source
     assert "visual_review.record_human_review" in review_source
     assert "sha256(candidate_path)" in review_source
+    assert 'st.text_input("Reviewer"' not in review_source
+    assert 'st.text_area("Visible content and crop assessment"' not in review_source
 
 
 def test_webui_delete_keeps_task_state_when_file_removal_fails(tmp_path):
@@ -401,6 +419,7 @@ def test_terminal_task_renders_subject_named_video_download(
         ),
         "utils": SimpleNamespace(task_dir=lambda _task_id: str(tmp_path)),
         "_render_generation_logs": lambda _task_id: None,
+            "_render_savage_stock_review": lambda _task_id: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
@@ -438,7 +457,7 @@ def test_terminal_task_renders_subject_named_video_download(
     assert fake_st.videos == [str(video_path)]
     if no_subtitles:
         assert len(fake_st.warnings) == 2
-        assert "no subtitles" in fake_st.warnings[0]
+        assert "No narration subtitles were produced" in fake_st.warnings[0]
         assert fake_st.warnings[1] == "Video 2 reused 3 source clips."
     else:
         assert fake_st.warnings == ["Video 2 reused 3 source clips."]

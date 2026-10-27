@@ -57,12 +57,7 @@ def _hindi_alignment_environment() -> dict[str, str]:
 
 
 def preflight_hindi_alignment_script(script: str, *, source_text: str | None = None) -> list[dict]:
-    """Check Hindi alignment characters while allowing mixed-script Hinglish.
-
-    The Hindi CTC model cannot align Latin words. Those are left intact for TTS
-    and handled by the existing local Whisper subtitle fallback after alignment;
-    they must not prevent an otherwise valid Hindi/Hinglish video from rendering.
-    """
+    """Validate the exact canonical text and local worker used for Hindi CTC."""
     normalized = unicodedata.normalize(
         "NFC", utils.normalize_script_for_subtitle_matching(script)
     )
@@ -74,6 +69,20 @@ def preflight_hindi_alignment_script(script: str, *, source_text: str | None = N
     if source_text is not None:
         from app.services import hindi_script
         errors.extend(hindi_script.source_symbol_issues(source_text))
+    latin_tokens = sorted(set(re.findall(
+        r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*(?![A-Za-z0-9_])",
+        alignment_text,
+    )))
+    if latin_tokens:
+        errors.append({
+            "code": "unresolved_latin_pronunciation",
+            "tokens": latin_tokens[:20],
+            "message": (
+                "Resolve Latin terms before synthesis: spell an initialism in uppercase "
+                "to use letter names, add an explicit pronunciation override, or write "
+                "the intended pronunciation in Devanagari. No TTS request was made."
+            ),
+        })
     for char in sorted(set(alignment_text)):
         if unicodedata.category(char)[0] in {"S", "C"}:
             errors.append({
@@ -81,6 +90,15 @@ def preflight_hindi_alignment_script(script: str, *, source_text: str | None = N
                 "message": f"Unsupported alignment symbol {char!r}; spell out the intended speech.",
             })
     environment = _hindi_alignment_environment()
+    align_python = environment.get("MPT_HINDI_ALIGNMENT_PYTHON", "").strip()
+    if not align_python or not os.path.isfile(align_python):
+        errors.append({
+            "code": "alignment_worker_unavailable",
+            "message": (
+                "Hindi word alignment requires an installed MPT_HINDI_ALIGNMENT_PYTHON; "
+                "configure the same worker used at render time before synthesis."
+            ),
+        })
     model_path = Path(environment.get("MPT_HINDI_ALIGNMENT_MODEL", "")).expanduser()
     if not model_path.is_absolute():
         model_path = Path(utils.root_dir()) / model_path
