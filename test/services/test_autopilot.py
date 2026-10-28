@@ -180,6 +180,39 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(call.call_args.kwargs["language"], "English")
         self.assertIn("Science Facts", call.call_args.kwargs["channel_context"])
 
+    def test_caption_validator_accepts_hindi_question_and_does_not_count_emojis_as_words(self):
+        body = "यूट्यूब और इंस्टाग्राम में असली फर्क जानते हैं क्या? 🧐"
+        self.assertEqual(
+            self.service._youtube_caption_body_errors(body, "Hindi"), []
+        )
+        self.assertIn(
+            "each caption sentence must contain at most 10 words",
+            self.service._youtube_caption_body_errors(
+                "एक दो तीन चार पाँच छह सात आठ नौ दस ग्यारह।", "Hindi"
+            ),
+        )
+
+    def test_autopilot_caption_language_uses_channel_caption_setting_not_narration(self):
+        profile = self.profiles[0]
+        plan = self.plan(profile, "विषय", "यह हिंदी में narration है।")
+        plan = self.service.ready(profile.channel_id, plan.plan_id, True)
+        job = self.service.create_job(profile.channel_id, plan.plan_id)
+        language, context, _ = self.service._youtube_caption_context(job)
+        self.assertEqual(language, "English")
+        self.assertEqual(json.loads(context)["caption_language"], "English")
+
+        updated = self.service.profile_store.update(
+            profile.channel_id,
+            profile.model_copy(update={"youtube_caption_language": "Hindi"}),
+            profile.version,
+        )
+        plan = self.plan(updated, "नया दूसरा विषय", "समुद्र और सूरज पर आज की नई जानकारी साझा करते हैं।")
+        plan = self.service.ready(updated.channel_id, plan.plan_id, True)
+        job = self.service.create_job(updated.channel_id, plan.plan_id)
+        language, context, _ = self.service._youtube_caption_context(job)
+        self.assertEqual(language, "Hindi")
+        self.assertEqual(json.loads(context)["caption_language"], "Hindi")
+
     def test_upload_metadata_reuses_caption_saved_with_completed_task(self):
         job = self.ready_job(
             topic="What makes a star", script="A star is a sphere of plasma.",
@@ -216,9 +249,12 @@ class TestAutopilot(unittest.TestCase):
 
         with patch.object(autopilot.utils, "task_dir", return_value=str(manifest_dir)), \
                 patch.object(autopilot.llm, "generate_social_metadata") as generate:
+            prepared = self.service.get_youtube_metadata(job.job_id)
             result = self.service.ensure_youtube_metadata(job.job_id)
             reopened = self.service.ensure_youtube_metadata(job.job_id)
 
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared["title"], "What Makes Stars Shine")
         self.assertEqual(generate.call_count, 0)
         self.assertEqual(result, reopened)
         self.assertEqual(result["title"], "What Makes Stars Shine")
@@ -293,7 +329,7 @@ class TestAutopilot(unittest.TestCase):
 
     def test_youtube_caption_rejects_non_english_and_dangling_endings(self):
         caption = (
-            "बताओ, आज क्या? 🔍🤔\n"
+            "बताओ, आज क्या। 🔍🤔\n"
             "पैसा बाजार में घूमता रहता है। 💡✨\n"
             "#MoneyFlow #Economy #CircularFlow #HindiFacts #HindiASMRFacts"
         )
@@ -304,10 +340,16 @@ class TestAutopilot(unittest.TestCase):
         self.assertIn("caption must be written in English", "; ".join(errors))
 
     def test_youtube_long_script_fallback_keeps_complete_sentences(self):
+        profile = self.service.profile_store.update(
+            self.profiles[0].channel_id,
+            self.profiles[0].model_copy(update={"youtube_caption_language": "Hindi"}),
+            self.profiles[0].version,
+        )
         job = self.ready_job(
             topic="Paisa economy",
             script=("पैसा आखिर कहाँ जाता है? दुकान से सप्लायर तक घूमता है। "
                     "कर्मचारी उससे अपना खर्च चलाते हैं। ") * 20,
+            profile=profile,
         )
         self.service.store.transition(job.job_id, "queued")
         self.service.store.transition(job.job_id, "generating")
@@ -331,7 +373,12 @@ class TestAutopilot(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
 
     def test_youtube_caption_edit_requires_two_sentences_emojis_and_channel_hashtag(self):
-        job = self.ready_job(topic="How stars shine", script="Stars emit light.")
+        profile = self.service.profile_store.update(
+            self.profiles[0].channel_id,
+            self.profiles[0].model_copy(update={"youtube_caption_language": "Hindi"}),
+            self.profiles[0].version,
+        )
+        job = self.ready_job(topic="How stars shine", script="Stars emit light.", profile=profile)
         self.service.store.transition(job.job_id, "queued")
         self.service.store.transition(job.job_id, "generating")
         self.service.store.transition(job.job_id, "generated")

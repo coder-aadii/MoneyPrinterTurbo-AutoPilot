@@ -74,6 +74,22 @@ class TestChannelProfiles(unittest.TestCase):
                 self.assertEqual(params.tts_provider, provider)
                 self.assertEqual(params.resolved_generation_settings.tts_provider, provider)
 
+    def test_youtube_caption_language_is_independent_from_narration_language_and_persists(self):
+        profile = self.store.create(self.profile(language="hi"))
+        self.assertEqual(profile.youtube_caption_language, "English")
+        params = service.build_preview(profile).params
+        self.assertEqual(params.video_language, "hi")
+        self.assertEqual(params.youtube_caption_language, "English")
+
+        updated = self.store.update(
+            profile.channel_id,
+            profile.model_copy(update={"youtube_caption_language": "Hindi"}),
+            profile.version,
+        )
+        reopened = service.ChannelProfileStore(self.store.database_path).get(profile.channel_id)
+        self.assertEqual(reopened.youtube_caption_language, "Hindi")
+        self.assertEqual(service.build_preview(updated).params.youtube_caption_language, "Hindi")
+
     def test_generation_settings_reject_unknown_and_secret_options(self):
         for options in (
             {"api_key": "secret"}, {"made_up_option": "value"},
@@ -116,6 +132,10 @@ class TestChannelProfiles(unittest.TestCase):
             "intro_audio": {"asset_key": "intro/v2-" + "a" * 64 + ".mp3",
                             "content_hash": "a" * 64, "duration_seconds": 1.25,
                             "version": 2},
+            "intro_video": {"asset_key": "intro/v1-" + "b" * 64 + ".mp4",
+                            "content_hash": "b" * 64, "version": 1},
+            "profile_image": {"asset_key": "profile/v1-" + "c" * 64 + ".png",
+                              "content_hash": "c" * 64, "version": 1},
         })
         params = service.build_preview(profile).params
         self.assertEqual(params.channel_id, profile.channel_id)
@@ -125,6 +145,8 @@ class TestChannelProfiles(unittest.TestCase):
         )
         self.assertTrue(params.channel_branding["intro"]["enabled"])
         self.assertEqual(params.channel_branding["intro"]["audio"]["version"], 2)
+        self.assertEqual(params.channel_branding["intro"]["video"]["content_hash"], "b" * 64)
+        self.assertEqual(params.channel_branding["profile_image"]["content_hash"], "c" * 64)
         self.assertFalse(params.channel_branding["outro"]["enabled"])
 
     def test_blank_channel_voice_uses_saved_video_generator_voice(self):

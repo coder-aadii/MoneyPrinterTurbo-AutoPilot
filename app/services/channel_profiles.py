@@ -157,12 +157,16 @@ def build_preview(profile: ChannelProfile, job_values: dict[str, Any] | None = N
     profile_fields = {
         "channel_id": profile.channel_id,
         "channel_branding": {
-            name: {
-                "enabled": getattr(profile, f"{name}_enabled"),
-                "text": getattr(profile, f"{name}_text"),
-                "audio": getattr(profile, f"{name}_audio"),
-            }
-            for name in ("intro", "outro")
+            **{
+                name: {
+                    "enabled": getattr(profile, f"{name}_enabled"),
+                    "text": getattr(profile, f"{name}_text"),
+                    "audio": getattr(profile, f"{name}_audio"),
+                    "video": getattr(profile, f"{name}_video"),
+                }
+                for name in ("intro", "outro")
+            },
+            "profile_image": profile.profile_image,
         },
         "video_aspect": profile.video_aspect.value,
         "stock_video_style": profile.stock_video_style,
@@ -171,6 +175,7 @@ def build_preview(profile: ChannelProfile, job_values: dict[str, Any] | None = N
         "asmr_categories": profile.asmr_categories,
         "video_source": profile.video_source,
         "video_language": profile.language,
+        "youtube_caption_language": profile.youtube_caption_language,
         "voice_name": resolve_profile_voice(profile),
         "tts_provider": profile.generation_settings.get("tts_provider"),
         "tts_model": profile.tts_model,

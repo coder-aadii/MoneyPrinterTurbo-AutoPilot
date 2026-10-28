@@ -2050,9 +2050,11 @@ class AutopilotService:
         profile = job.profile_snapshot or {}
         params = job.params_snapshot or {}
         language_value = str(
-            params.get("video_language") or profile.get("language") or "en"
+            params.get("youtube_caption_language")
+            or profile.get("youtube_caption_language")
+            or "English"
         ).casefold()
-        language = "Hindi" if language_value.startswith(("hi", "hindi")) else "English"
+        language = "Hindi" if language_value in {"hi", "hindi"} else "English"
         context = {
             "channel": profile.get("display_name", ""),
             "channel_hashtag": AutopilotService._youtube_channel_hashtag(job),
@@ -2109,7 +2111,7 @@ class AutopilotService:
             return ["caption body is empty"]
         if not AutopilotService._youtube_text_matches_language(body, language):
             errors.append(f"caption must be written in {language}")
-        if len(body.split()) > 10:
+        if AutopilotService._youtube_word_count(body) > 10:
             errors.append("each caption sentence must contain at most 10 words")
         if "#" in body:
             errors.append("hashtags must be separate trailing tokens")
@@ -2131,6 +2133,7 @@ class AutopilotService:
         if re.search(r"[.!?।॥]", ending[:-1]):
             errors.append("each caption line must contain exactly one sentence")
 
+        terminal_mark = ending[-1]
         final_text = re.sub(r"[.!?।॥]+$", "", ending).rstrip()
         final_word_match = re.search(r"([^\s,;:!?।॥]+)$", final_text, flags=re.UNICODE)
         if final_word_match:
@@ -2141,13 +2144,20 @@ class AutopilotService:
                 "अगर", "और", "कहाँ", "कब", "क्यों", "क्योंकि", "कैसे", "क्या", "के",
                 "की", "का", "कौन", "लेकिन", "जिसमें", "जिससे", "तक", "तो", "पर", "में", "से", "या",
             }
-            if final_word in dangling:
+            if final_word in dangling and terminal_mark not in "?？":
                 errors.append("caption ends with an incomplete phrase or question")
         return errors
 
     @staticmethod
     def _youtube_emoji_count(text: str) -> int:
         return len(re.findall(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", text))
+
+    @staticmethod
+    def _youtube_word_count(text: str) -> int:
+        return sum(
+            any(unicodedata.category(char)[0] in {"L", "N"} for char in token)
+            for token in str(text or "").split()
+        )
 
     @classmethod
     def _youtube_caption_validation_errors(
@@ -2157,7 +2167,7 @@ class AutopilotService:
         lines = [line for line in lines if line]
         tokens = str(caption or "").split()
         errors = []
-        if len(tokens) > 50:
+        if cls._youtube_word_count(str(caption or "")) > 50:
             errors.append("caption exceeds 50 whitespace-separated words")
         hashtag_tokens = [token for token in tokens if token.startswith("#")]
         if len(hashtag_tokens) != 5:
@@ -2460,8 +2470,57 @@ class AutopilotService:
         self.store.save_youtube_metadata(job_id, result)
         return result
 
+    def get_youtube_metadata(self, job_id: str) -> dict | None:
+        """Read already-prepared, current YouTube metadata without provider calls."""
+        job = self.store.get_job(job_id)
+        if job.state != "generated":
+            return None
+        narration = job.script or ""
+        task_manifest = {}
+        if job.mpt_task_id:
+            manifest_path = Path(utils.task_dir(job.mpt_task_id)) / "script.json"
+            try:
+                task_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                narration = str(task_manifest.get("spoken_script") or task_manifest.get("script") or narration)
+            except (OSError, ValueError, TypeError):
+                pass
+        language, _context_text, context_fingerprint = self._youtube_caption_context(job)
+        narration_fingerprint = hashlib.sha256(narration.encode("utf-8")).hexdigest()
+        caption_source = self._youtube_caption_source(job, narration)
+        caption_source_fingerprint = hashlib.sha256(caption_source.encode("utf-8")).hexdigest()
+        channel_hashtag = self._youtube_channel_hashtag(job)
+        candidates = [job.youtube_metadata or {}]
+        output_name = Path(job.output_artifacts[0]).name if job.output_artifacts else ""
+        task_metadata = task_manifest.get("youtube_metadata_by_video", [])
+        for item in task_metadata:
+            if (not isinstance(item, dict) or item.get("video_name") != output_name
+                    or item.get("narration_fingerprint") != narration_fingerprint
+                    or item.get("caption_source_fingerprint") != caption_source_fingerprint):
+                continue
+            body, raw_hashtags = self._youtube_caption_parts(
+                item.get("caption", ""), item.get("hashtags"),
+            )
+            hashtags = self._youtube_caption_hashtags(raw_hashtags, job, narration)
+            candidates.append({
+                **item, "caption": self._compose_youtube_caption(body, hashtags),
+                "hashtags": hashtags, "context_fingerprint": context_fingerprint,
+                "language": language, "channel_hashtag": channel_hashtag,
+            })
+        for metadata in candidates:
+            if (metadata.get("narration_fingerprint") != narration_fingerprint
+                    or metadata.get("context_fingerprint") != context_fingerprint
+                    or self._youtube_caption_validation_errors(
+                        metadata.get("caption", ""), channel_hashtag, language,
+                    )
+                    or not self._youtube_title_matches_language(metadata.get("title", ""), language)):
+                continue
+            return metadata
+        return None
+
     def youtube_caption_validation_errors(self, job_id: str, caption: str) -> list[str]:
-        metadata = self.ensure_youtube_metadata(job_id)
+        metadata = self.get_youtube_metadata(job_id)
+        if metadata is None:
+            return ["generate or prepare the YouTube caption before editing"]
         return self._youtube_caption_validation_errors(
             caption, metadata.get("channel_hashtag", ""), metadata.get("language", "English"),
         )

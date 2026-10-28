@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 from loguru import logger
 from moviepy import VideoClip, VideoFileClip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.services import alignment_quality, character_library, emotion_storyboard, hindi_script, material, scene_spec, task_artifacts, visual_review
 from app.utils import utils
@@ -1337,7 +1337,8 @@ def _fit_heading(draw: ImageDraw.ImageDraw, title: str, font_path: str,
 
 def _draw_frame(topic: str, duration: float, time_seconds: float,
                 groups: list[dict], beats: list[dict],
-                stock_segments: list[dict] | None = None) -> np.ndarray:
+                stock_segments: list[dict] | None = None,
+                branding_segments: list[dict] | None = None) -> np.ndarray:
     canvas = Image.new("RGB", (WIDTH, HEIGHT), _BG)
     draw = ImageDraw.Draw(canvas)
     font_path = _font_path()
@@ -1436,6 +1437,22 @@ def _draw_frame(topic: str, duration: float, time_seconds: float,
             x += word_width + 20
     bob = round(5 * math.sin(time_seconds * 4.0)) if speech_active else 0
     canvas.paste(pose, ((WIDTH - pose.width) // 2, 1055 + bob), pose)
+    active_branding = next((segment for segment in branding_segments or []
+                            if segment["start"] <= time_seconds < segment["end"]), None)
+    if active_branding:
+        local_time = min(max(0.0, time_seconds - active_branding["start"]),
+                         max(0.0, float(active_branding["clip"].duration) - 1 / FPS))
+        branded_frame = Image.fromarray(
+            active_branding["clip"].get_frame(local_time)
+        ).convert("RGB")
+        if branded_frame.size == canvas.size:
+            canvas = branded_frame
+        else:
+            contained = ImageOps.contain(branded_frame, canvas.size,
+                                         method=Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", canvas.size, _BG)
+            canvas.paste(contained, ((WIDTH - contained.width) // 2,
+                                     (HEIGHT - contained.height) // 2))
     return np.asarray(canvas)
 
 
@@ -1450,7 +1467,8 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
                       stock_terms: list[str] | None = None,
                       caption_mode: str = "word_by_word",
                       preview_unapproved_stock: bool = False,
-                      stock_media_policy: str | None = None) -> str:
+                      stock_media_policy: str | None = None,
+                      branding_segments: list[dict] | None = None) -> str:
     """Render a 1080×1920, 30 FPS local explainer scene with the saved narrator."""
     if not math.isfinite(float(duration)) or duration <= 0:
         raise ValueError("explainer duration must be a positive finite number")
@@ -1501,6 +1519,14 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
         except (OSError, ValueError, IndexError):
             continue
         prepared_segments.append({**segment, "clip": panel_clip})
+    prepared_branding = []
+    for segment in branding_segments or []:
+        try:
+            panel_clip = VideoFileClip(str(segment["path"]), audio=False)
+            panel_clip.get_frame(0)
+        except (OSError, ValueError, IndexError, KeyError, TypeError):
+            continue
+        prepared_branding.append({**segment, "clip": panel_clip})
     fingerprint = task_artifacts.cache_key({
         "renderer": task_artifacts.file_digest(__file__),
         "emotion_resolver": task_artifacts.file_digest(emotion_storyboard.__file__),
@@ -1511,6 +1537,10 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
                 "start", "end", "path", "sha256", "approved", "asset_id", "provider"
             )}
             for segment in prepared_segments
+        ],
+        "branding_segments": [
+            {key: segment.get(key) for key in ("start", "end", "sha256", "asset_key")}
+            for segment in prepared_branding
         ],
         "preview_unapproved_stock": preview_unapproved_stock,
         "stock_media_policy": stock_media_policy or material.config.app.get(
@@ -1533,11 +1563,14 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
     if cached:
         try:
             validate_media(cached["path"])
+            for segment in prepared_segments + prepared_branding:
+                segment["clip"].close()
             return cached["path"]
         except (OSError, ValueError):
             pass
     clip = VideoClip(
-        lambda t: _draw_frame(topic, duration, float(t), groups, beats, prepared_segments),
+        lambda t: _draw_frame(topic, duration, float(t), groups, beats,
+                              prepared_segments, prepared_branding),
         duration=float(duration),
     )
     try:
@@ -1548,12 +1581,23 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
         clip.close()
         for segment in prepared_segments:
             segment["clip"].close()
+        for segment in prepared_branding:
+            segment["clip"].close()
     validate_media(output)
     rendered_sources = []
     for beat in beats:
+        overlapping_branding = [segment for segment in prepared_branding
+                                if segment["start"] < beat["end"]
+                                and segment["end"] > beat["start"]]
         overlapping = [segment for segment in prepared_segments
                        if segment["start"] < beat["end"] and segment["end"] > beat["start"]]
-        if overlapping:
+        if overlapping_branding:
+            segment = overlapping_branding[0]
+            source = {
+                "type": "channel_branding_video", "provider": "channel",
+                "asset_key": segment.get("asset_key"), "sha256": segment.get("sha256"),
+            }
+        elif overlapping:
             segment = overlapping[0]
             selected_source = beat.get("selected_source") or {}
             source = {
@@ -1575,7 +1619,11 @@ def render_background(task_id: str, topic: str, duration: float, *, output_path:
                     beat.get("beat_id"), beat["start"], beat["end"], source)
     task_artifacts._write_json_atomic(
         Path(utils.task_dir(task_id)) / "top-panel-rendered-media.json",
-        {"caption_mode": caption_mode, "output": output, "sources": rendered_sources},
+        {"caption_mode": caption_mode, "output": output, "sources": rendered_sources,
+         "branding_video_segments": [
+             {key: segment.get(key) for key in ("start", "end", "asset_key", "sha256")}
+             for segment in prepared_branding
+         ]},
     )
     task_artifacts.cache_artifact(task_id, "explainer", fingerprint, output)
     return output

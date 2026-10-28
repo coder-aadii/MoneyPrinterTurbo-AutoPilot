@@ -1585,6 +1585,7 @@ def generate_video(
     output_file: str,
     params: VideoParams,
     bgm_file_override: str | None = None,
+    branding_segments: list[dict] | None = None,
 ) -> bool:
     """
     合成最终视频，并返回本次背景音乐处理是否成功。
@@ -1862,6 +1863,36 @@ def generate_video(
             AudioFileClip(prepare_voice_audio(clip_stack))
         )
         video_clip = source_video_clip
+        branding_clips = []
+        for segment in branding_segments or []:
+            try:
+                overlay_source = clip_stack.enter_context(
+                    _open_video_clip_quietly(str(segment["path"]))
+                )
+                panel = segment.get("placement") == "top_panel"
+                target_width = video_width
+                target_height = (min(video_height, round(video_width * 9 / 16))
+                                 if panel else video_height)
+                overlay = _fit_clip_to_canvas(
+                    overlay_source, target_width=target_width,
+                    target_height=target_height, fit_mode=VideoFitMode.contain,
+                ).with_start(float(segment["start"])).with_duration(min(
+                    float(segment["end"]) - float(segment["start"]),
+                    float(overlay_source.duration),
+                ))
+                if panel:
+                    # Branding footage is a horizontal top panel on both
+                    # portrait and landscape outputs.
+                    overlay = overlay.with_position((0, 0))
+                branding_clips.append(overlay)
+            except (OSError, ValueError, KeyError, TypeError):
+                logger.warning("skipping unreadable channel branding video segment")
+        if branding_clips:
+            video_clip = CompositeVideoClip(
+                [source_video_clip, *branding_clips],
+                size=(video_width, video_height),
+            ).with_duration(source_video_clip.duration)
+            clip_stack.callback(video_clip.close)
         audio_clip = voice_source_clip.with_effects(
             [afx.MultiplyVolume(1.0 if params.voice_volume is None else params.voice_volume)]
         )
@@ -1878,9 +1909,19 @@ def generate_video(
         )
         if (params.subtitle_enabled and subtitle_path and os.path.exists(subtitle_path)
                 and not captions_embedded_in_explainer):
+            subtitle_items = moviepy_subtitles(subtitle_path)
+            if branding_segments:
+                subtitle_items = [
+                    item for item in subtitle_items
+                    if not any(
+                        float(item[0][0]) < float(segment["end"])
+                        and float(item[0][1]) > float(segment["start"])
+                        for segment in branding_segments
+                    )
+                ]
             sub = clip_stack.enter_context(
                 SubtitlesClip(
-                    subtitles=moviepy_subtitles(subtitle_path),
+                    subtitles=subtitle_items,
                     encoding="utf-8",
                     make_textclip=make_textclip,
                 )

@@ -179,6 +179,7 @@ class VideoParams(BaseModel):
     channel_id: str = ""
     channel_branding: dict[str, Any] = Field(default_factory=dict)
     video_language: Optional[str] = ""  # auto detect
+    youtube_caption_language: Literal["English", "Hindi"] = "English"
 
     voice_name: Optional[str] = ""
     tts_provider: Optional[str] = Field(default=None, max_length=100)

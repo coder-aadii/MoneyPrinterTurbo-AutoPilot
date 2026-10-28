@@ -74,6 +74,16 @@ class _FakeMoviePyClip:
     def with_effects(self, _effects):
         return self
 
+    def with_start(self, _start):
+        return self
+
+    def with_duration(self, duration):
+        self.duration = duration
+        return self
+
+    def with_position(self, _position):
+        return self
+
     def with_audio(self, _audio):
         return self.with_audio_result
 
@@ -316,6 +326,35 @@ class TestVideoService(unittest.TestCase):
         writer.assert_called_once()
         self.assertEqual(source_video.close_calls, 2)
         self.assertEqual(voice_source.close_calls, 1)
+
+    def test_generate_video_replaces_full_frame_with_saved_branding_video(self):
+        params = vd.VideoParams(video_subject="test", subtitle_enabled=False, bgm_type="")
+        source_video = _FakeMoviePyClip()
+        overlay_source = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        final_video = _FakeMoviePyClip()
+        composite = _FakeMoviePyClip()
+        composite.with_audio_result = final_video
+        with (
+            patch.object(vd, "_open_video_clip_quietly", side_effect=[source_video, overlay_source]),
+            patch.object(vd, "AudioFileClip", return_value=voice_source),
+            patch.object(vd, "_fit_clip_to_canvas", return_value=_FakeMoviePyClip()) as fit,
+            patch.object(vd, "CompositeVideoClip", return_value=composite) as compose,
+            patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            result = vd.generate_video(
+                video_path="combined.mp4", audio_path="voice.mp3", subtitle_path="",
+                output_file="final.mp4", params=params,
+                branding_segments=[{"path": "intro.mp4", "start": 0, "end": 2,
+                                    "placement": "full_frame"}],
+            )
+        self.assertTrue(result)
+        self.assertEqual(fit.call_args.kwargs["target_width"], params.video_aspect.to_resolution()[0])
+        self.assertEqual(fit.call_args.kwargs["target_height"], params.video_aspect.to_resolution()[1])
+        compose.assert_called_once()
+        self.assertEqual(len(compose.call_args.args[0]), 2)
+        writer.assert_called_once()
 
     def test_generate_video_reports_successful_bgm_mix_and_closes_sources(self):
         """BGM 混合成功后应返回 True，并释放所有原始文件 reader。"""

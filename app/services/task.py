@@ -1624,6 +1624,7 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration,
     *, partial_results: dict | None = None,
+    branding_video_segments: list[dict] | None = None,
 ):
     """Record completed outputs even if a later clip raises before returning."""
     final_video_paths = []
@@ -1771,6 +1772,9 @@ def generate_final_videos(
             output_file=final_video_path,
             params=params,
             bgm_file_override=bgm_file_override,
+            branding_segments=(branding_video_segments or [])
+            if params.effective_visual_style != visual_style.SAVAGE_ANIMATED_EXPLAINER
+            else [],
         )
         if (
             video_music_provider is not None
@@ -1910,8 +1914,8 @@ def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
 
 
 def _social_metadata_language(params: VideoParams) -> str:
-    language = str(getattr(params, "video_language", "") or "").casefold()
-    return "Hindi" if language.startswith("hi") else "English"
+    language = str(getattr(params, "youtube_caption_language", "English") or "English").casefold()
+    return "Hindi" if language in {"hi", "hindi"} else "English"
 
 
 def _youtube_caption_context_for_params(params: VideoParams) -> str:
@@ -2740,6 +2744,7 @@ def _run_pipeline(
     narration_subtitle_path = subtitle_path
     main_narration_duration = actual_narration_duration
     intro_duration = 0.0
+    branding_video_segments = []
     branding = getattr(params, "channel_branding", {}) or {}
     channel_id = getattr(params, "channel_id", "")
     if channel_id and isinstance(branding, dict):
@@ -2765,6 +2770,11 @@ def _run_pipeline(
                     raise ValueError("branding audio has zero duration")
                 cue_path = branding_service.read_subtitle(channel_id, asset, kind)
                 segments.append((kind, str(asset_path), measured, cue_path))
+                if not item.get("video"):
+                    skipped.append({
+                        "segment": f"{kind}_video",
+                        "reason": "no saved branded video; audio will be used with the selected visuals",
+                    })
             except (ValueError, OSError, TypeError) as exc:
                 skipped.append({"segment": kind, "reason": str(exc)})
 
@@ -2781,6 +2791,44 @@ def _run_pipeline(
                     raise RuntimeError("assembled audio has zero duration")
                 intro_duration = sum(entry[2] for entry in ordered
                                      if entry[0] == "intro")
+                elapsed_for_video = 0.0
+                for kind, _audio_path, segment_duration, cue in ordered:
+                    item = branding.get(kind) or {}
+                    video_asset = item.get("video") or {}
+                    if kind in {"intro", "outro"} and video_asset:
+                        try:
+                            if video_asset.get("layout_version") != 2:
+                                raise ValueError("saved video uses an older layout; regenerate it to match the final avatar position")
+                            video_path = branding_service.resolve_video(
+                                channel_id, video_asset.get("asset_key"),
+                                expected_kind=kind,
+                            )
+                            audio_hash = hashlib.sha256(Path(_audio_path).read_bytes()).hexdigest()
+                            subtitle_hash = hashlib.sha256(Path(cue).read_bytes()).hexdigest() if cue else ""
+                            if (audio_hash != video_asset.get("audio_hash")
+                                    or subtitle_hash != video_asset.get("subtitle_hash")
+                                    or hashlib.sha256(video_path.read_bytes()).hexdigest()
+                                    != video_asset.get("content_hash")):
+                                raise ValueError("branding video no longer matches its audio or subtitles")
+                            avatar_hash = ""
+                            profile_image = branding.get("profile_image") or {}
+                            if kind == "outro" and profile_image:
+                                avatar_path = branding_service.resolve_profile_image(
+                                    channel_id, profile_image.get("asset_key"),
+                                )
+                                avatar_hash = hashlib.sha256(avatar_path.read_bytes()).hexdigest()
+                            if avatar_hash != str(video_asset.get("avatar_hash") or ""):
+                                raise ValueError("branding video no longer matches the channel profile image")
+                            branding_video_segments.append({
+                                "path": str(video_path), "start": elapsed_for_video,
+                                "end": elapsed_for_video + segment_duration,
+                                "sha256": video_asset["content_hash"],
+                                "asset_key": video_asset["asset_key"],
+                                "placement": "full_frame",
+                            })
+                        except (ValueError, OSError, TypeError, KeyError) as exc:
+                            skipped.append({"segment": f"{kind}_video", "reason": str(exc)})
+                    elapsed_for_video += segment_duration
                 cue_blocks = []
                 if subtitle_path and os.path.isfile(subtitle_path):
                     cue_blocks.append(branding_service.offset_srt(subtitle_path, intro_duration))
@@ -2812,11 +2860,19 @@ def _run_pipeline(
                     task_id,
                     actual_narration_duration_seconds=assembled_duration,
                     channel_branding_applied=[entry[0] for entry in segments],
+                    channel_branding_video_applied=[
+                        {key: segment.get(key) for key in ("asset_key", "sha256", "start", "end")}
+                        for segment in branding_video_segments
+                    ],
                     channel_branding_fallbacks=skipped,
                     duration_metadata=duration_metadata,
                 )
                 task_artifacts.patch_script_data(
                     task_id, channel_branding_applied=[entry[0] for entry in segments],
+                    channel_branding_video_applied=[
+                        {key: segment.get(key) for key in ("asset_key", "sha256", "start", "end")}
+                        for segment in branding_video_segments
+                    ],
                     channel_branding_fallbacks=skipped,
                     duration_metadata=duration_metadata,
                 )
@@ -2854,6 +2910,7 @@ def _run_pipeline(
                 stock_terms=video_terms,
                 caption_mode=params.subtitle_display_mode,
                 stock_media_policy=params.stock_media_policy,
+                branding_segments=branding_video_segments,
             )]
         else:
             downloaded_videos = get_video_materials(
@@ -2934,6 +2991,7 @@ def _run_pipeline(
             subtitle_path,
             audio_duration,
             partial_results=partial_results,
+            branding_video_segments=branding_video_segments,
         )
     except Exception as exc:
         logger.exception(f"video batch failed, task_id: {task_id}, error: {exc}")

@@ -17,6 +17,7 @@ class ChannelProfile(BaseModel):
     niche: str = Field(default="", max_length=500)
     topic_preferences: list[str] = Field(default_factory=list, max_length=100)
     language: str = Field(default="", max_length=64)
+    youtube_caption_language: Literal["English", "Hindi"] = "English"
     script_style: str = Field(default="", max_length=2000)
     target_duration_seconds: int = Field(default=30, ge=5, le=3600)
     duration_enforcement: Literal["flexible", "warn_only", "strict"] = "flexible"
@@ -52,9 +53,12 @@ class ChannelProfile(BaseModel):
     intro_enabled: bool = False
     intro_text: str = Field(default="", max_length=1000)
     intro_audio: dict[str, str | float | int | None] | None = None
+    intro_video: dict[str, str | float | int | None] | None = None
     outro_enabled: bool = False
     outro_text: str = Field(default="", max_length=1000)
     outro_audio: dict[str, str | float | int | None] | None = None
+    outro_video: dict[str, str | float | int | None] | None = None
+    profile_image: dict[str, str | int | None] | None = None
     generation_provider: str = Field(default="global", max_length=100)
     generation_settings: dict[str, str | int | float | bool] = Field(default_factory=dict)
     timezone: str = "UTC"

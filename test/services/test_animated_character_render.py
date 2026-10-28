@@ -67,6 +67,46 @@ def test_animated_scene_renders_from_audio_duration_without_subtitle_cues(tmp_pa
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for animated video validation")
+def test_saved_branding_video_replaces_full_frame_and_manifest_records_it(tmp_path, monkeypatch):
+    branding_path = tmp_path / "saved-intro.mp4"
+
+    def moving_frame(time_seconds):
+        frame = np.empty((1920, 1080, 3), dtype=np.uint8)
+        frame[:] = (15, 25, 225)
+        x = 100 + int(time_seconds * 500)
+        frame[400:700, x:x + 180] = (250, 250, 20)
+        return frame
+
+    source = VideoClip(moving_frame, duration=0.4)
+    source.write_videofile(str(branding_path), fps=24, codec="libx264", audio=False,
+                           preset="ultrafast", logger=None)
+    source.close()
+    monkeypatch.setattr(animated_explainer.utils, "task_dir", lambda _task_id: str(tmp_path))
+    monkeypatch.setattr(animated_explainer.task_artifacts, "load_cached_artifact", lambda *_: None)
+    monkeypatch.setattr(animated_explainer.task_artifacts, "cache_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr(animated_explainer, "resolve_storyboard_media",
+                        lambda _task, beats, **_kwargs: (beats, []))
+
+    output = animated_explainer.render_background(
+        "branding-video-render", "स्थानीय परीक्षण", 0.3,
+        output_path=str(tmp_path / "branding-render.mp4"),
+        branding_segments=[{
+            "path": str(branding_path), "start": 0.0, "end": 0.3,
+            "asset_key": "intro/v1-" + "a" * 64 + ".mp4", "sha256": "a" * 64,
+        }],
+    )
+    with animated_explainer.VideoFileClip(output, audio=False) as rendered:
+        first = rendered.get_frame(0.05)
+        later = rendered.get_frame(0.25)
+        assert np.mean(np.abs(first[380:800, 120:960].astype(float)
+                              - later[380:800, 120:960].astype(float))) > 2
+        assert first[400:820, 110:970, 2].mean() > first[400:820, 110:970, 0].mean()
+        assert first[1400, 120, 2] > first[1400, 120, 0]
+    manifest = json.loads((tmp_path / "top-panel-rendered-media.json").read_text())
+    assert manifest["branding_video_segments"][0]["asset_key"].startswith("intro/")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required for animated video validation")
 def test_two_reviewed_cached_pexels_clips_are_composited_with_captions_and_character(
     tmp_path, monkeypatch,
 ):

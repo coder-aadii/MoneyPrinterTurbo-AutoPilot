@@ -10383,12 +10383,18 @@ def _render_autopilot_gallery_publish_dialog(job, platform, destination_account_
     if platform == "youtube":
         st.write(f"YouTube destination: **{handle}**")
         st.info("Manual YouTube publication uses Private visibility. This action does not enable Autopilot or public posting.")
-        try:
-            with st.spinner("Preparing the YouTube caption…"):
-                metadata = service.ensure_youtube_metadata(job.job_id)
-        except Exception as exc:
-            st.error(f"Caption could not be prepared: {exc}")
-            if st.button("Close", key="gallery_publish_caption_close"):
+        metadata = service.get_youtube_metadata(job.job_id)
+        if metadata is None:
+            st.info("No current saved YouTube caption is available. Generate one to continue.")
+            generate_col, close_col = st.columns(2)
+            if generate_col.button("Generate YouTube caption", key="gallery_publish_caption_generate"):
+                try:
+                    with st.spinner("Generating the YouTube caption…"):
+                        service.ensure_youtube_metadata(job.job_id)
+                    st.rerun(scope="app")
+                except Exception as exc:
+                    st.error(f"Caption could not be prepared: {exc}")
+            if close_col.button("Close", key="gallery_publish_caption_close"):
                 st.session_state.pop("gallery_publish_confirm", None)
                 st.rerun(scope="app")
             return
@@ -11427,6 +11433,11 @@ def _render_channel_autopilot():
                                 help="Voice ID used by this channel's video jobs.")
                         channel_language = st.selectbox("Default language", ["Hindi", "English"],
                             index=0 if item.language.lower().startswith("hi") else 1)
+                        caption_language = st.selectbox(
+                            "YouTube caption language", ["English", "Hindi"],
+                            index=0 if item.youtube_caption_language == "English" else 1,
+                            help="Controls generated YouTube titles and captions independently of narration language.",
+                        )
                         channel_style = st.selectbox("Default visuals", list(styles),
                             index=list(styles.values()).index(item.visual_style))
                         channel_hashtag = st.text_input(
@@ -11438,6 +11449,7 @@ def _render_channel_autopilot():
                             try:
                                 _autopilot_save_profile(item, voice_name=voice_name,
                                     language="hi" if channel_language == "Hindi" else "en",
+                                    youtube_caption_language=caption_language,
                                     visual_style=styles[channel_style],
                                     channel_hashtag=channel_hashtag.strip(),
                                     topic_preferences=[line.strip() for line in preferences.splitlines() if line.strip()])
@@ -11448,8 +11460,54 @@ def _render_channel_autopilot():
                     st.markdown("#### Channel Branding — Intro & Outro")
                     from app.services import channel_branding as branding_service
                     branding_preview = channel_profiles.build_preview(item).params
+                    with st.container(border=True):
+                        image_upload_col, image_preview_col = st.columns([1.5, 1])
+                        with image_upload_col:
+                            st.markdown("##### Outro profile image")
+                            profile_image_upload = st.file_uploader(
+                                "Optional channel profile image for the outro",
+                                type=["png", "jpg", "jpeg", "webp"],
+                                key=f"channel_branding_profile_image_{channel_id}",
+                                help="PNG, JPG, or WebP · up to 10 MB. The image appears in the outro's top visual panel.",
+                            )
+                            if profile_image_upload and st.button(
+                                "Save image",
+                                key=f"channel_branding_profile_image_save_{channel_id}",
+                            ):
+                                try:
+                                    current_image = item.profile_image or {}
+                                    image_asset = branding_service.save_profile_image(
+                                        channel_id, profile_image_upload.getvalue(),
+                                        version=int(current_image.get("version", 0)) + 1,
+                                    )
+                                    _autopilot_save_profile(
+                                        item, profile_image=image_asset,
+                                        **({"outro_video": None} if item.outro_video else {}),
+                                    )
+                                    st.success("Image saved. Generate a new outro video to include it.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Channel profile image could not be saved: {exc}")
+                        with image_preview_col:
+                            if item.profile_image:
+                                try:
+                                    image_path = branding_service.resolve_profile_image(
+                                        channel_id, item.profile_image.get("asset_key", ""),
+                                    )
+                                    if hashlib.sha256(image_path.read_bytes()).hexdigest() != item.profile_image.get("content_hash"):
+                                        raise ValueError("saved image hash does not match")
+                                    from PIL import Image
+                                    with Image.open(image_path) as saved_image:
+                                        saved_image.thumbnail((320, 320))
+                                        image_preview = saved_image.copy()
+                                    st.image(image_preview, width=180, caption="Saved image")
+                                except (ValueError, OSError, TypeError):
+                                    st.warning("Saved channel profile image is missing or invalid.")
+                            else:
+                                st.caption("No profile image saved")
                     for segment in ("intro", "outro"):
                         segment_audio = getattr(item, f"{segment}_audio") or {}
+                        segment_video = getattr(item, f"{segment}_video") or {}
                         with st.expander(segment.capitalize(), expanded=False):
                             enabled = st.toggle(
                                 f"Enable {segment}",
@@ -11469,6 +11527,11 @@ def _render_channel_autopilot():
                             uploaded_branding = st.file_uploader(
                                 "Upload custom MP3/WAV", type=["mp3", "wav"],
                                 key=f"channel_branding_{segment}_upload_{channel_id}",
+                            )
+                            uploaded_subtitles = st.file_uploader(
+                                "Matching timed subtitles (SRT, required for a video from uploaded audio)",
+                                type=["srt"],
+                                key=f"channel_branding_{segment}_subtitle_upload_{channel_id}",
                             )
                             force_regeneration = st.checkbox(
                                 "Regenerate matching audio",
@@ -11539,7 +11602,8 @@ def _render_channel_autopilot():
                                         _autopilot_save_profile(
                                             item, **{f"{segment}_audio": saved_asset,
                                                      f"{segment}_text": spoken_text.strip(),
-                                                     f"{segment}_enabled": enabled}
+                                                     f"{segment}_enabled": enabled,
+                                                     f"{segment}_video": None}
                                         )
                                         st.success(f"{segment.capitalize()} audio saved and ready to reuse.")
                                         st.rerun()
@@ -11556,11 +11620,13 @@ def _render_channel_autopilot():
                                             channel_id, segment, uploaded_branding.getvalue(),
                                             extension=Path(uploaded_branding.name).suffix.removeprefix(".").lower(),
                                             version=next_version,
+                                            cues=uploaded_subtitles.getvalue() if uploaded_subtitles else None,
                                         )
                                         _autopilot_save_profile(
                                             item, **{f"{segment}_audio": saved_asset,
                                                      f"{segment}_text": spoken_text.strip(),
-                                                     f"{segment}_enabled": enabled}
+                                                     f"{segment}_enabled": enabled,
+                                                     f"{segment}_video": None}
                                         )
                                         st.success(f"Uploaded {segment} audio saved.")
                                         st.rerun()
@@ -11584,6 +11650,69 @@ def _render_channel_autopilot():
                                     )
                                 except (ValueError, OSError, TypeError):
                                     st.warning("Enabled branding audio is missing or invalid. Upload or regenerate it to repair.")
+                                ratio_options = ["Vertical (9:16)", "Horizontal (16:9)"]
+                                saved_ratio = segment_video.get("aspect")
+                                ratio_index = (0 if saved_ratio == "9:16" else 1
+                                               if saved_ratio == "16:9" else None)
+                                ratio_col, action_col = st.columns([1, 1])
+                                with ratio_col:
+                                    selected_ratio = st.selectbox(
+                                        "Video ratio · required",
+                                        ratio_options,
+                                        index=ratio_index,
+                                        key=f"channel_branding_{segment}_video_ratio_{channel_id}",
+                                        help="Choose the shape of the saved intro/outro video.",
+                                    )
+                                with action_col:
+                                    action_label = "Regenerate video" if segment_video else "Generate video"
+                                    generate_video_clicked = st.button(
+                                        action_label,
+                                        key=f"channel_branding_{segment}_video_generate_{channel_id}",
+                                        disabled=selected_ratio is None,
+                                        help="Uses the saved audio and timed subtitles. Does not make a TTS request.",
+                                    )
+                                if generate_video_clicked:
+                                    try:
+                                        with tempfile.TemporaryDirectory(prefix="mpt-brand-video-") as tmp:
+                                            output_path = os.path.join(tmp, f"{segment}.mp4")
+                                            video_asset = branding_service.generate_video(
+                                                channel_id, segment, segment_audio,
+                                                display_name=item.display_name,
+                                                aspect=("9:16" if selected_ratio.startswith("Vertical") else "16:9"),
+                                                profile_image=item.profile_image if segment == "outro" else None,
+                                                output_path=output_path,
+                                                version=int(segment_video.get("version", 0)) + 1,
+                                            )
+                                        _autopilot_save_profile(
+                                            item, **{f"{segment}_video": video_asset}
+                                        )
+                                        st.success(f"{segment.capitalize()} video saved ({video_asset['aspect']}) without another TTS request.")
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"{segment.capitalize()} video could not be generated: {exc}")
+                                if segment_video:
+                                    try:
+                                        video_path = branding_service.resolve_video(
+                                            channel_id, segment_video.get("asset_key", ""),
+                                            expected_kind=segment,
+                                        )
+                                        if hashlib.sha256(video_path.read_bytes()).hexdigest() != segment_video.get("content_hash"):
+                                            raise ValueError("saved video hash does not match")
+                                        if segment_video.get("layout_version") != 2:
+                                            st.warning("This video uses the previous avatar layout. Regenerate it to match the final video's character position.")
+                                        else:
+                                            with st.expander("Preview saved video", expanded=False):
+                                                st.video(str(video_path), width=420)
+                                            st.caption(
+                                                f"Saved · {'Vertical 9:16' if segment_video.get('aspect') == '9:16' else 'Horizontal 16:9'}"
+                                                " · matches saved audio and timed subtitles"
+                                            )
+                                    except (ValueError, OSError, TypeError):
+                                        st.warning("Saved branding video is missing or no longer valid. Generate it again.")
+                                else:
+                                    st.caption(
+                                        "Audio will play with the selected visuals until you generate a matching branded video."
+                                    )
                             else:
                                 st.caption("No saved audio. Intro/outro is optional and disabled by default.")
                     if item.publishing_backend == "youtube_direct":

@@ -587,12 +587,14 @@ from datetime import datetime
 from types import SimpleNamespace
 st.session_state.setdefault("published", [])
 st.session_state.setdefault("saved_caption", "")
+st.session_state.setdefault("ensure_calls", 0)
 st.rerun = lambda **kwargs: None
 metadata = {"title":"Where Does Money Go?", "caption":"Stars shine? 🔭🤔\\nThey glow. 🌟💡\\n#Stars #Space #Science #Astronomy #TestChannel",
     "hashtags":["#Stars","#Space","#Science","#Astronomy","#TestChannel"],
     "narration_fingerprint":"12345678", "context_fingerprint":"abcdefgh"}
 service = SimpleNamespace(
-    ensure_youtube_metadata=lambda _job_id: metadata,
+    get_youtube_metadata=lambda _job_id: metadata,
+    ensure_youtube_metadata=lambda _job_id: st.session_state.__setitem__("ensure_calls", st.session_state["ensure_calls"] + 1) or metadata,
     youtube_caption_validation_errors=lambda _job_id, _caption: [],
     save_youtube_caption=lambda _job_id, caption: st.session_state.__setitem__("saved_caption", caption),
     publish_job=lambda job_id, platform, destination_account_id: st.session_state["published"].append(
@@ -608,6 +610,7 @@ job = SimpleNamespace(job_id="caption-job", topic="पैसा कहाँ ज
     code += '\n_render_autopilot_gallery_publish_dialog(job, "youtube", "channel-a")\n'
     app = AppTest.from_string(code).run()
     assert not app.exception
+    assert app.session_state["ensure_calls"] == 0
     assert any("Where Does Money Go?" in item.value for item in app.get("markdown"))
     app.text_area(key="gallery_youtube_caption_caption-job_12345678_abcdefgh").set_value(
         "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #TestChannel"
@@ -616,6 +619,39 @@ job = SimpleNamespace(job_id="caption-job", topic="पैसा कहाँ ज
     assert not app.exception
     assert app.session_state["saved_caption"] == "Stars shine? 🔭🤔\nThey glow. 🌟💡\n#Stars #Space #Science #Astronomy #TestChannel"
     assert app.session_state["published"] == [("caption-job", "youtube", "channel-a")]
+
+
+def test_youtube_upload_dialog_generates_caption_only_after_explicit_click():
+    node = _main_function("_render_autopilot_gallery_publish_dialog")
+    node.decorator_list = []
+    code = '''
+import re
+import streamlit as st
+from datetime import datetime
+from types import SimpleNamespace
+st.session_state.setdefault("ensure_calls", 0)
+st.rerun = lambda **kwargs: None
+metadata = {"title":"A Saved Title", "caption":"Stars shine? 🔭🤔\\nThey glow. 🌟💡\\n#Stars #Space #Science #Astronomy #TestChannel",
+    "hashtags":["#Stars","#Space","#Science","#Astronomy","#TestChannel"],
+    "narration_fingerprint":"12345678", "context_fingerprint":"abcdefgh"}
+service = SimpleNamespace(
+    get_youtube_metadata=lambda _job_id: None,
+    ensure_youtube_metadata=lambda _job_id: st.session_state.__setitem__("ensure_calls", st.session_state["ensure_calls"] + 1) or metadata,
+)
+autopilot_service = SimpleNamespace(get_service=lambda: service)
+_gallery_instagram_destination = lambda *_: None
+_gallery_youtube_destination = lambda *_: {"username":"channel-a", "handle":"Test channel"}
+job = SimpleNamespace(job_id="caption-job", topic="Stars", created_at=datetime(2026, 10, 26))
+'''
+    source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text(encoding="utf-8")
+    code += ast.get_source_segment(source, node)
+    code += '\n_render_autopilot_gallery_publish_dialog(job, "youtube", "channel-a")\n'
+    app = AppTest.from_string(code).run()
+    assert not app.exception
+    assert app.session_state["ensure_calls"] == 0
+    app.button(key="gallery_publish_caption_generate").click().run()
+    assert not app.exception
+    assert app.session_state["ensure_calls"] == 1
 
 
 def test_gallery_media_lookup_rejects_paths_outside_storage(tmp_path):

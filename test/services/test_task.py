@@ -128,15 +128,25 @@ class TestTaskService(unittest.TestCase):
         self.assertIn("Final narration: Final spoken narration.", generate.call_args.kwargs["video_script"])
         self.assertIn("Channel outro: Follow for more.", generate.call_args.kwargs["video_script"])
 
-    def test_hindi_narration_uses_hindi_for_completed_video_metadata(self):
+    def test_hindi_narration_uses_default_english_caption_language(self):
         params = VideoParams(video_subject="जेलीफ़िश", video_language="hi")
         with patch.object(tm.llm, "generate_social_metadata", return_value={
             "title": "जेलीफ़िश", "caption": "जेलीफ़िश", "hashtags": []
         }) as generate:
             tm._generate_completed_video_youtube_metadata(
                 "hindi-metadata", params, "जेलीफ़िश फिर शुरू होती है।", ["final.mp4"])
+        self.assertEqual(generate.call_args.kwargs["language"], "English")
+        self.assertEqual(json.loads(generate.call_args.kwargs["channel_context"])["caption_language"], "English")
+
+    def test_channel_caption_language_controls_completed_video_metadata(self):
+        params = VideoParams(video_subject="जेलीफ़िश", video_language="hi",
+                             youtube_caption_language="Hindi")
+        with patch.object(tm.llm, "generate_social_metadata", return_value={
+            "title": "जेलीफ़िश", "caption": "जेलीफ़िश", "hashtags": []
+        }) as generate:
+            tm._generate_completed_video_youtube_metadata(
+                "hindi-caption-language", params, "जेलीफ़िश फिर शुरू होती है।", ["final.mp4"])
         self.assertEqual(generate.call_args.kwargs["language"], "Hindi")
-        self.assertEqual(json.loads(generate.call_args.kwargs["channel_context"])["caption_language"], "Hindi")
 
     def test_caption_source_keeps_optional_branding_out_of_canonical_narration(self):
         params = VideoParams(

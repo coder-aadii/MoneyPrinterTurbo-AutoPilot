@@ -10,7 +10,8 @@ from app.services.visual_style import SAVAGE_ANIMATED_EXPLAINER
 
 
 def _channel_page(initial_style="savage_animated_explainer", initial_script="An existing narration script.",
-                  initial_tab="Create Video"):
+                  initial_tab="Create Video", with_branding_audio=False,
+                  with_branding_video=False):
     source = (Path(__file__).resolve().parents[2] / "webui" / "Main.py").read_text()
     nodes = ast.parse(source).body
     definitions = [
@@ -33,6 +34,7 @@ from app.models.channel_profile import ChannelProfile
 from app.services import visual_style as visual_style_service
 from app.services import generation_settings as generation_settings_service
 from app.services import channel_profiles as _channel_profiles, llm as _llm, script_quality, task as tm
+from app.services import material
 llm = SimpleNamespace(generate_terms=lambda subject, script, amount=5, **kwargs: [
     f"narration topic {index + 1}" for index in range(amount)
 ], get_llm_provider=_llm.get_llm_provider)
@@ -44,8 +46,12 @@ llm.generate_terms = lambda subject, script, amount=5, **kwargs: [
 
 profile = ChannelProfile(channel_id="test-channel", display_name="Test channel",
     language="hi", visual_style=st.session_state.get("saved_visual_style", INITIAL_STYLE),
+    youtube_caption_language=st.session_state.get("saved_caption_language", "English"),
     version=2 if "saved_visual_style" in st.session_state else 1,
-    voice_name="test-voice", publishing_backend="youtube_direct")
+    voice_name="test-voice", publishing_backend="youtube_direct",
+    intro_audio={"asset_key":"intro/v1-" + "a" * 64 + ".wav"} if WITH_BRANDING_AUDIO else None,
+    intro_video={"asset_key":"intro/v1-" + "b" * 64 + ".mp4", "aspect":"16:9",
+                 "content_hash":"b" * 64} if WITH_BRANDING_VIDEO else None)
 channel_profiles = SimpleNamespace(
     store=SimpleNamespace(list=lambda: [profile]),
     build_preview=_channel_profiles.build_preview,
@@ -85,7 +91,10 @@ def _autopilot_create_video(profile, topic, script, duration, aspect, style, lan
 
 def _autopilot_save_profile(profile, **changes):
     st.session_state["saved_visual_style"] = changes["visual_style"]
-'''.replace("INITIAL_STYLE", repr(initial_style))
+    st.session_state["saved_caption_language"] = changes["youtube_caption_language"]
+'''.replace("INITIAL_STYLE", repr(initial_style)).replace(
+        "WITH_BRANDING_AUDIO", repr(with_branding_audio)
+    ).replace("WITH_BRANDING_VIDEO", repr(with_branding_video))
     code += "\n" + "\n\n".join(ast.get_source_segment(source, node) for node in definitions)
     code += "\n_render_channel_autopilot()\n"
     app = AppTest.from_string(code, default_timeout=30)
@@ -123,6 +132,18 @@ def test_animated_channel_default_saves_and_loads_in_create_video_dropdown():
     assert app.selectbox(key="simple_style_test-channel").value == "Savage Animated Explainer"
 
 
+def test_channel_caption_language_defaults_to_english_and_can_be_saved_independently():
+    app = _channel_page(initial_tab="Channels")
+    assert not app.exception
+    caption_language = next(item for item in app.selectbox
+                            if item.label == "YouTube caption language")
+    assert caption_language.value == "English"
+    caption_language.select("Hindi")
+    next(item for item in app.button if item.label == "Save channel defaults").click().run()
+    assert not app.exception
+    assert app.session_state["saved_caption_language"] == "Hindi"
+
+
 def test_new_channel_defaults_to_savage_animated_explainer():
     app = _channel_page()
     assert not app.exception
@@ -134,6 +155,25 @@ def test_channels_tab_shows_optional_branding_controls_disabled_by_default():
     assert not app.exception
     assert any("Channel Branding — Intro & Outro" in item.value for item in app.markdown)
     assert {item.label for item in app.expander} >= {"Intro", "Outro"}
+    assert any(item.label == "Optional channel profile image for the outro"
+               for item in app.get("file_uploader"))
+
+
+def test_channel_branding_ui_exposes_video_generation_for_saved_audio():
+    app = _channel_page(initial_tab="Channels", with_branding_audio=True)
+    assert not app.exception
+    assert any(item.label == "Generate video"
+               for item in app.button)
+    assert any(item.label == "Video ratio · required" for item in app.selectbox)
+
+
+def test_channel_branding_ui_offers_regeneration_for_saved_video():
+    app = _channel_page(initial_tab="Channels", with_branding_audio=True,
+                        with_branding_video=True)
+    assert not app.exception
+    assert any(item.label == "Regenerate video" for item in app.button)
+    ratio = next(item for item in app.selectbox if item.label == "Video ratio · required")
+    assert ratio.value == "Horizontal (16:9)"
 
 
 def test_both_ai_buttons_use_current_style_personality_and_profanity_without_overwriting_script():
